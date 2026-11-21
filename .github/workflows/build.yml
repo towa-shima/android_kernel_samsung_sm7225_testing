@@ -53,9 +53,33 @@ jobs:
       - name: Toolchain - clang-r563880 (1.6 GB)
         run: |
           mkdir -p "$HOME/linux-x86-main"
-          git clone --depth=1 \
-            https://github.com/Aeron-Aeron/linux-x86-clang-21.0.0-r563880.git \
-            "$HOME/linux-x86-main/clang-r563880"
+          cd "$HOME/linux-x86-main"
+          echo "--- disk before ---"; df -h / | tail -1
+
+          # Plain HTTP download, not `git clone`. Cloning a 770 MB repo with
+          # ~100k files is the most fragile thing you can do on a CI runner
+          # (early EOF / RPC failures); a tarball either downloads or it doesn't.
+          # $1 = url, $2 = directory levels to strip
+          fetch() {
+            echo "=== trying: $1"
+            curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
+                 --connect-timeout 30 --no-progress-meter \
+                 -o /tmp/clang.tar.gz "$1" || { echo "  download failed"; return 1; }
+            echo "  downloaded: $(stat -c%s /tmp/clang.tar.gz) bytes"
+            rm -rf clang-r563880 && mkdir -p clang-r563880
+            tar -xzf /tmp/clang.tar.gz -C clang-r563880 --strip-components="$2" \
+              || { echo "  extract failed"; return 1; }
+            rm -f /tmp/clang.tar.gz
+            [ -x clang-r563880/bin/clang ] || { echo "  no bin/clang after extract"; ls clang-r563880 | head; return 1; }
+            clang-r563880/bin/clang --version || { echo "  clang will not run"; return 1; }
+          }
+
+          fetch "https://codeload.github.com/Aeron-Aeron/linux-x86-clang-21.0.0-r563880/tar.gz/refs/heads/main" 1 \
+          || fetch "https://github.com/kiy017/clang-r563880c/releases/download/release/linux-x86-f8439f0628d799092dd07df440a6334cab28939c-clang-r563880c.tar.gz" 1 \
+          || fetch "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r547379.tar.gz" 0 \
+          || { echo "ALL CLANG SOURCES FAILED"; df -h /; exit 1; }
+
+          echo "--- disk after ---"; df -h / | tail -1
           "$HOME/linux-x86-main/clang-r563880/bin/clang" --version
 
       # Only used for the target triple and libgcc prefix; clang does the
