@@ -13,6 +13,8 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 300
+    permissions:
+      contents: write   # needed to attach the zip to a release
 
     steps:
       # ---------------------------------------------------------------- disk
@@ -209,8 +211,15 @@ jobs:
           sed -i 's/^          //' anykernel.sh
           rm -f "$GITHUB_WORKSPACE"/Boostkernel-*.zip
           zip -r9 "$GITHUB_WORKSPACE/Boostkernel-cip-${{ github.run_number }}.zip" . -x '.git/*' >/dev/null
+          Z="$GITHUB_WORKSPACE/Boostkernel-cip-${{ github.run_number }}.zip"
           echo "--- zip contents ---"
-          unzip -l "$GITHUB_WORKSPACE"/Boostkernel-*.zip | head -25
+          unzip -l "$Z" | head -25
+          # Prove the archive is valid, and record a hash so a bad download can
+          # be told apart from a bad upload later.
+          echo "--- self-test ---"
+          unzip -t "$Z" | tail -3
+          echo "--- sha256 (compare with your download) ---"
+          sha256sum "$Z"
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
@@ -218,7 +227,21 @@ jobs:
           name: Boostkernel-cip-${{ github.run_number }}
           path: ${{ github.workspace }}/Boostkernel-cip-*.zip
           if-no-files-found: error
-          compression-level: 0
+
+      # Artifacts are always served wrapped in another zip, which makes a bad
+      # download hard to distinguish from a bad build. A release asset is the
+      # file itself, so you can download and flash it directly.
+      - name: Attach zip to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Z="$GITHUB_WORKSPACE/Boostkernel-cip-${{ github.run_number }}.zip"
+          gh release create "build-${{ github.run_number }}" "$Z" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "BoostKernel build ${{ github.run_number }}" \
+            --notes "sha256: $(sha256sum "$Z" | cut -d' ' -f1)" \
+          || gh release upload "build-${{ github.run_number }}" "$Z" \
+            --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Upload raw Image/dtb/dtbo
         uses: actions/upload-artifact@v4
@@ -227,11 +250,3 @@ jobs:
           path: ${{ github.workspace }}/out/
           if-no-files-found: error
           compression-level: 0
-          aw Image/dtb/dtbo
-        uses: actions/upload-artifact@v4
-        with:
-          name: raw-${{ github.run_number }}
-          path: ${{ github.workspace }}/out/
-          if-no-files-found: error
-          compression-level: 0
-          
