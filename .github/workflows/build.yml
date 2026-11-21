@@ -227,4 +227,11 @@ jobs:
           path: ${{ github.workspace }}/out/
           if-no-files-found: error
           compression-level: 0
+          aw Image/dtb/dtbo
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ github.run_number }}
+          path: ${{ github.workspace }}/out/
+          if-no-files-found: error
+          compression-level: 0
           
