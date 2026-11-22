@@ -1,0 +1,301 @@
+name: Build BoostKernel (m23xq)
+
+# Press "Run workflow" in the Actions tab. Nothing else to configure.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Device model'
+        required: true
+        default: 'm23xq'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    permissions:
+      contents: write   # needed to attach the zip to a release
+
+    steps:
+      # ---------------------------------------------------------------- disk
+      # A 4.19 kernel + a 1.6 GB clang + a 2 GB source tree does not fit in the
+      # runner's default free space. Strip the preinstalled SDKs first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio flex git libelf-dev libssl-dev \
+            lz4 python3 rsync unzip wget xz-utils zip
+
+      # ------------------------------------------------------------- sources
+      # --depth=1 because the repo is ~2.2 GB of history.
+      # --recurse-submodules because KernelSU lives in a submodule
+      #   (Baka-SU/BakaSU) and the build needs it present.
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --branch Boostkernel2-cip \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/Aflaungos/android_kernel_samsung_sm7225_testing.git \
+            "$GITHUB_WORKSPACE/kernel"
+
+      # ---------------------------------------------------------- toolchains
+      # AOSP deletes old clang revisions from prebuilts/clang/host/linux-x86
+      # (master keeps only r522817 / r530567 / r536225 / r547379), so r563880 is
+      # no longer fetchable from Google. This mirror is a plain import of that
+      # revision: its manifest_13783749.xml matches the "Android (13783749, ...)"
+      # build number in the kernel banner.
+      - name: Toolchain - clang-r563880 (1.6 GB)
+        run: |
+          mkdir -p "$HOME/linux-x86-main"
+          cd "$HOME/linux-x86-main"
+          echo "--- disk before ---"; df -h / | tail -1
+
+          # Plain HTTP download, not `git clone`. Cloning a 770 MB repo with
+          # ~100k files is the most fragile thing you can do on a CI runner
+          # (early EOF / RPC failures); a tarball either downloads or it doesn't.
+          # $1 = url, $2 = directory levels to strip
+          fetch() {
+            echo "=== trying: $1"
+            curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
+                 --connect-timeout 30 --no-progress-meter \
+                 -o /tmp/clang.tar.gz "$1" || { echo "  download failed"; return 1; }
+            echo "  downloaded: $(stat -c%s /tmp/clang.tar.gz) bytes"
+            rm -rf clang-r563880 && mkdir -p clang-r563880
+            tar -xzf /tmp/clang.tar.gz -C clang-r563880 --strip-components="$2" \
+              || { echo "  extract failed"; return 1; }
+            rm -f /tmp/clang.tar.gz
+            [ -x clang-r563880/bin/clang ] || { echo "  no bin/clang after extract"; ls clang-r563880 | head; return 1; }
+            clang-r563880/bin/clang --version || { echo "  clang will not run"; return 1; }
+          }
+
+          fetch "https://codeload.github.com/Aeron-Aeron/linux-x86-clang-21.0.0-r563880/tar.gz/refs/heads/main" 1 \
+          || fetch "https://github.com/kiy017/clang-r563880c/releases/download/release/linux-x86-f8439f0628d799092dd07df440a6334cab28939c-clang-r563880c.tar.gz" 1 \
+          || fetch "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r547379.tar.gz" 0 \
+          || { echo "ALL CLANG SOURCES FAILED"; df -h /; exit 1; }
+
+          echo "--- disk after ---"; df -h / | tail -1
+          "$HOME/linux-x86-main/clang-r563880/bin/clang" --version
+
+      # Only used for the target triple and libgcc prefix; clang does the
+      # compiling. android11-release matches PLATFORM_VERSION=11 in the script.
+      - name: Toolchain - aarch64-linux-android-4.9
+        run: |
+          mkdir -p "$HOME/aarch64-linux-android-4.9"
+          curl -fsSL \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android11-release.tar.gz" \
+            | tar -xz -C "$HOME/aarch64-linux-android-4.9"
+          ls "$HOME/aarch64-linux-android-4.9/bin" | head
+
+      # --------------------------------------------------------------- config
+      # The RTkernel driver needs no symbols this kernel lacks (verified: all 32
+      # of its imports resolve). What blocks it is signature enforcement, and
+      # what may block it next is the MODVERSIONS CRC check.
+      #
+      #   # CONFIG_MODULE_SIG is not set   -> removes the -ENOKEY refusal
+      #   CONFIG_MODULE_FORCE_LOAD=y      -> lets `insmod -f` skip CRC checks
+      #
+      # Written into every config input, not just the defconfig: `make` merges
+      # the defconfig with the two vendor fragments in order and the LAST one
+      # wins, so the fragment must agree or it would undo this.
+      - name: Apply kernel config changes
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          FILES="arch/arm64/configs/vendor/lito-perf_defconfig
+                 vendor/samsung/lito-sec-common.config
+                 vendor/samsung/${{ inputs.model }}.config"
+          for f in $FILES; do
+            if [ ! -f "$f" ]; then echo "  skip (absent): $f"; continue; fi
+            sed -i -e '/^CONFIG_MODULE_SIG=/d' \
+                   -e '/^# CONFIG_MODULE_SIG is not set$/d' \
+                   -e '/^CONFIG_MODULE_SIG_FORCE=/d' \
+                   -e '/^# CONFIG_MODULE_SIG_FORCE is not set$/d' \
+                   -e '/^CONFIG_MODULE_FORCE_LOAD=/d' \
+                   -e '/^# CONFIG_MODULE_FORCE_LOAD is not set$/d' "$f"
+            printf '# CONFIG_MODULE_SIG is not set\nCONFIG_MODULE_FORCE_LOAD=y\n' >> "$f"
+            echo "  patched: $f"
+          done
+          echo "--- resulting lines ---"
+          for f in $FILES; do [ -f "$f" ] && grep -Hn 'MODULE_SIG\|FORCE_LOAD' "$f"; done || true
+
+      # ---------------------------------------------------------------- build
+      # Runs the repo's own build_lito_kernel.sh unchanged, so the result is the
+      # same recipe the kernel maintainer uses. Its only interaction is one
+      # prompt for the model, fed in on stdin.
+      - name: Build kernel
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          chmod +x build_lito_kernel.sh tools/mkdtimg tools/ufdt_apply_overlay
+          # The script hardcodes -j8; the runner has 4 cores and 16 GB, so 8
+          # parallel clang jobs risks the OOM killer. Parallelism does not
+          # change codegen.
+          sed -i 's/^BUILD_JOB_NUMBER=8$/BUILD_JOB_NUMBER=4/' build_lito_kernel.sh
+          echo "${{ inputs.model }}" | ./build_lito_kernel.sh
+
+      # ----------------------------------------------------------- artefacts
+      - name: Collect build output
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          IMG=out/arch/arm64/boot/Image
+          DTB=out/arch/arm64/boot/dts/vendor/qcom/lagoon.dtb
+          DTBO=out/arch/arm64/boot/dtbo.img
+          for f in "$IMG" "$DTB" "$DTBO"; do
+            test -s "$f" || { echo "MISSING: $f"; exit 1; }
+            echo "  $(stat -c%s "$f")  $f"
+          done
+          echo "--- kernel banner ---"
+          strings -a "$IMG" | grep -m1 '^Linux version'
+
+          # Read the config back out of the built Image. This is the proof that
+          # the change above actually took effect - do not skip it.
+          python3 - "$IMG" <<'PYEOF'
+          import sys, gzip, re
+          d = open(sys.argv[1], 'rb').read()
+          s, e = d.find(b'IKCFG_ST'), d.find(b'IKCFG_ED')
+          if s < 0 or e < s:
+              print('  no embedded config found'); sys.exit(0)
+          cfg = gzip.decompress(d[s+8:e]).decode('utf-8', 'replace')
+          for opt in ('CONFIG_MODULE_SIG', 'CONFIG_MODULE_SIG_FORCE',
+                      'CONFIG_MODULE_FORCE_LOAD', 'CONFIG_MODVERSIONS',
+                      'CONFIG_HARDENED_USERCOPY', 'CONFIG_KPROBES'):
+              m = [l for l in cfg.splitlines() if re.match(r'^(# )?' + opt + r'[ =]', l)]
+              print('  %-30s %s' % (opt, m[0] if m else 'ABSENT'))
+          PYEOF
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$IMG"  "$GITHUB_WORKSPACE/out/Image"
+          cp "$DTB"  "$GITHUB_WORKSPACE/out/dtb"
+          cp "$DTBO" "$GITHUB_WORKSPACE/out/dtbo"
+
+      # ------------------------------------------------------------- package
+      # AnyKernel3 is the flashable-zip format this device uses. The template
+      # comes from upstream; the anykernel.sh below is the device-specific one
+      # taken verbatim from a known-good Boostkernel release zip.
+      - name: Package AnyKernel3 zip
+        run: |
+          set -e
+          curl -fsSL "https://codeload.github.com/osm0sis/AnyKernel3/tar.gz/refs/heads/master" -o /tmp/ak3.tar.gz
+          mkdir -p /tmp/ak3 && tar -xzf /tmp/ak3.tar.gz -C /tmp/ak3 --strip-components=1
+          cd /tmp/ak3
+          chmod +x tools/* 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/out/Image" Image
+          cp "$GITHUB_WORKSPACE/out/dtb"   dtb
+          cp "$GITHUB_WORKSPACE/out/dtbo"  dtbo
+
+          cat > anykernel.sh <<'AK3EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### AnyKernel setup
+          # global properties
+          properties() { '
+          kernel.string=BoostKernel 2 for Samsung Galaxy M23. By Mrsiri
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=m23xq
+          device.name2=m23xq
+          device.name3=m23xq
+          device.name4=m23xq
+          device.name5=m23xq
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+
+          ### AnyKernel install
+          ## boot files attributes
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          } # end attributes
+
+          # boot shell variables
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install
+          dump_boot;
+
+          # init.rc
+          backup_file init.rc;
+          replace_string init.rc "cpuctl cpu,timer_slack" "mount cgroup none /dev/cpuctl cpu" "mount cgroup none /dev/cpuctl cpu,timer_slack";
+
+          # init.tuna.rc
+          backup_file init.tuna.rc;
+          insert_line init.tuna.rc "nodiratime barrier=0" after "mount_all /fstab.tuna" "\tmount ext4 /dev/block/platform/omap/omap_hsmmc.0/by-name/userdata /data remount nosuid nodev noatime nodiratime barrier=0";
+          append_file init.tuna.rc "bootscript" init.tuna;
+
+          # fstab.tuna
+          backup_file fstab.tuna;
+          patch_fstab fstab.tuna /system ext4 options "noatime,barrier=1" "noatime,nodiratime,barrier=0";
+          patch_fstab fstab.tuna /cache ext4 options "barrier=1" "barrier=0,nomblk_io_submit";
+          patch_fstab fstab.tuna /data ext4 options "data=ordered" "nomblk_io_submit,data=writeback";
+          append_file fstab.tuna "usbdisk" fstab;
+
+          write_boot;
+          ## end boot install
+          AK3EOF
+
+          sed -i 's/^          //' anykernel.sh
+          rm -f "$GITHUB_WORKSPACE"/Boostkernel-*.zip
+          zip -r9 "$GITHUB_WORKSPACE/Boostkernel-cip-${{ github.run_number }}.zip" . -x '.git/*' >/dev/null
+          Z="$GITHUB_WORKSPACE/Boostkernel-cip-${{ github.run_number }}.zip"
+          echo "--- zip contents ---"
+          unzip -l "$Z" | head -25
+          # Prove the archive is valid, and record a hash so a bad download can
+          # be told apart from a bad upload later.
+          echo "--- self-test ---"
+          unzip -t "$Z" | tail -3
+          echo "--- sha256 (compare with your download) ---"
+          sha256sum "$Z"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boostkernel-cip-${{ github.run_number }}
+          path: ${{ github.workspace }}/Boostkernel-cip-*.zip
+          if-no-files-found: error
+
+      # Artifacts are always served wrapped in another zip, which makes a bad
+      # download hard to distinguish from a bad build. A release asset is the
+      # file itself, so you can download and flash it directly.
+      - name: Attach zip to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Z="$GITHUB_WORKSPACE/Boostkernel-cip-${{ github.run_number }}.zip"
+          gh release create "build-${{ github.run_number }}" "$Z" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "BoostKernel build ${{ github.run_number }}" \
+            --notes "sha256: $(sha256sum "$Z" | cut -d' ' -f1)" \
+          || gh release upload "build-${{ github.run_number }}" "$Z" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Upload raw Image/dtb/dtbo
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ github.run_number }}
+          path: ${{ github.workspace }}/out/
+          if-no-files-found: error
+          compression-level: 0
