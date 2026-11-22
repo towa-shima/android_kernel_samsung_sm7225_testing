@@ -94,6 +94,38 @@ jobs:
             | tar -xz -C "$HOME/aarch64-linux-android-4.9"
           ls "$HOME/aarch64-linux-android-4.9/bin" | head
 
+      # --------------------------------------------------------------- config
+      # The RTkernel driver needs no symbols this kernel lacks (verified: all 32
+      # of its imports resolve). What blocks it is signature enforcement, and
+      # what may block it next is the MODVERSIONS CRC check.
+      #
+      #   # CONFIG_MODULE_SIG is not set   -> removes the -ENOKEY refusal
+      #   CONFIG_MODULE_FORCE_LOAD=y      -> lets `insmod -f` skip CRC checks
+      #
+      # Written into every config input, not just the defconfig: `make` merges
+      # the defconfig with the two vendor fragments in order and the LAST one
+      # wins, so the fragment must agree or it would undo this.
+      - name: Apply kernel config changes
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          FILES="arch/arm64/configs/vendor/lito-perf_defconfig
+                 vendor/samsung/lito-sec-common.config
+                 vendor/samsung/${{ inputs.model }}.config"
+          for f in $FILES; do
+            if [ ! -f "$f" ]; then echo "  skip (absent): $f"; continue; fi
+            sed -i -e '/^CONFIG_MODULE_SIG=/d' \
+                   -e '/^# CONFIG_MODULE_SIG is not set$/d' \
+                   -e '/^CONFIG_MODULE_SIG_FORCE=/d' \
+                   -e '/^# CONFIG_MODULE_SIG_FORCE is not set$/d' \
+                   -e '/^CONFIG_MODULE_FORCE_LOAD=/d' \
+                   -e '/^# CONFIG_MODULE_FORCE_LOAD is not set$/d' "$f"
+            printf '# CONFIG_MODULE_SIG is not set\nCONFIG_MODULE_FORCE_LOAD=y\n' >> "$f"
+            echo "  patched: $f"
+          done
+          echo "--- resulting lines ---"
+          for f in $FILES; do [ -f "$f" ] && grep -Hn 'MODULE_SIG\|FORCE_LOAD' "$f"; done || true
+
       # ---------------------------------------------------------------- build
       # Runs the repo's own build_lito_kernel.sh unchanged, so the result is the
       # same recipe the kernel maintainer uses. Its only interaction is one
@@ -122,6 +154,23 @@ jobs:
           done
           echo "--- kernel banner ---"
           strings -a "$IMG" | grep -m1 '^Linux version'
+
+          # Read the config back out of the built Image. This is the proof that
+          # the change above actually took effect - do not skip it.
+          python3 - "$IMG" <<'PYEOF'
+          import sys, gzip, re
+          d = open(sys.argv[1], 'rb').read()
+          s, e = d.find(b'IKCFG_ST'), d.find(b'IKCFG_ED')
+          if s < 0 or e < s:
+              print('  no embedded config found'); sys.exit(0)
+          cfg = gzip.decompress(d[s+8:e]).decode('utf-8', 'replace')
+          for opt in ('CONFIG_MODULE_SIG', 'CONFIG_MODULE_SIG_FORCE',
+                      'CONFIG_MODULE_FORCE_LOAD', 'CONFIG_MODVERSIONS',
+                      'CONFIG_HARDENED_USERCOPY', 'CONFIG_KPROBES'):
+              m = [l for l in cfg.splitlines() if re.match(r'^(# )?' + opt + r'[ =]', l)]
+              print('  %-30s %s' % (opt, m[0] if m else 'ABSENT'))
+          PYEOF
+
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp "$IMG"  "$GITHUB_WORKSPACE/out/Image"
           cp "$DTB"  "$GITHUB_WORKSPACE/out/dtb"
