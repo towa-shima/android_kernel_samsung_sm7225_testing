@@ -95,16 +95,27 @@ jobs:
           ls "$HOME/aarch64-linux-android-4.9/bin" | head
 
       # --------------------------------------------------------------- config
-      # The RTkernel driver needs no symbols this kernel lacks (verified: all 32
-      # of its imports resolve). What blocks it is signature enforcement, and
-      # what may block it next is the MODVERSIONS CRC check.
+      # Which RTkernel variant you use decides what the kernel must provide.
       #
+      #   b / c ("clean" builds) - all 32 imports already resolve, but they load
+      #         INERT: no /dev node, no proc entry, nothing exposed. The scene
+      #         reports only the NORMAL build actually works.
+      #   normal (4.19.191.sh)   - built for a lockdep kernel; imports six
+      #         symbols this tree does not export:
+      #           lock_acquire, lock_release              -> LOCKDEP
+      #           rcu_lock_map, lockdep_rcu_suspicious,
+      #           debug_lockdep_rcu_enabled               -> PROVE_RCU
+      #           __might_fault                           -> DEBUG_ATOMIC_SLEEP
+      #         PROVE_LOCKING selects LOCKDEP, PROVE_RCU, DEBUG_LOCK_ALLOC,
+      #         TRACE_IRQFLAGS, DEBUG_SPINLOCK, DEBUG_MUTEXES and DEBUG_RWSEMS,
+      #         so one line covers five of the six.
+      #
+      # Also:
       #   # CONFIG_MODULE_SIG is not set   -> removes the -ENOKEY refusal
       #   CONFIG_MODULE_FORCE_LOAD=y      -> lets `insmod -f` skip CRC checks
       #
       # Written into every config input, not just the defconfig: `make` merges
-      # the defconfig with the two vendor fragments in order and the LAST one
-      # wins, so the fragment must agree or it would undo this.
+      # the defconfig with the vendor fragments in order and the LAST one wins.
       - name: Apply kernel config changes
         working-directory: ${{ github.workspace }}/kernel
         run: |
@@ -119,12 +130,16 @@ jobs:
                    -e '/^CONFIG_MODULE_SIG_FORCE=/d' \
                    -e '/^# CONFIG_MODULE_SIG_FORCE is not set$/d' \
                    -e '/^CONFIG_MODULE_FORCE_LOAD=/d' \
-                   -e '/^# CONFIG_MODULE_FORCE_LOAD is not set$/d' "$f"
-            printf '# CONFIG_MODULE_SIG is not set\nCONFIG_MODULE_FORCE_LOAD=y\n' >> "$f"
+                   -e '/^# CONFIG_MODULE_FORCE_LOAD is not set$/d' \
+                   -e '/^CONFIG_PROVE_LOCKING=/d' \
+                   -e '/^# CONFIG_PROVE_LOCKING is not set$/d' \
+                   -e '/^CONFIG_DEBUG_ATOMIC_SLEEP=/d' \
+                   -e '/^# CONFIG_DEBUG_ATOMIC_SLEEP is not set$/d' "$f"
+            printf '# CONFIG_MODULE_SIG is not set\nCONFIG_MODULE_FORCE_LOAD=y\nCONFIG_PROVE_LOCKING=y\nCONFIG_DEBUG_ATOMIC_SLEEP=y\n' >> "$f"
             echo "  patched: $f"
           done
           echo "--- resulting lines ---"
-          for f in $FILES; do [ -f "$f" ] && grep -Hn 'MODULE_SIG\|FORCE_LOAD' "$f"; done || true
+          for f in $FILES; do [ -f "$f" ] && grep -Hn 'MODULE_SIG\|FORCE_LOAD\|PROVE_LOCKING\|DEBUG_ATOMIC_SLEEP' "$f"; done || true
 
       # CONFIG_MODULE_SIG is hard-wired on in this tree. Writing an explicit
       # "# CONFIG_MODULE_SIG is not set" into the defconfig is silently ignored
@@ -194,9 +209,11 @@ jobs:
           if s < 0 or e < s:
               print('  no embedded config found'); sys.exit(0)
           cfg = gzip.decompress(d[s+8:e]).decode('utf-8', 'replace')
-          for opt in ('CONFIG_MODULE_SIG', 'CONFIG_MODULE_SIG_FORCE',
-                      'CONFIG_MODULE_FORCE_LOAD', 'CONFIG_MODVERSIONS',
-                      'CONFIG_HARDENED_USERCOPY', 'CONFIG_KPROBES'):
+          for opt in ('CONFIG_PROVE_LOCKING', 'CONFIG_LOCKDEP',
+                      'CONFIG_PROVE_RCU', 'CONFIG_DEBUG_LOCK_ALLOC',
+                      'CONFIG_DEBUG_ATOMIC_SLEEP', 'CONFIG_TRACE_IRQFLAGS',
+                      'CONFIG_MODULE_SIG', 'CONFIG_MODULE_FORCE_LOAD',
+                      'CONFIG_HARDENED_USERCOPY', 'CONFIG_MODVERSIONS'):
               m = [l for l in cfg.splitlines() if re.match(r'^(# )?' + opt + r'[ =]', l)]
               print('  %-30s %s' % (opt, m[0] if m else 'ABSENT'))
           PYEOF
