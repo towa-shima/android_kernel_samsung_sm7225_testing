@@ -126,6 +126,31 @@ jobs:
           echo "--- resulting lines ---"
           for f in $FILES; do [ -f "$f" ] && grep -Hn 'MODULE_SIG\|FORCE_LOAD' "$f"; done || true
 
+      # CONFIG_MODULE_SIG is hard-wired on in this tree. Writing an explicit
+      # "# CONFIG_MODULE_SIG is not set" into the defconfig is silently ignored
+      # (verified: it still comes out =y), and no Kconfig select explains it.
+      # So instead of fighting Kconfig, neutralise the single value the check
+      # actually reads.
+      #
+      # kernel/module.c:
+      #   static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);
+      #
+      # module_sig_check() refuses an unsigned module only when that is true, so
+      # starting it false is exactly equivalent to MODULE_SIG_FORCE=n. It stays
+      # false too: the module_param is bool_enable_only, meaning the kernel
+      # cmdline can turn enforcement ON but never off.
+      - name: Disable module signature enforcement
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          F=kernel/module.c
+          echo "before: $(grep -n 'static bool sig_enforce' "$F")"
+          sed -i 's/^static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);$/static bool sig_enforce = false;/' "$F"
+          AFTER=$(grep -n 'static bool sig_enforce' "$F")
+          echo "after : $AFTER"
+          echo "$AFTER" | grep -q 'static bool sig_enforce = false;' \
+            || { echo "!! the patch did not apply - the line has changed upstream"; exit 1; }
+
       # ---------------------------------------------------------------- build
       # Runs the repo's own build_lito_kernel.sh unchanged, so the result is the
       # same recipe the kernel maintainer uses. Its only interaction is one
@@ -155,8 +180,13 @@ jobs:
           echo "--- kernel banner ---"
           strings -a "$IMG" | grep -m1 '^Linux version'
 
-          # Read the config back out of the built Image. This is the proof that
-          # the change above actually took effect - do not skip it.
+          # Read the config back out of the built Image.
+          # NOTE: CONFIG_MODULE_SIG will STILL read =y here, and that is
+          # expected - the tree forces it on and we work around it in source
+          # instead. What matters is CONFIG_MODULE_FORCE_LOAD=y (for `insmod -f`
+          # to skip CRC checks) and that the sig_enforce patch step above
+          # reported success. Enforcement can only be proven by loading a
+          # module on the device.
           python3 - "$IMG" <<'PYEOF'
           import sys, gzip, re
           d = open(sys.argv[1], 'rb').read()
