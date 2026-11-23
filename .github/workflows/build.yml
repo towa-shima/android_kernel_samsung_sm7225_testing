@@ -1568,12 +1568,62 @@ jobs:
 
           grep -n 'TOWA_CORE\|MODULE_FORCE_LOAD\|MODULE_SIG' "$DEF"
 
+      # Our files, first, alone - about a minute and a half.
+      #
+      # A kernel build runs four jobs in parallel, so a compile error in
+      # drivers/towa scrolls past among thousands of QCACLD lines and the log
+      # ends eleven minutes later with a bare "Makefile:1234: drivers Error 2".
+      # That is exactly what happened and it cost two round trips. Configuring
+      # the tree the way build_lito_kernel.sh does and compiling only our three
+      # objects makes any error the only thing in this step's output.
+      - name: Compile towa sources only
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set +e
+          export PATH="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin:$HOME/aarch64-linux-android-4.9/bin:$PATH"
+          P="CC=clang LLVM_IAS=1 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- DTC_OVERLAY_TEST_EXT=$PWD/tools/ufdt_apply_overlay"
+
+          DEF=vendor/lito-perf_defconfig
+          [ -f "arch/arm64/configs/$DEF" ] || DEF=$(ls arch/arm64/configs/vendor/*perf_defconfig 2>/dev/null | head -1 | sed 's|arch/arm64/configs/||')
+          echo "defconfig: $DEF"
+
+          make O=out $P ARCH=arm64 "$DEF" > /tmp/cfg.log 2>&1
+          cfgrc=$?
+          echo "### defconfig exit: $cfgrc"
+          if [ "$cfgrc" -ne 0 ]; then tail -30 /tmp/cfg.log; exit $cfgrc; fi
+
+          make O=out $P ARCH=arm64 olddefconfig >> /tmp/cfg.log 2>&1
+          make O=out $P ARCH=arm64 prepare      >> /tmp/cfg.log 2>&1
+          echo "--- the three switches that decide what our code compiles as ---"
+          grep -E '^CONFIG_(TOWA_CORE|MODULES|HAVE_HW_BREAKPOINT|PERF_EVENTS)' out/.config || true
+
+          rc=0
+          : > /tmp/towa.log
+          for o in drivers/towa/towa_syscall.o drivers/towa/towa_watch.o drivers/towa/towa_core.o; do
+            echo "=== $o" >> /tmp/towa.log
+            make O=out $P ARCH=arm64 "$o" >> /tmp/towa.log 2>&1 || rc=1
+          done
+
+          echo "### compile exit: $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "=========== OUR ERRORS (with context) ==========="
+            grep -n -B 2 -A 6 -E 'error:|错误' /tmp/towa.log || tail -40 /tmp/towa.log
+          else
+            echo "our three objects compiled cleanly:"
+            ls -l out/drivers/towa/ 2>/dev/null
+          fi
+          exit $rc
+
       - name: Build kernel
         working-directory: ${{ github.workspace }}/kernel
         run: |
-          set -e
           chmod +x tools/* 2>/dev/null || true
           export MAKEFLAGS="-j$(nproc)"
+
+          # Everything goes to a log, and on failure the interesting lines are
+          # printed LAST - so the end of this step is always the answer, and
+          # nobody has to scroll a 40-minute log to find one line of error.
+          set +e
           # lito first: that is the script on Boostkernel2-cip (the 325 tree), and
           # the one the device's own kernels were built with. cheetkernel has
           # build_kernel.sh instead.
@@ -1581,14 +1631,34 @@ jobs:
             echo "using build_lito_kernel.sh"
             chmod +x build_lito_kernel.sh
             sed -i 's/^BUILD_JOB_NUMBER=8$/BUILD_JOB_NUMBER=4/' build_lito_kernel.sh
-            echo "${{ inputs.model }}" | ./build_lito_kernel.sh
+            echo "${{ inputs.model }}" | ./build_lito_kernel.sh > /tmp/build.log 2>&1
+            rc=$?
           elif [ -f build_kernel.sh ]; then
             echo "using build_kernel.sh"
             chmod +x build_kernel.sh
-            ./build_kernel.sh
+            ./build_kernel.sh > /tmp/build.log 2>&1
+            rc=$?
           else
             echo "no build script"; ls -l *.sh; exit 1
           fi
+
+          echo "### build exit code: $rc"
+          echo "### last 25 lines"
+          tail -25 /tmp/build.log
+
+          if [ "$rc" -ne 0 ]; then
+            echo "=========== ERROR LINES ==========="
+            grep -n -m 25 -E 'error:|Error [1-9]|错误|No rule to make|undefined!' /tmp/build.log \
+              || echo "  (no line matched 'error:' - see the tail above)"
+            echo "=========== CONTEXT AROUND THE FIRST 'error:' ==========="
+            first=$(grep -n -m1 'error:' /tmp/build.log | cut -d: -f1)
+            if [ -n "$first" ]; then
+              sed -n "$(( first > 12 ? first - 12 : 1 )),$(( first + 8 ))p" /tmp/build.log
+            fi
+            echo "=========== OUR OWN FILES IN THE LOG ==========="
+            grep -n 'drivers/towa' /tmp/build.log | tail -20
+          fi
+          exit $rc
 
       # A plain `make` builds vmlinux; modules are a separate target. This step
       # is also what produces towa_core.ko.
@@ -1596,12 +1666,22 @@ jobs:
         if: ${{ inputs.builtin != 'y' }}
         working-directory: ${{ github.workspace }}/kernel
         run: |
-          set -e
+          set +e
           export PATH="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin:$HOME/aarch64-linux-android-4.9/bin:$PATH"
           if [ -f out/Module.symvers ]; then OOPT="O=out"; else OOPT=""; fi
           echo "O option: '$OOPT'"
           make $OOPT ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- M=drivers/towa modules
+               CROSS_COMPILE=aarch64-linux-gnu- M=drivers/towa modules \
+               > /tmp/ko.log 2>&1
+          rc=$?
+          echo "### module build exit: $rc"
+          tail -40 /tmp/ko.log
+          if [ "$rc" -ne 0 ]; then
+            echo "=========== ERROR LINES ==========="
+            grep -n -m 25 -E 'error:|Error [1-9]|undefined!' /tmp/ko.log || true
+          fi
+          [ "$rc" -eq 0 ] || exit $rc
+          set -e
           KO=$(find . -name 'towa_core.ko' | head -1)
           [ -n "$KO" ] || { echo "towa_core.ko NOT BUILT"; exit 1; }
           echo "--- $KO ---"
