@@ -218,7 +218,13 @@ jobs:
           	TOWA_OP_WATCH_OFF  = 10,/* a1=slot -> 0				*/
           };
           
-          /* a3 of TOWA_OP_HWBP_SET.  X = execute, i.e. call me at this address. */
+          /* a3 of TOWA_OP_HWBP_SET.  X = execute, i.e. call me at this address.
+           *
+           * TOWA_BP_W (a data watchpoint) is REFUSED by the kernel: the debug exception
+           * is taken before the access completes, this kernel does not single-step it,
+           * and the access therefore re-executes and traps forever - a storm that freezes
+           * the target, whose only escape is skipping the access, which corrupts it.
+           * Use a page watch (TOWA_OP_WATCH_*) to find out who touches memory. */
           #define TOWA_BP_X	0
           #define TOWA_BP_W	1
           
@@ -239,7 +245,12 @@ jobs:
            * left pc alone would trip again on the same instruction and never get out.
            * Nothing here needs a trampoline, so nothing here copies the game's code.
            */
-          #define TOWA_ACT_NONE	0	/* count, and after TOWA_HBP_TRIP skip once */
+          /*
+           * TOWA_ACT_NONE is also REFUSED: counting needs the instruction to execute
+           * again after the trap, which is the same storm.  There is no safe way to count
+           * hits without single-stepping, so an action is mandatory.
+           */
+          #define TOWA_ACT_NONE	0	/* refused - see above */
           #define TOWA_ACT_SKIP	1	/* pc += 4 - the instruction does not run  */
           #define TOWA_ACT_RET	2	/* return from the function: pc = x30,
           				   x0 = value.  A function that answers
@@ -301,6 +312,7 @@ jobs:
           int towa_watch_arm(pid_t pid, unsigned long addr, unsigned long mode);
           int towa_watch_off(unsigned long slot);
           int towa_watch_stat(unsigned long slot, struct towa_watch_info *out);
+          void towa_watch_off_all(void);
           
           #endif /* _TOWA_H */
           TW_H
@@ -424,7 +436,6 @@ jobs:
           	struct mm_struct	*mm;		/* NULL = free */
           	unsigned long		addr;		/* page aligned */
           	unsigned long		mode;
-          	pte_t			saved;		/* the PTE we took access from */
           	unsigned long long	hits;
           	unsigned long		last_pc;
           	unsigned long		last_task;
@@ -564,7 +575,6 @@ jobs:
           		}
           	}
           
-          	w->saved = pte;
           	w->addr = pgaddr;
           	w->mode = mode;
           	w->hits = 0;
@@ -610,27 +620,6 @@ jobs:
           /* -------------------------------------------------------------- restoring */
           
           /*
-           * Called from the fault path with mmap_sem held for read and the faulting
-           * task being current.  Puts the PTE back and marks the slot spent.
-           */
-          static void towa_watch_release(struct towa_watch_slot *w, unsigned long addr)
-          {
-          	struct mm_struct *mm = w->mm;
-          	struct towa_pte p = { NULL, NULL, NULL };
-          
-          	if (w->mode == TOWA_WATCH_ACCESS)
-          		return;	/* the normal fault path rebuilds this one for us */
-          
-          	if (towa_pte_lock(mm, addr & PAGE_MASK, &p))
-          		return;
-          
-          	set_pte_at(mm, addr, p.ptep, w->saved);
-          	towa_pte_unlock(&p);
-          
-          	flush_tlb_mm(mm);
-          }
-          
-          /*
            * The fault-path entry.  Never claims the fault: it records, puts the page back
            * the way it was, and returns so the normal handling goes ahead and the access
            * succeeds.  Nothing here can fail the target's access.
@@ -673,7 +662,13 @@ jobs:
           		if (esr & ESR_ELx_WNR)
           			WRITE_ONCE(w->flags, READ_ONCE(w->flags) | TOWA_WF_WRITE);
           
-          		towa_watch_release(w, addr);
+          		/*
+          		 * That is all.  No page table work, no TLB shootdown, no lock
+          		 * beyond the ones the fault path already holds - which is the
+          		 * whole point.  The page is still write-protected, so the
+          		 * retried write faults once more, finds this slot spent, and
+          		 * the normal fault path installs a proper PTE itself.
+          		 */
           		return 0;
           	}
           
@@ -687,8 +682,6 @@ jobs:
           {
           	struct towa_watch_slot *w;
           	struct mm_struct *mm;
-          	struct towa_pte p = { NULL, NULL, NULL };
-          	unsigned long flags;
           
           	if (slot >= TOWA_WATCH_SLOTS)
           		return -EINVAL;
@@ -697,19 +690,15 @@ jobs:
           	if (!w->mm)
           		return -EINVAL;
           
-          	flags = READ_ONCE(w->flags);
           	mm = w->mm;
           
-          	/* Still armed and still write-protected?  Give the write bit back. */
-          	if (w->mode == TOWA_WATCH_WRITE && (flags & TOWA_WF_ARMED)) {
-          		mmap_read_lock(mm);
-          		if (!towa_pte_lock(mm, w->addr, &p)) {
-          			set_pte_at(mm, w->addr, p.ptep, w->saved);
-          			towa_pte_unlock(&p);
-          			flush_tlb_mm(mm);
-          		}
-          		mmap_read_unlock(mm);
-          	}
+          	/*
+          	 * Nothing to put back.  Arming only took the write bit away, and the
+          	 * target's own first write to that page faults straight into the normal
+          	 * path, which installs a correct PTE by itself.  So this deliberately
+          	 * writes no page table at all: an unload must not be able to alter a
+          	 * live process, and an "unfreeze" must not be able to wait on anything.
+          	 */
           
           	WRITE_ONCE(w->flags, 0);
           	smp_wmb();
@@ -722,6 +711,22 @@ jobs:
           	return 0;
           }
           EXPORT_SYMBOL_GPL(towa_watch_off);
+          
+          /*
+           * Release every slot.  Called from module_exit: the watches live in this
+           * built-in file, not in the module, so without this an rmmod would leave pages
+           * write-protected and the fault hook still firing - the module would look like
+           * the cause of a freeze it can no longer clear.
+           */
+          void towa_watch_off_all(void)
+          {
+          	int i;
+          
+          	for (i = 0; i < TOWA_WATCH_SLOTS; i++)
+          		if (towa_watch[i].mm)
+          			towa_watch_off(i);
+          }
+          EXPORT_SYMBOL_GPL(towa_watch_off_all);
           
           int towa_watch_stat(unsigned long slot, struct towa_watch_info *out)
           {
@@ -1067,6 +1072,31 @@ jobs:
           	struct perf_event *bp;
           	int slot;
           
+          	/*
+          	 * A data watchpoint is refused outright, and so is counting mode.
+          	 *
+          	 * A debug exception is taken BEFORE the access or the instruction
+          	 * completes.  This kernel does not single-step it for us on the way out,
+          	 * so the CPU retries the same access, traps again, and never gets
+          	 * anywhere - a trap storm on that thread that freezes the process.  The
+          	 * earlier version "solved" that by skipping the instruction after 64
+          	 * hits, which for a store means the store never happens and the target's
+          	 * frame is corrupted.  Both outcomes are worse than not arming.
+          	 *
+          	 * Only the actions survive, because every one of them moves pc: the
+          	 * instruction is not retried, so nothing storms.  TOWA_ACT_RET is the
+          	 * useful one - the function returns immediately with a chosen value, and
+          	 * not one byte of it is ever written.
+          	 *
+          	 * To find out who touches what, use a page watch: the page table is
+          	 * written, the page's contents are not, nothing traps on the retry path,
+          	 * and it reports the pc and the task.
+          	 */
+          	if (type == TOWA_BP_W)
+          		return -EOPNOTSUPP;
+          	if (action == TOWA_ACT_NONE)
+          		return -EOPNOTSUPP;
+          
           	for (slot = 0; slot < TOWA_HBP_SLOTS; slot++)
           		if (!towa_hbp[slot].bp)
           			break;
@@ -1386,6 +1416,7 @@ jobs:
           {
           	towa_compat_cleanup();
           	towa_hbp_cleanup();
+          	towa_watch_off_all();	/* pages go back to normal before we leave */
           	towa_set_handler(NULL);
           }
           
@@ -1899,7 +1930,16 @@ jobs:
           
           static void perr(const char *what, long r)
           {
-              fprintf(stderr, "%-10s failed: %s (%ld)\n", what, strerror((int)-r), r);
+              /*
+               * syscall() does NOT hand back the negated errno: it returns -1 and puts
+               * the real code in errno, exactly like every other libc call.  Reading -r
+               * here printed strerror(1) - "Operation not permitted" - for every possible
+               * failure, which is worse than printing nothing.  Read errno first, before
+               * strerror() or fprintf() get a chance to touch it.
+               */
+              int e = (r == -1) ? errno : (int)-r;
+          
+              fprintf(stderr, "%-10s failed: %s (%d)\n", what, strerror(e), e);
           }
           
           // ---------------------------------------------------------------- process lookup
@@ -1959,6 +1999,98 @@ jobs:
               closedir(d);
           
               return exact >= 0 ? exact : loose;
+          }
+          
+          // A pid, or a process name - "13696" or "com.dts.freefireth" both work, so
+          // nothing has to be looked up and pasted by hand.
+          static int resolve_pid(const char *s)
+          {
+              if (!s || !*s) return -1;
+              for (const char *c = s; *c; c++)
+                  if (*c < '0' || *c > '9') return find_pid(s);
+              return atoi(s);
+          }
+          
+          /*
+           * The stack pointer of a pid, straight out of /proc/<pid>/syscall.
+           *
+           * That file is "<nr> <arg0..arg5> <sp> <pc>" while the task is in a syscall,
+           * and a single word like "running" when it is not - so this retries briefly
+           * rather than reporting failure for a thread that is simply on-CPU right now.
+           */
+          /*
+           * A thread's name, out of /proc/<tid>/comm.  The kernel truncates it to 15
+           * characters, which is why the thread list shows things like "IL2CPP Threadpo".
+           */
+          static void read_comm(int tid, char *buf, size_t n)
+          {
+              char p[64];
+              snprintf(p, sizeof(p), "/proc/%d/comm", tid);
+          
+              buf[0] = '\0';
+              int fd = open(p, O_RDONLY);
+              if (fd < 0) return;
+          
+              ssize_t got = read(fd, buf, n - 1);
+              close(fd);
+              if (got <= 0) { buf[0] = '\0'; return; }
+              buf[got] = '\0';
+          
+              char *nl = strchr(buf, '\n');
+              if (nl) *nl = '\0';
+          }
+          
+          // The first live thread of `pid` whose name matches - exactly, or with either
+          // side being the other's prefix, since comm is truncated at 15 characters.
+          // Threads come and go, so this is resolved at the moment it is used.
+          static int find_thread(int pid, const char *want)
+          {
+              char dir[64];
+              snprintf(dir, sizeof(dir), "/proc/%d/task", pid);
+          
+              DIR *d = opendir(dir);
+              if (!d) return -1;
+          
+              int found = -1;
+              struct dirent *e;
+          
+              while ((e = readdir(d)) != NULL) {
+                  if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+          
+                  int tid = atoi(e->d_name);
+                  char comm[64];
+                  read_comm(tid, comm, sizeof(comm));
+                  if (!comm[0]) continue;
+          
+                  size_t a = strlen(comm), b = strlen(want);
+                  size_t k = a < b ? a : b;
+                  if (k >= 4 && !strncmp(comm, want, k)) { found = tid; break; }
+              }
+              closedir(d);
+              return found;
+          }
+          
+          static unsigned long proc_sp(int pid)
+          {
+              char path[64];
+              char buf[512];
+              unsigned long v[9];
+              int got;
+          
+              snprintf(path, sizeof(path), "/proc/%d/syscall", pid);
+              int fd = open(path, O_RDONLY);
+              if (fd < 0) return 0;
+          
+              ssize_t n = read(fd, buf, sizeof(buf) - 1);
+              close(fd);
+              if (n <= 0) return 0;
+              buf[n] = '\0';
+          
+              got = sscanf(buf, "%lu %lx %lx %lx %lx %lx %lx %lx %lx",
+                           &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8]);
+              if (got < 9) return 0;          /* "running", or not a traced-able task */
+          
+              return v[7];                    /* sp */
           }
           
           // ---------------------------------------------------------------- towa wrappers
@@ -2178,6 +2310,235 @@ jobs:
               return 0;
           }
           
+          // ------------------------------------------------- address -> who owns it
+          //
+          // A pc is only useful if you can say which library it is in and how far into
+          // it, because that pair is what you would arm a hook on.
+          
+          struct mapping {
+              unsigned long start, end, off;
+              char perms[8];
+              char path[256];
+          };
+          
+          static int read_maps(int pid, std::vector<mapping> &out)
+          {
+              char p[64];
+              snprintf(p, sizeof(p), "/proc/%d/maps", pid);
+          
+              FILE *f = fopen(p, "r");
+              if (!f) return -1;
+          
+              char line[512];
+              while (fgets(line, sizeof(line), f)) {
+                  mapping m;
+                  char perms[8] = { 0 };
+                  char dev[16] = { 0 };
+                  unsigned long ino = 0;
+          
+                  memset(&m, 0, sizeof(m));
+                  int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %255[^\n]",
+                                 &m.start, &m.end, perms, &m.off, dev, &ino, m.path);
+                  if (n < 5) continue;                 /* anonymous lines end after ino */
+          
+                  snprintf(m.perms, sizeof(m.perms), "%s", perms);
+                  char *q = m.path;
+                  while (*q == ' ') q++;
+                  memmove(m.path, q, strlen(q) + 1);
+                  out.push_back(m);
+              }
+              fclose(f);
+              return 0;
+          }
+          
+          // module + offset for an address; false if it is not mapped in that process
+          static bool module_of(int pid, unsigned long addr, char *name, size_t n,
+                                unsigned long *base, unsigned long *off)
+          {
+              std::vector<mapping> ms;
+              if (read_maps(pid, ms) < 0) return false;
+          
+              int hit = -1;
+              for (size_t i = 0; i < ms.size(); i++)
+                  if (addr >= ms[i].start && addr < ms[i].end) { hit = (int)i; break; }
+              if (hit < 0) return false;
+          
+              const mapping &m = ms[hit];
+              snprintf(name, n, "%s", m.path[0] ? m.path : "(anonymous)");
+          
+              unsigned long b = m.start;
+              if (m.path[0])
+                  for (size_t i = 0; i < ms.size(); i++)
+                      if (!strcmp(ms[i].path, m.path) && ms[i].start < b)
+                          b = ms[i].start;
+          
+              if (base) *base = b;
+              if (off)  *off  = addr - b;
+              return true;
+          }
+          
+          /*
+           * hunt: arm a write watch on the stack page of every thread that looks like it
+           * runs game code, then get out of the way.
+           *
+           * It returns immediately rather than waiting, because the game only runs when
+           * it is in the foreground - so the watching has to happen while the terminal is
+           * not on screen.  Arm now, play, then `towacli report`.
+           */
+          static int cmd_hunt(void)
+          {
+              int pid = find_pid("com.dts.freefireth");
+              if (pid <= 0) { printf("the game is not running\n"); return 1; }
+          
+              /* slots stay held once used, so clear them out first */
+              for (int i = 0; i < 4; i++) towa_watch_off(i);
+          
+              char dir[64];
+              snprintf(dir, sizeof(dir), "/proc/%d/task", pid);
+          
+              DIR *d = opendir(dir);
+              if (!d) { perror("task"); return 1; }
+          
+              struct { int tid; char comm[64]; unsigned long sp; } cand[512];
+              int nc = 0;
+              struct dirent *e;
+          
+              while ((e = readdir(d)) != NULL && nc < 512) {
+                  if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+          
+                  int tid = atoi(e->d_name);
+                  char comm[64];
+                  read_comm(tid, comm, sizeof(comm));
+                  if (!comm[0]) continue;
+          
+                  /* threads that plausibly execute the game, not the framework */
+                  if (!strstr(comm, "Unity") && !strstr(comm, "IL2CPP") &&
+                      !strstr(comm, "Gfx")   && !strstr(comm, "Render"))
+                      continue;
+          
+                  cand[nc].tid = tid;
+                  snprintf(cand[nc].comm, sizeof(cand[nc].comm), "%s", comm);
+                  cand[nc].sp = proc_sp(tid);
+                  nc++;
+              }
+              closedir(d);
+          
+              if (!nc) { printf("no Unity/IL2CPP-looking threads found in pid %d\n", pid); return 1; }
+          
+              printf("pid %d, %d candidate threads\n", pid, nc);
+          
+              /* hottest first: a thread that is actually in a syscall right now has a
+               * live stack pointer and is far more likely to write to it soon */
+              for (int i = 0; i < nc; i++)
+                  for (int j = i + 1; j < nc; j++)
+                      if (cand[j].sp && !cand[i].sp) {
+                          typeof(cand[0]) t = cand[i]; cand[i] = cand[j]; cand[j] = t;
+                      }
+          
+              int armed = 0;
+              for (int i = 0; i < nc && armed < 4; i++) {
+                  unsigned long sp = cand[i].sp;
+          
+                  for (int k = 0; k < 5 && !sp; k++) {
+                      sp = proc_sp(cand[i].tid);
+                      if (!sp) usleep(10000);
+                  }
+                  if (!sp) continue;
+          
+                  unsigned long page = sp & ~0xfffUL;
+                  long slot = towa_watch_arm(cand[i].tid, page, TOWA_WATCH_WRITE);
+                  if (slot < 0) continue;
+          
+                  printf("  slot %ld  tid %-6d %-16s page 0x%lx\n",
+                         slot, cand[i].tid, cand[i].comm, page);
+                  armed++;
+              }
+          
+              if (!armed) { printf("could not arm anything - are all four slots busy?\n"); return 1; }
+          
+              printf("\nnow put the game in front and play, then run:\n"
+                     "    towacli report\n");
+              return 0;
+          }
+          
+          /*
+           * report: read back every slot, name the pc, and release the slots.
+           */
+          static int cmd_report(void)
+          {
+              int pid = find_pid("com.dts.freefireth");
+              int any = 0;
+          
+              for (int slot = 0; slot < 4; slot++) {
+                  towa_watch_info w;
+                  memset(&w, 0, sizeof(w));
+          
+                  if (towa(TOWA_OP_WATCH_STAT, slot, (unsigned long)&w) < 0)
+                      continue;
+          
+                  any = 1;
+                  printf("slot %d  page 0x%lx  hits %llu  %-6s",
+                         slot, w.addr, w.hits,
+                         (w.flags & TOWA_WF_ACCESS) ? "access" : "write");
+          
+                  if (!w.hits) {
+                      printf("  (never touched)\n");
+                      towa_watch_off(slot);
+                      continue;
+                  }
+          
+                  unsigned long pc = (unsigned long)w.last_pc;
+          
+                  if ((pc >> 48) == 0xffff) {
+                      printf("  pc 0x%lx  <kernel>\n", pc);
+                  } else {
+                      char nm[256];
+                      unsigned long base = 0, off = 0;
+                      if (pid > 0 && module_of(pid, pc, nm, sizeof(nm), &base, &off)) {
+                          const char *base_name = strrchr(nm, '/');
+                          printf("  pc 0x%lx  %s + 0x%lx\n",
+                                 pc, base_name ? base_name + 1 : nm, off);
+                      } else {
+                          printf("  pc 0x%lx  (unmapped)\n", pc);
+                      }
+                  }
+          
+                  printf("        %s\n", (w.flags & TOWA_WF_WRITE) ? "WROTE it" : "read");
+                  towa_watch_off(slot);
+              }
+          
+              if (!any) printf("nothing armed - run 'towacli hunt' first\n");
+              return 0;
+          }
+          
+          static int cmd_where(int pid, unsigned long addr)
+          {
+              std::vector<mapping> ms;
+              if (read_maps(pid, ms) < 0) { perror("maps"); return 1; }
+          
+              int hit = -1;
+              for (size_t i = 0; i < ms.size(); i++)
+                  if (addr >= ms[i].start && addr < ms[i].end) { hit = (int)i; break; }
+          
+              if (hit < 0) { printf("0x%lx is not mapped in pid %d\n", addr, pid); return 1; }
+          
+              const mapping &m = ms[hit];
+              printf("mapping : %lx-%lx %s off %lx\n", m.start, m.end, m.perms, m.off);
+              printf("file    : %s\n", m.path[0] ? m.path : "(anonymous)");
+          
+              /* the lowest mapping of the same file is its load base */
+              unsigned long base = m.start;
+              if (m.path[0]) {
+                  for (size_t i = 0; i < ms.size(); i++)
+                      if (!strcmp(ms[i].path, m.path) && ms[i].start < base)
+                          base = ms[i].start;
+              }
+          
+              printf("base    : 0x%lx\n", base);
+              printf("offset  : 0x%lx        <- %lx + 0x%lx\n", addr - base, base, addr - base);
+              return 0;
+          }
+          
           // ---------------------------------------------------------------- utilities
           
           static bool hex_to_bytes(const char *s, std::vector<unsigned char> &out)
@@ -2261,31 +2622,49 @@ jobs:
                   "  compat                        the same thing a scene hack does, through\n"
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
                   "  pid <name>                    find a pid by process name\n"
+                  "  selftest                      arm a watch on our own page, write to it,\n"
+                  "                                report - proves the watcher with\n"
+                  "                                nothing at stake.  Run this first\n"
+                  "  hunt                          watch the stack page of every Unity/IL2CPP\n"
+                  "                                thread at once (4 slots), then return -\n"
+                  "                                play, then run report\n"
+                  "  report                        read every slot back, name each pc, and\n"
+                  "                                release the slots\n"
+                  "  watchstack [pid|tid|name]     watch the page a thread's stack pointer\n"
+                  "                                is on right now.  A name is resolved\n"
+                  "                                at that moment, because threads\n"
+                  "                                come and go: watchstack UnityMain\n"
                   "  base <pid> <soname>           load address of a shared object\n"
+                  "  where <pid> <hexaddr>         which module an address is in,\n"
+                  "                                and its offset into it - turn a\n"
+                  "                                pc from a watch into something\n"
+                  "                                you could hook\n"
                   "  read <pid> <hexaddr> <len>    hexdump from the target\n"
                   "  write <pid> <hexaddr> <hex>   write bytes into the target\n"
                   "\n"
                   "hardware breakpoints (no byte of the target is touched):\n"
-                  "  hbp add   <x|w> <pid> <addr>            count hits, nothing else\n"
-                  "  hbp arm   <x|w> <pid> <addr> [act] [v] [reg]\n"
+                  "  hbp arm   x <pid> <addr> <act> [v] [reg]   an action is mandatory\n"
                   "      act: none  skip        pc += 4, the instruction does not run\n"
                   "           ret   <v>        return from the function now, x0 = v\n"
                   "           pc    <addr>     jump\n"
                   "           x0    <v>        x0 = v, then skip that instruction\n"
                   "           reg   <v> <rn>   regs[rn] = v, then skip it\n"
-                  "  hbp sweep <x|w> <pid> <addr> [act] [v]  arm, watch for 10 s, disarm\n"
+                  "  hbp sweep x <pid> <addr> <act> [v]      arm, watch for 10 s, disarm\n"
                   "  hbp stat  <slot>                        hits, last pc, address\n"
                   "  hbp off   <slot>                        disarm\n"
                   "\n"
                   "page watches (the page table is touched, not the page):\n"
                   "  watch   <pid> <addr> [w|a]    next write (w) or next access (a)\n"
+                  "                                this is the safe way to see who writes\n"
+                  "                                what: the page table is touched, the\n"
+                  "                                page's contents never are\n"
                   "  watch sweep <pid> <addr> [w|a]  arm, wait up to 20 s, report, disarm\n"
                   "  watch stat <slot>             who touched it, from which pc\n"
                   "  watch off  <slot>             disarm\n"
                   "\n"
                   "example:  towacli test\n"
                   "          towacli read 12345 0x71c2a5b000 64\n"
-                  "          towacli hbp sweep x 12345 0x71c2a5b000\n"
+                  "          towacli hbp sweep x 12345 0x71c2a5b000 ret 1\n"
                   "          towacli hbp arm x 12345 0x71c2a5b000 ret 1\n"
                   "          towacli watch sweep 12345 0x71c2a5b400 w\n",
                   me);
@@ -2329,6 +2708,48 @@ jobs:
           
               if (cmd == "compat") {
                   return cmd_compat();
+              }
+          
+              // Prove the whole mechanism on a page of our own, with nothing at stake.
+              // Arm -> write -> fault -> restore -> report, in one second, on a throwaway
+              // anonymous page.  Run this before pointing anything at the game.
+              if (cmd == "selftest") {
+                  void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                  if (p == MAP_FAILED) { perror("mmap"); return 1; }
+          
+                  memset(p, 0, 4096);                 /* faulted in, so the PTE exists */
+          
+                  int me = getpid();
+                  printf("selftest: pid %d, page %p\n", me, p);
+          
+                  long slot = towa_watch_arm(me, (unsigned long)p, TOWA_WATCH_WRITE);
+                  if (slot < 0) {
+                      printf("selftest: arm failed - that alone is the bug\n");
+                      munmap(p, 4096);
+                      return 1;
+                  }
+                  printf("selftest: armed slot %ld\n", slot);
+          
+                  /* the write that must trip it */
+                  *(volatile int *)((char *)p + 64) = 0x5eed;
+          
+                  towa_watch_stat(slot);
+                  towa_watch_off(slot);
+                  munmap(p, 4096);
+          
+                  printf("selftest: done - if that said hits 1 WROTE it, the watcher works\n");
+                  return 0;
+              }
+          
+              if (cmd == "hunt")   return cmd_hunt();
+              if (cmd == "report") return cmd_report();
+          
+              if (cmd == "where") {
+                  if (a.size() < 3) { usage(argv[0]); return 2; }
+                  int pid = resolve_pid(a[1].c_str());
+                  if (pid <= 0) { printf("no such process\n"); return 1; }
+                  return cmd_where(pid, strtoul(a[2].c_str(), NULL, 16));
               }
           
               if (cmd == "pid") {
@@ -2375,7 +2796,7 @@ jobs:
                   }
           
                   unsigned long type = (a[2] == "w") ? TOWA_BP_W : TOWA_BP_X;
-                  int pid = atoi(a[3].c_str());
+                  int pid = resolve_pid(a[3].c_str());
                   unsigned long addr = strtoul(a[4].c_str(), NULL, 16);
           
                   unsigned long action = TOWA_ACT_NONE, value = 0, reg = 0;
@@ -2415,6 +2836,81 @@ jobs:
                   return 0;
               }
           
+              // One command that does the arithmetic: find the thread's stack pointer,
+              // take the page it lives on, and watch that.  The address cannot be
+              // remembered between runs - a reboot or a relaunch moves it.
+              if (cmd == "watchstack") {
+                  int pid = find_pid("com.dts.freefireth");
+                  if (pid <= 0) { printf("the game is not running\n"); return 1; }
+          
+                  int tid = pid;
+                  if (a.size() > 1) {
+                      const std::string &arg = a[1];
+                      bool numeric = !arg.empty();
+          
+                      for (size_t i = 0; i < arg.size(); i++)
+                          if (arg[i] < '0' || arg[i] > '9') { numeric = false; break; }
+          
+                      if (numeric) {
+                          tid = atoi(arg.c_str());
+                      } else if (arg.find('.') != std::string::npos) {
+                          int other = find_pid(arg.c_str());
+                          if (other <= 0) { printf("no process matching %s\n", arg.c_str()); return 1; }
+                          pid = other;
+                          tid = pid;
+                      } else {
+                          /* a thread name - resolved now, because threads come and go */
+                          tid = find_thread(pid, arg.c_str());
+                          if (tid < 0) {
+                              printf("no live thread called '%s'.  Threads in pid %d right now:\n",
+                                     arg.c_str(), pid);
+                              char dir[64];
+                              snprintf(dir, sizeof(dir), "/proc/%d/task", pid);
+                              DIR *d = opendir(dir);
+                              if (d) {
+                                  struct dirent *e;
+                                  int shown = 0;
+                                  while ((e = readdir(d)) != NULL && shown < 25) {
+                                      if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+                                      char comm[64];
+                                      read_comm(atoi(e->d_name), comm, sizeof(comm));
+                                      if (comm[0]) { printf("  %-6s %s\n", e->d_name, comm); shown++; }
+                                  }
+                                  closedir(d);
+                              }
+                              return 1;
+                          }
+                      }
+                  }
+          
+                  unsigned long sp = 0;
+                  for (int i = 0; i < 50 && !sp; i++) {
+                      sp = proc_sp(tid);
+                      if (!sp) usleep(20000);
+                  }
+                  if (!sp) {
+                      printf("could not read the stack pointer of tid %d - is it still alive?\n", tid);
+                      return 1;
+                  }
+          
+                  char comm[64];
+                  read_comm(tid, comm, sizeof(comm));
+          
+                  unsigned long page = sp & ~0xfffUL;
+                  printf("pid %d  tid %d (%s)  sp 0x%lx  page 0x%lx\n",
+                         pid, tid, comm, sp, page);
+          
+                  long slot = towa_watch_arm(tid, page, TOWA_WATCH_WRITE);
+                  if (slot < 0) {
+                      printf("(the page under the live stack pointer should always be mapped;\n"
+                             " EFAULT here means it is not faulted in yet - try again)\n");
+                      return 1;
+                  }
+                  printf("watching slot %ld - play for ten seconds, then:\n", slot);
+                  printf("    towacli watch stat %ld\n", slot);
+                  return 0;
+              }
+          
               // Page watches: arm one page, see who touches it, put it back.
               if (cmd == "watch") {
                   if (a.size() < 2) { usage(argv[0]); return 2; }
@@ -2433,20 +2929,28 @@ jobs:
                       return 0;
                   }
           
-                  // watch | sweep  <pid>  <hexaddr>  [w|a]
+                  // <pid> <hexaddr> [w|a]   or   sweep <pid> <hexaddr> [w|a]
+                  //
+                  // The documented form has no sub-command, so a[1] is the pid.  The
+                  // earlier version demanded a literal "watch" there and printed the
+                  // help instead, which is why the first attempt did nothing.
                   bool sweep = a[1] == "sweep";
-                  if ((a[1] != "watch" && !sweep) || a.size() < 4) { usage(argv[0]); return 2; }
+                  size_t base = (a[1] == "watch" || sweep) ? 2 : 1;
+                  if (a.size() < base + 3) { usage(argv[0]); return 2; }
           
-                  int pid = atoi(a[2].c_str());
-                  unsigned long addr = strtoul(a[3].c_str(), NULL, 16);
-                  unsigned long mode = (a.size() > 4 && a[4] == "a") ? TOWA_WATCH_ACCESS
-                                                                     : TOWA_WATCH_WRITE;
+                  int pid = resolve_pid(a[base].c_str());
+                  unsigned long addr = strtoul(a[base + 1].c_str(), NULL, 16);
+                  unsigned long mode = (a.size() > base + 2 && a[base + 2] == "a")
+                                       ? TOWA_WATCH_ACCESS : TOWA_WATCH_WRITE;
           
                   long slot = towa_watch_arm(pid, addr, mode);
                   if (slot < 0) {
-                      printf("(EFAULT = that page is not faulted in yet, touch it first;  "
-                             "EOPNOTSUPP = access mode was refused - it needs a read-only\n"
-                             " file page, use write mode on anything else)\n");
+                      printf("(ENOENT  = that address is not in any mapping of that pid -\n"
+                             "          the layout changed, get the address again\n"
+                             " EFAULT  = mapped, but the page is not faulted in yet\n"
+                             " EOPNOTSUPP = access mode refused - it needs a read-only file page;\n"
+                             "          use write mode on anything else\n"
+                             " EPERM   = the page is not writable by that process at all)\n");
                       return 1;
                   }
                   printf("watching slot %ld: pid %d page 0x%lx, next %s\n",
