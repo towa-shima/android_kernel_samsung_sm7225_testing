@@ -87,34 +87,72 @@ jobs:
         run: |
           mkdir -p "$HOME/linux-x86-main"
           cd "$HOME/linux-x86-main"
+          D="${{ inputs.clang_dir }}"
+
+          # $1 = url, then the strip-depths to try, in order.
+          #
+          # The depth is NOT a property of the mirror, it is a property of how
+          # the tarball was made, and there are two shapes in the wild:
+          #
+          #   a GitHub repo tarball  ->  one wrapper directory, so strip 1
+          #       linux-x86-clang-21.0.0-r563880-main/bin/clang
+          #   an AOSP-style tarball  ->  bin/, lib/, include/ right at the root,
+          #       so strip 0  (googlesource's +archive, and release assets named
+          #       linux-x86-<sha>-<revision>.tar.gz)
+          #
+          # Hardcoding one depth is what broke this: kiy017's asset is the
+          # AOSP-named shape, so strip 1 deleted bin/ itself and the check for
+          # bin/clang failed on a perfectly good download.  So try each depth and
+          # PROVE it worked by looking for the binary - and say what the layout
+          # actually was when none of them do.
           fetch() {
-            echo "=== trying: $1"
+            url="$1"; shift
+            echo "=== trying: $url"
             curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
                  --connect-timeout 30 --no-progress-meter \
-                 -o /tmp/clang.tar.gz "$1" || { echo "  download failed"; return 1; }
+                 -o /tmp/clang.tar.gz "$url" || { echo "  download failed"; return 1; }
             echo "  downloaded: $(stat -c%s /tmp/clang.tar.gz) bytes"
-            rm -rf "${{ inputs.clang_dir }}" && mkdir -p "${{ inputs.clang_dir }}"
-            tar -xzf /tmp/clang.tar.gz -C "${{ inputs.clang_dir }}" --strip-components="$2" \
-              || { echo "  extract failed"; return 1; }
+
+            for n in "$@"; do
+              rm -rf "$D" && mkdir -p "$D"
+              if ! tar -xzf /tmp/clang.tar.gz -C "$D" --strip-components="$n"; then
+                echo "  strip=$n: extract failed, trying the next depth"
+                continue
+              fi
+              if [ -x "$D/bin/clang" ]; then
+                echo "  OK with --strip-components=$n"
+                "$D/bin/clang" --version || return 1
+                rm -f /tmp/clang.tar.gz
+                return 0
+              fi
+              echo "  strip=$n: no bin/clang; what came out was:"
+              ls "$D" 2>/dev/null | head -6
+            done
+
+            echo "  none of the depths produced bin/clang"
+            echo "  first entries of the tarball were:"
+            tar -tzf /tmp/clang.tar.gz 2>/dev/null | head -6
             rm -f /tmp/clang.tar.gz
-            [ -x "${{ inputs.clang_dir }}/bin/clang" ] || { echo "  no bin/clang"; return 1; }
-            "${{ inputs.clang_dir }}/bin/clang" --version || return 1
+            return 1
           }
+
           # AOSP prunes old revisions out of prebuilts/clang/host/linux-x86, so
           # whether a given revision is still downloadable depends entirely on
-          # who mirrored it.  Which mirror exists is NOT the same for the two
-          # trees this workflow can build: r563880 (the 325 tree) lives in
-          # Aeron-Aeron's and kiy017's imports, r487747c (the 191 tree) in
-          # halogenOS's and project-raspberry's.  So try all of them and let the
-          # first that answers win - a list that only covers one revision is how
-          # this failed the first time, with three 404s and a 400.
-          D="${{ inputs.clang_dir }}"
-          fetch "https://codeload.github.com/Aeron-Aeron/linux-x86-clang-21.0.0-${D#clang-}/tar.gz/refs/heads/main" 1 \
-          || fetch "https://github.com/kiy017/${D}c/releases/download/release/linux-x86-f8439f0628d799092dd07df440a6334cab28939c-${D}c.tar.gz" 1 \
-          || fetch "https://codeload.github.com/halogenOS/android_prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/XOS-13.0" 1 \
-          || fetch "https://codeload.github.com/project-raspberry/prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/fifteen" 1 \
-          || fetch "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/$D.tar.gz" 0 \
-          || { echo "ALL CLANG SOURCES FAILED - no mirror of $D answered"; df -h /; exit 1; }
+          # who mirrored it, and that is NOT the same for the two trees this
+          # workflow can build: r563880 (the 325 tree) lives in Aeron-Aeron's and
+          # kiy017's imports, r487747c (the 191 tree) in halogenOS's and
+          # project-raspberry's.  Try them all; the first that yields a working
+          # clang wins.
+          # kiy017 first: measured to have no wrapper directory (its root really
+          # is AndroidVersion.txt, bin/, lib/), so strip 0 is right and there is
+          # nothing to interpret.  Aeron-Aeron is a GitHub repo tarball and needs
+          # strip 1 - checked, its root is linux-x86-clang-...-main/.
+          fetch "https://github.com/kiy017/${D}c/releases/download/release/linux-x86-f8439f0628d799092dd07df440a6334cab28939c-${D}c.tar.gz" 0 1 2 \
+          || fetch "https://codeload.github.com/Aeron-Aeron/linux-x86-clang-21.0.0-${D#clang-}/tar.gz/refs/heads/main" 1 0 2 \
+          || fetch "https://codeload.github.com/halogenOS/android_prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/XOS-13.0" 1 0 2 \
+          || fetch "https://codeload.github.com/project-raspberry/prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/fifteen" 1 0 2 \
+          || fetch "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/$D.tar.gz" 0 1 \
+          || { echo "ALL CLANG SOURCES FAILED - no mirror of $D yielded a clang"; df -h /; exit 1; }
 
           echo "--- which clang did we actually end up with? ---"
           ls -d "$HOME/linux-x86-main/$D" && "$HOME/linux-x86-main/$D/bin/clang" --version
