@@ -1,19 +1,37 @@
-name: Build CheetKernal 191 (m23xq)
+name: Build towa kernel (325 / 191 + towa syscall)
 
-# Same pipeline as the 325 build, pointed at the .191 source.
+# One run gives you two files:
+#   * a flashable AnyKernel3 zip whose kernel carries a NEW syscall, and
+#   * towa_core.ko - the module that holds the actual read/write logic.
 #
-# The only kernel change RTkernel needs is CONFIG_HARDENED_USERCOPY=y, which
-# this workflow applies to the defconfig automatically and then verifies by
-# reading the built Image's embedded config back out.
+# Why split it that way:
+#   RT and CShell get their syscall by writing sys_call_table[] at runtime. On
+#   this kernel that table is read-only (.rodata + STRICT_KERNEL_RWX), which is
+#   the most likely reason RT loads and then never hooks anything, and it is
+#   certainly why it would collide with KernelSU's manual hook, which wants the
+#   very same table. We don't write it at all - the compiler emits the entry,
+#   once, at build time. Nothing at runtime touches sys_call_table.
 #
-# Fill in the branch name in the Run workflow box once mrsiri gives you the repo.
+#   The stub that lives in the flashed kernel is ~40 lines and does nothing but
+#   tail-call a registered function pointer. All the real code sits in the
+#   module, so after this one flash every future change is insmod / rmmod with
+#   no reflash. With the module unloaded the syscall returns -ENOSYS, i.e. it
+#   looks exactly like the hole in the table it sits in.
+#
+# The build log prints TOWA_NR=<n>. That is the syscall number - normally 294,
+# but the run reads it out of the tree rather than assuming it.
+#
+# DEFAULTS ARE THE 325 BUILD (branch Boostkernel2-cip, clang-r563880). The
+# source below is version-agnostic - none of it cares which 4.19 it lands in -
+# so the 191 tree is the same run with branch=cheetkernel and
+# clang_dir=clang-r487747c.
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Source branch (e.g. cheet)'
+        description: 'Source branch'
         required: true
-        default: 'cheetkernel'
+        default: 'Boostkernel2-cip'
       model:
         description: 'Device model'
         required: true
@@ -21,11 +39,11 @@ on:
       clang_dir:
         description: 'AOSP clang revision directory'
         required: true
-        default: 'clang-r487747c'
-      ksu:
-        description: 'Build KernelSU in? y = BakaSU root, n = rootless (for APatch)'
+        default: 'clang-r563880'
+      builtin:
+        description: 'y = build towa into the kernel (nothing in /proc/modules), n = loadable towa_core.ko'
         required: true
-        default: 'y'
+        default: 'n'
 
 jobs:
   build:
@@ -47,7 +65,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential cpio flex git libelf-dev libssl-dev \
+            bc bison build-essential cpio flex git kmod libelf-dev libssl-dev \
             lz4 python3 rsync unzip wget xz-utils zip
 
       - name: Clone kernel source
@@ -58,21 +76,17 @@ jobs:
             https://github.com/Aflaungos/android_kernel_samsung_sm7225_testing.git \
             "$GITHUB_WORKSPACE/kernel"
           cd "$GITHUB_WORKSPACE/kernel"
+          echo "--- commit we are building ---"
+          git log -1 --format='%H %ad %s' --date=iso
           echo "--- version ---"
           head -5 Makefile
-          echo "--- build script present? ---"
-          ls -l build_lito_kernel.sh 2>/dev/null || echo "  NO build_lito_kernel.sh"
-          echo "--- defconfigs ---"
-          ls arch/arm64/configs/vendor/ 2>/dev/null | head -20 || true
+          ls -l build_kernel.sh build_lito_kernel.sh 2>/dev/null || true
 
-      # r487747c is the clang 17.0.2 that built the original CheetKernal
-      # (banner: "Android (10087095, ...) clang version 17.0.2"). AOSP deletes
-      # old revisions from prebuilts/clang/host/linux-x86, so these are imports.
+      # r487747c is the clang 17.0.2 that built the CheetKernal 191 banner.
       - name: Toolchain - ${{ inputs.clang_dir }}
         run: |
           mkdir -p "$HOME/linux-x86-main"
           cd "$HOME/linux-x86-main"
-          echo "--- disk before ---"; df -h / | tail -1
           fetch() {
             echo "=== trying: $1"
             curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
@@ -83,15 +97,14 @@ jobs:
             tar -xzf /tmp/clang.tar.gz -C "${{ inputs.clang_dir }}" --strip-components="$2" \
               || { echo "  extract failed"; return 1; }
             rm -f /tmp/clang.tar.gz
-            [ -x "${{ inputs.clang_dir }}/bin/clang" ] || { echo "  no bin/clang"; ls "${{ inputs.clang_dir }}" | head; return 1; }
+            [ -x "${{ inputs.clang_dir }}/bin/clang" ] || { echo "  no bin/clang"; return 1; }
             "${{ inputs.clang_dir }}/bin/clang" --version || return 1
           }
           D="${{ inputs.clang_dir }}"
           fetch "https://codeload.github.com/halogenOS/android_prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/XOS-13.0" 1 \
           || fetch "https://codeload.github.com/project-raspberry/prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/fifteen" 1 \
           || fetch "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/$D.tar.gz" 0 \
-          || { echo "ALL CLANG SOURCES FAILED"; df -h /; exit 1; }
-          echo "--- disk after ---"; df -h / | tail -1
+          || { echo "ALL CLANG SOURCES FAILED"; exit 1; }
 
       - name: Toolchain - aarch64-linux-android-4.9
         run: |
@@ -101,91 +114,1445 @@ jobs:
             | tar -xz -C "$HOME/aarch64-linux-android-4.9"
           ls "$HOME/aarch64-linux-android-4.9/bin" | head
 
-      # RTkernel (all b/c variants) imports exactly one symbol your kernel does
-      # not export: __check_object_size. That comes from HARDENED_USERCOPY.
-      # Note the non-b 4.19.191.sh build is a lockdep build and needs six more
-      # symbols - do not use it.
-      - name: Enable CONFIG_HARDENED_USERCOPY
+      # ------------------------------------------------------- the towa source
+      # The four files are written here so this workflow stays a single upload.
+      - name: Write towa sources
         working-directory: ${{ github.workspace }}/kernel
         run: |
           set -e
-          # The cheetkernel branch builds from m23xq_eur_open_defconfig
-          # (see build_kernel.sh), and the maintainer already enabled
-          # HARDENED_USERCOPY / KPROBES / PROVE_LOCKING there.
+          mkdir -p drivers/towa include/linux
+          cat > drivers/towa/towa.h <<'TW_H'
+          /* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _TOWA_H
+          #define _TOWA_H
+          
+          /*
+           * Shared between the kernel side and the userspace client.
+           *
+           * TOWA_COOKIE is the first argument of every call. Without it the syscall
+           * answers -ENOSYS, so a blind probe of the number sees the same thing it would
+           * see from an unused table slot.
+           */
+          #define TOWA_COOKIE	0x9E3779B97F4A7C15ULL
+          
+          /* TOWA_OP_PING returns this. */
+          #define TOWA_MAGIC	0x5032300AUL
+          
+          enum {
+          	TOWA_OP_PING       = 0,	/* -> TOWA_MAGIC				*/
+          	TOWA_OP_READ       = 1,	/* a1=pid a2=addr a3=buf a4=len -> bytes	*/
+          	TOWA_OP_WRITE      = 2,	/* a1=pid a2=addr a3=buf a4=len -> bytes	*/
+          	TOWA_OP_BASE       = 3,	/* a1=pid a2=name a3=&out -> 0		*/
+          
+          	/*
+          	 * Hardware breakpoints.  A breakpoint costs no code change at all:
+          	 * nothing is written to the target, so there is no byte to notice and
+          	 * nothing that survives a restart of the game.  Four registers is what
+          	 * the architecture gives us.
+          	 */
+          	TOWA_OP_HWBP_SET   = 4,	/* a1=pid a2=addr a3=type a4=len -> slot	*/
+          	TOWA_OP_HWBP_DEL   = 5,	/* a1=slot -> 0				*/
+          	TOWA_OP_HWBP_STAT  = 6,	/* a1=slot a2=&u64[3] -> 0		*/
+          	TOWA_OP_HWBP_ARM   = 7,	/* a1=&struct towa_hbp_cfg -> slot		*/
+          
+          	/*
+          	 * Page watches - the fault-path half of a PTE hook.  Arming takes the
+          	 * access away from one page in one process; the next time that process
+          	 * touches it the kernel records who, from where, and whether it was a
+          	 * write, then lets the access through.  The page's own contents are
+          	 * never modified, which is the point.
+          	 */
+          	TOWA_OP_WATCH_ARM  = 8,	/* a1=&struct towa_watch_cfg -> slot		*/
+          	TOWA_OP_WATCH_STAT = 9,	/* a1=slot a2=&struct towa_watch_info -> 0	*/
+          	TOWA_OP_WATCH_OFF  = 10,/* a1=slot -> 0				*/
+          };
+          
+          /* a3 of TOWA_OP_HWBP_SET.  X = execute, i.e. call me at this address. */
+          #define TOWA_BP_X	0
+          #define TOWA_BP_W	1
+          
+          #define TOWA_HBP_SLOTS	4
+          
+          /*
+           * Safety net.  An execute breakpoint traps *before* the instruction runs, so
+           * unless the kernel single-steps over it the CPU retries the same instruction
+           * and traps again - a livelock that pins a core.  In counting mode, after this
+           * many hits the handler skips the instruction once and stops being a loop.
+           */
+          #define TOWA_HBP_TRIP	64
+          
+          /*
+           * What the breakpoint handler does when it fires.
+           *
+           * The four that act all leave the pc somewhere else on purpose: an action that
+           * left pc alone would trip again on the same instruction and never get out.
+           * Nothing here needs a trampoline, so nothing here copies the game's code.
+           */
+          #define TOWA_ACT_NONE	0	/* count, and after TOWA_HBP_TRIP skip once */
+          #define TOWA_ACT_SKIP	1	/* pc += 4 - the instruction does not run  */
+          #define TOWA_ACT_RET	2	/* return from the function: pc = x30,
+          				   x0 = value.  A function that answers
+          				   "yes" forever costs not one byte.        */
+          #define TOWA_ACT_PC	3	/* pc = value                              */
+          #define TOWA_ACT_X0	4	/* x0 = value, then skip that instruction  */
+          #define TOWA_ACT_REG	5	/* regs[reg] = value, then skip it         */
+          
+          /* TOWA_OP_WATCH_ARM modes. */
+          #define TOWA_WATCH_WRITE	0	/* next write to the page			*/
+          #define TOWA_WATCH_ACCESS	1	/* next read, write or execute		*/
+          
+          #define TOWA_WATCH_SLOTS	4
+          
+          #define TOWA_MAX_XFER		(1024 * 1024)
+          
+          /* towa_watch_info.flags */
+          #define TOWA_WF_ARMED	0x0001
+          #define TOWA_WF_SPENT	0x0002
+          #define TOWA_WF_WRITE	0x0004	/* the access that fired was a write	*/
+          #define TOWA_WF_ACCESS	0x0008	/* armed in ACCESS mode			*/
+          
+          struct towa_hbp_cfg {
+          	int		pid;
+          	unsigned long	type;
+          	unsigned long	addr;
+          	unsigned long	len;
+          	unsigned long	action;
+          	unsigned long	value;
+          	unsigned long	reg;
+          };
+          
+          struct towa_watch_cfg {
+          	int		pid;
+          	unsigned long	addr;
+          	unsigned long	mode;
+          };
+          
+          struct towa_watch_info {
+          	unsigned long long	hits;
+          	unsigned long long	last_pc;
+          	unsigned long long	last_task;
+          	unsigned long		addr;
+          	unsigned long		flags;
+          };
+          
+          /* What towa_syscall.c holds and calls. */
+          typedef long (*towa_handler_t)(unsigned long op, unsigned long a1,
+          			       unsigned long a2, unsigned long a3,
+          			       unsigned long a4);
+          
+          /* Implemented in towa_watch.c, which is built into the kernel, not the module:
+           * it needs the page-fault path and the core mm helpers. */
+          int towa_watch_arm(pid_t pid, unsigned long addr, unsigned long mode);
+          int towa_watch_off(unsigned long slot);
+          int towa_watch_stat(unsigned long slot, struct towa_watch_info *out);
+          
+          #endif /* _TOWA_H */
+          TW_H
+          cat > drivers/towa/towa_syscall.c <<'TW_S'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * The syscall front end.
+           *
+           * Its entire body is "call the registered handler". The table entry is emitted
+           * by the compiler at build time, so nothing here ever writes to sys_call_table
+           * - no set_memory_rw, no text poking, no rwxp page, and nothing for another
+           * hook to collide with.
+           *
+           * If no handler is installed (towa_core.ko not loaded) this returns -ENOSYS,
+           * which is what an unimplemented table slot returns anyway.
+           */
+          #include <linux/kernel.h>
+          #include <linux/syscalls.h>
+          #include <linux/mutex.h>
+          #include <linux/export.h>
+          
+          #include "towa.h"
+          
+          static towa_handler_t towa_handler __read_mostly;
+          static DEFINE_MUTEX(towa_mutex);
+          
+          void towa_set_handler(towa_handler_t fn)
+          {
+          	mutex_lock(&towa_mutex);
+          	towa_handler = fn;
+          	mutex_unlock(&towa_mutex);
+          }
+          EXPORT_SYMBOL_GPL(towa_set_handler);
+          
+          SYSCALL_DEFINE6(towa, unsigned long, cookie, unsigned long, op,
+          		unsigned long, a1, unsigned long, a2,
+          		unsigned long, a3, unsigned long, a4)
+          {
+          	towa_handler_t fn;
+          	long ret;
+          
+          	if (cookie != TOWA_COOKIE)
+          		return -ENOSYS;
+          
+          	/*
+          	 * The mutex is held across the call on purpose: it serialises two
+          	 * concurrent callers, and it also means rmmod cannot free the module
+          	 * while a call is still inside it (module_exit takes the same lock to
+          	 * clear the handler).
+          	 */
+          	mutex_lock(&towa_mutex);
+          	fn = towa_handler;
+          	ret = fn ? fn(op, a1, a2, a3, a4) : -ENOSYS;
+          	mutex_unlock(&towa_mutex);
+          
+          	return ret;
+          }
+          TW_S
+          cat > drivers/towa/towa_watch.c <<'TW_W'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * Page watches - the fault-path half of a PTE hook.
+           *
+           * This file is built into the kernel, not into the module, because it needs two
+           * things a module cannot have: a call site inside do_page_fault() and the core
+           * mm helpers that manipulate another process's page tables.
+           *
+           * How it works, and why it is the safe end of "PTE hook":
+           *
+           *   1. Arming takes access to one page away from one process.  For a write
+           *      watch that means clearing the write bit in the PTE; for an access watch
+           *      it means clearing the PTE so the next touch faults.  Either way only the
+           *      page TABLE is touched.  The page's contents are untouched, so a scanner
+           *      that reads the memory finds exactly the original bytes - there is no
+           *      shadow page and no patched instruction anywhere.
+           *
+           *   2. The next time that process touches the page it faults, do_page_fault()
+           *      calls us before the normal handling, and we record the pc it faulted
+           *      from, which task it was, and whether it was a write.
+           *
+           *   3. We then put the PTE back the way it was and return "not handled", so the
+           *      normal fault path resolves it and the access simply succeeds.  Nothing
+           *      is emulated and no instruction is decoded - which is the whole trick.
+           *      A watch is single shot: one arm, one event.  Arm it again for another.
+           *
+           * What this deliberately does NOT do yet: substitute a different value for the
+           * game to read.  That needs either a shadow page (the page then belongs to the
+           * file's page cache, which is a real hazard) or decoding the faulting
+           * instruction.  Both are separate steps that want this watcher proven first.
+           */
+          #include <linux/kernel.h>
+          #include <linux/module.h>
+          #include <linux/mm.h>
+          #include <linux/sched.h>
+          #include <linux/sched/mm.h>
+          #include <linux/pid.h>
+          #include <linux/export.h>
+          #include <linux/spinlock.h>
+          #include <linux/jump_label.h>
+          #include <linux/rmap.h>
+          #include <linux/pagemap.h>
+          #include <asm/pgtable.h>
+          #include <asm/tlbflush.h>
+          #include <asm/ptrace.h>
+          #include <asm/esr.h>
+          
+          #include "towa.h"
+          
+          /*
+           * Off unless something is armed.  A static branch compiles to a no-op that the
+           * CPU predicts perfectly, so do_page_fault() pays nothing for the call below
+           * while no watch exists.
+           */
+          DEFINE_STATIC_KEY_FALSE(towa_watch_key);
+          
+          struct towa_watch_slot {
+          	struct mm_struct	*mm;		/* NULL = free */
+          	unsigned long		addr;		/* page aligned */
+          	unsigned long		mode;
+          	pte_t			saved;		/* the PTE we took access from */
+          	unsigned long long	hits;
+          	unsigned long		last_pc;
+          	unsigned long		last_task;
+          	unsigned long		last_addr;
+          	unsigned long		flags;
+          };
+          
+          static struct towa_watch_slot towa_watch[TOWA_WATCH_SLOTS];
+          static int towa_watch_live;
+          
+          /* ------------------------------------------------------------- page table */
+          
+          struct towa_pte {
+          	pmd_t		*pmd;
+          	pte_t		*ptep;
+          	spinlock_t	*ptl;
+          };
+          
+          /*
+           * Walk to the PTE for addr.  Caller must hold mm->mmap_sem for read.  Returns
+           * 0 with ptep locked, or an error with nothing held.
+           */
+          static int towa_pte_lock(struct mm_struct *mm, unsigned long addr,
+          			 struct towa_pte *out)
+          {
+          	pgd_t *pgd;
+          	pud_t *pud;
+          	pmd_t *pmd;
+          
+          	pgd = pgd_offset(mm, addr);
+          	if (pgd_none(*pgd) || pgd_bad(*pgd))
+          		return -EFAULT;
+          
+          	pud = pud_offset(pgd, addr);
+          	if (pud_none(*pud) || pud_bad(*pud))
+          		return -EFAULT;
+          
+          	pmd = pmd_offset(pud, addr);
+          	if (pmd_none(*pmd) || pmd_bad(*pmd))
+          		return -EFAULT;
+          
+          	/* A huge mapping has no PTE to take access from. */
+          	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
+          		return -EOPNOTSUPP;
+          
+          	out->pmd  = pmd;
+          	out->ptep = pte_offset_map_lock(mm, pmd, addr, &out->ptl);
+          	if (!out->ptep) {
+          		out->ptl = NULL;
+          		return -EFAULT;
+          	}
+          	return 0;
+          }
+          
+          static void towa_pte_unlock(struct towa_pte *p)
+          {
+          	if (p->ptep)
+          		pte_unmap_unlock(p->ptep, p->ptl);
+          }
+          
+          /* ---------------------------------------------------------------- arming */
+          
+          int towa_watch_arm(pid_t pid, unsigned long addr, unsigned long mode)
+          {
+          	struct towa_watch_slot *w = NULL;
+          	struct task_struct *t;
+          	struct mm_struct *mm;
+          	struct vm_area_struct *vma;
+          	struct towa_pte p = { NULL, NULL, NULL };
+          	unsigned long pgaddr = addr & PAGE_MASK;
+          	pte_t pte, new;
+          	int slot, ret;
+          
+          	if (mode != TOWA_WATCH_WRITE && mode != TOWA_WATCH_ACCESS)
+          		return -EINVAL;
+          
+          	for (slot = 0; slot < TOWA_WATCH_SLOTS; slot++)
+          		if (!towa_watch[slot].mm) {
+          			w = &towa_watch[slot];
+          			break;
+          		}
+          	if (!w)
+          		return -ENOSPC;
+          
+          	rcu_read_lock();
+          	t = find_task_by_vpid(pid);
+          	if (t)
+          		get_task_struct(t);
+          	rcu_read_unlock();
+          	if (!t)
+          		return -ESRCH;
+          
+          	/* get_task_mm returns with a reference held; we keep it until disarm. */
+          	mm = get_task_mm(t);
+          	put_task_struct(t);
+          	if (!mm)
+          		return -EINVAL;
+          
+          	down_read(&mm->mmap_sem);
+          
+          	vma = find_vma(mm, addr);
+          	if (!vma || vma->vm_start > addr) {
+          		ret = -ENOENT;
+          		goto out_unlock;
+          	}
+          
+          	ret = towa_pte_lock(mm, addr, &p);
+          	if (ret)
+          		goto out_unlock;
+          
+          	pte = *p.ptep;
+          	if (!pte_present(pte)) {
+          		/* Not faulted in yet - there is no access to take away. */
+          		ret = -EFAULT;
+          		goto out_pte;
+          	}
+          
+          	new = pte;
+          	if (mode == TOWA_WATCH_WRITE) {
+          		/*
+          		 * Safe on anything: clearing the write bit is exactly what
+          		 * copy-on-write does, and the page is not lost, only made
+          		 * read-only until the next write faults.
+          		 */
+          		new = pte_wrprotect(pte);
+          	} else {
+          		/*
+          		 * Clearing the PTE means the normal fault path has to rebuild it
+          		 * from the VMA, so it must be a clean file page.  On a writable
+          		 * pte that rebuild would throw away a private copy, and on an
+          		 * anonymous page there is nothing to rebuild from at all.
+          		 */
+          		if (!vma->vm_file || pte_write(pte)) {
+          			ret = -EOPNOTSUPP;
+          			goto out_pte;
+          		}
+          	}
+          
+          	w->saved = pte;
+          	w->addr = pgaddr;
+          	w->mode = mode;
+          	w->hits = 0;
+          	w->last_pc = 0;
+          	w->last_task = 0;
+          	w->last_addr = 0;
+          	w->flags = TOWA_WF_ARMED;
+          	if (mode == TOWA_WATCH_ACCESS)
+          		w->flags |= TOWA_WF_ACCESS;
+          
+          	if (mode == TOWA_WATCH_WRITE)
+          		set_pte_at(mm, addr, p.ptep, new);
+          	else
+          		ptep_get_and_clear(mm, addr, p.ptep);
+          
+          	towa_pte_unlock(&p);
+          	up_read(&mm->mmap_sem);
+          
+          	/*
+          	 * The PTE changed, so every CPU that might have it cached has to be
+          	 * told.  Safe here - process context, no spinlock held.
+          	 */
+          	flush_tlb_mm(mm);
+          
+          	if (towa_watch_live++ == 0)
+          		static_branch_enable(&towa_watch_key);
+          
+          	/* Published last: the fault path keys off w->mm. */
+          	smp_wmb();
+          	w->mm = mm;
+          
+          	return slot;
+          
+          out_pte:
+          	towa_pte_unlock(&p);
+          out_unlock:
+          	up_read(&mm->mmap_sem);
+          	mmput(mm);
+          	return ret;
+          }
+          EXPORT_SYMBOL_GPL(towa_watch_arm);
+          
+          /* -------------------------------------------------------------- restoring */
+          
+          /*
+           * Called from the fault path with mm->mmap_sem held for read and the faulting
+           * task being current.  Puts the PTE back and marks the slot spent.
+           */
+          static void towa_watch_release(struct towa_watch_slot *w, unsigned long addr)
+          {
+          	struct mm_struct *mm = w->mm;
+          	struct towa_pte p = { NULL, NULL, NULL };
+          
+          	if (w->mode == TOWA_WATCH_ACCESS)
+          		return;	/* the normal fault path rebuilds this one for us */
+          
+          	if (towa_pte_lock(mm, addr & PAGE_MASK, &p))
+          		return;
+          
+          	set_pte_at(mm, addr, p.ptep, w->saved);
+          	towa_pte_unlock(&p);
+          
+          	flush_tlb_mm(mm);
+          }
+          
+          /*
+           * The fault-path entry.  Never claims the fault: it records, puts the page back
+           * the way it was, and returns so the normal handling goes ahead and the access
+           * succeeds.  Nothing here can fail the target's access.
+           */
+          int towa_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr)
+          {
+          	struct mm_struct *mm;
+          	struct towa_watch_slot *w;
+          	unsigned long flags;
+          	int i;
+          
+          	if (!static_branch_unlikely(&towa_watch_key))
+          		return 0;
+          
+          	mm = current->mm;
+          	if (!mm)
+          		return 0;
+          
+          	for (i = 0; i < TOWA_WATCH_SLOTS; i++) {
+          		w = &towa_watch[i];
+          		if (w->mm != mm)
+          			continue;
+          
+          		flags = READ_ONCE(w->flags);
+          		if (!(flags & TOWA_WF_ARMED))
+          			continue;
+          		if ((addr & PAGE_MASK) != w->addr)
+          			continue;
+          
+          		/*
+          		 * Take the slot first: a second CPU faulting on the same page
+          		 * must not record a second, phantom event.
+          		 */
+          		WRITE_ONCE(w->flags, flags | TOWA_WF_SPENT);
+          
+          		w->hits++;
+          		w->last_pc = regs ? regs->pc : 0;
+          		w->last_task = current->tgid;
+          		w->last_addr = addr;
+          		if (esr & ESR_ELx_WNR)
+          			WRITE_ONCE(w->flags, READ_ONCE(w->flags) | TOWA_WF_WRITE);
+          
+          		towa_watch_release(w, addr);
+          		return 0;
+          	}
+          
+          	return 0;
+          }
+          EXPORT_SYMBOL_GPL(towa_watch_fault);
+          
+          /* ---------------------------------------------------------------- disarm */
+          
+          int towa_watch_off(unsigned long slot)
+          {
+          	struct towa_watch_slot *w;
+          	struct mm_struct *mm;
+          	struct towa_pte p = { NULL, NULL, NULL };
+          	unsigned long flags;
+          
+          	if (slot >= TOWA_WATCH_SLOTS)
+          		return -EINVAL;
+          
+          	w = &towa_watch[slot];
+          	if (!w->mm)
+          		return -EINVAL;
+          
+          	flags = READ_ONCE(w->flags);
+          	mm = w->mm;
+          
+          	/* Still armed and still write-protected?  Give the write bit back. */
+          	if (w->mode == TOWA_WATCH_WRITE && (flags & TOWA_WF_ARMED)) {
+          		down_read(&mm->mmap_sem);
+          		if (!towa_pte_lock(mm, w->addr, &p)) {
+          			set_pte_at(mm, w->addr, p.ptep, w->saved);
+          			towa_pte_unlock(&p);
+          			flush_tlb_mm(mm);
+          		}
+          		up_read(&mm->mmap_sem);
+          	}
+          
+          	WRITE_ONCE(w->flags, 0);
+          	smp_wmb();
+          	w->mm = NULL;
+          	mmput(mm);
+          
+          	if (towa_watch_live > 0 && --towa_watch_live == 0)
+          		static_branch_disable(&towa_watch_key);
+          
+          	return 0;
+          }
+          EXPORT_SYMBOL_GPL(towa_watch_off);
+          
+          int towa_watch_stat(unsigned long slot, struct towa_watch_info *out)
+          {
+          	struct towa_watch_slot *w;
+          
+          	if (slot >= TOWA_WATCH_SLOTS)
+          		return -EINVAL;
+          
+          	w = &towa_watch[slot];
+          	if (!w->mm)
+          		return -EINVAL;
+          
+          	out->hits      = w->hits;
+          	out->last_pc   = w->last_pc;
+          	out->last_task = w->last_task;
+          	out->addr      = w->addr;
+          	out->flags     = READ_ONCE(w->flags);
+          
+          	return 0;
+          }
+          EXPORT_SYMBOL_GPL(towa_watch_stat);
+          TW_W
+          cat > drivers/towa/towa_core.c <<'TW_C'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * towa core - everything that actually touches memory.
+           *
+           * There is no device node, no proc entry, no sysfs attribute and not one
+           * printk: logcat is one of the few channels the anti-cheat really does read,
+           * so this module never says anything.
+           *
+           * Reads and writes map the target's own pages and copy straight between them
+           * and the caller.  No staging buffer, so a bulk read costs one copy instead of
+           * two, and none of the userspace checks apply - no VMA permission test, no
+           * ptrace_may_access, no SELinux.  Writes break copy-on-write the same way
+           * /proc/<pid>/mem does, so a read-only mapping can be written too.
+           */
+          #include <linux/kernel.h>
+          #include <linux/sched.h>
+          #include <linux/sched/mm.h>
+          #include <linux/mm.h>
+          #include <linux/pid.h>
+          #include <linux/uaccess.h>
+          #include <linux/slab.h>
+          #include <linux/rcupdate.h>
+          #include <linux/fs.h>
+          #include <linux/dcache.h>
+          #include <linux/module.h>
+          #include <linux/miscdevice.h>
+          #include <linux/proc_fs.h>
+          #include <linux/string.h>
+          #include <linux/perf_event.h>
+          #include <linux/hw_breakpoint.h>
+          #include <linux/pagemap.h>
+          #include <linux/highmem.h>
+          
+          #include "towa.h"
+          
+          /*
+           * 1 = also answer as a device node the wanbai.h family of clients can find
+           * (see the block below).  0 = syscall only, no nodes.
+           */
+          #define TOWA_COMPAT	1
+          
+          static struct task_struct *towa_get_task(pid_t pid)
+          {
+          	struct task_struct *t;
+          
+          	rcu_read_lock();
+          	t = find_task_by_vpid(pid);
+          	if (t)
+          		get_task_struct(t);
+          	rcu_read_unlock();
+          
+          	return t;
+          }
+          
+          /* ------------------------------------------------------- bulk memory, no buffer */
+          
+          /*
+           * Pages are mapped in batches and copied straight to and from the caller, so a
+           * transfer costs one copy rather than the two a staging buffer would.
+           *
+           * get_user_pages_remote() is the same primitive a driver uses to pin a user
+           * buffer; pointed at another process's mm it pins that process's pages.
+           * FOLL_FORCE is what makes a write into a read-only mapping work: it breaks
+           * copy-on-write rather than refusing.
+           */
+          #define TOWA_BATCH	32
+          
+          static long towa_rw(pid_t pid, unsigned long addr, void __user *ubuf,
+          		    unsigned long len, bool write)
+          {
+          	struct page *pages[TOWA_BATCH];
+          	struct task_struct *t;
+          	struct mm_struct *mm;
+          	unsigned long done = 0;
+          	unsigned int gup_flags = FOLL_FORCE;
+          	int ret = 0;
+          
+          	if (!len || len > TOWA_MAX_XFER || !ubuf)
+          		return -EINVAL;
+          
+          	t = towa_get_task(pid);
+          	if (!t)
+          		return -ESRCH;
+          	mm = get_task_mm(t);
+          	if (!mm) {
+          		put_task_struct(t);
+          		return -EINVAL;
+          	}
+          
+          	if (write)
+          		gup_flags |= FOLL_WRITE;
+          
+          	while (done < len) {
+          		unsigned long chunk = min_t(unsigned long, len - done,
+          					    (unsigned long)TOWA_BATCH * PAGE_SIZE);
+          		int npages, i;
+          		unsigned long off = 0;
+          
+          		npages = get_user_pages_remote(t, mm, addr + done,
+          					       DIV_ROUND_UP(chunk, PAGE_SIZE),
+          					       gup_flags, pages, NULL, NULL);
+          		if (npages <= 0) {
+          			ret = npages ? npages : -EFAULT;
+          			break;
+          		}
+          
+          		for (i = 0; i < npages && off < chunk; i++) {
+          			unsigned long poff = (addr + done + off) & ~PAGE_MASK;
+          			unsigned long n = min_t(unsigned long, PAGE_SIZE - poff,
+          						chunk - off);
+          			void *kaddr = kmap(pages[i]);
+          
+          			if (!kaddr) {
+          				ret = -EFAULT;
+          				break;
+          			}
+          
+          			if (write) {
+          				if (copy_from_user(kaddr + poff, ubuf + done + off, n)) {
+          					kunmap(pages[i]);
+          					ret = -EFAULT;
+          					break;
+          				}
+          				set_page_dirty_lock(pages[i]);
+          			} else if (copy_to_user(ubuf + done + off, kaddr + poff, n)) {
+          				kunmap(pages[i]);
+          				ret = -EFAULT;
+          				break;
+          			}
+          
+          			kunmap(pages[i]);
+          			off += n;
+          		}
+          
+          		for (i = 0; i < npages; i++)
+          			put_page(pages[i]);
+          
+          		if (ret)
+          			break;
+          
+          		done += off;
+          		if (off < chunk)
+          			break;		/* short mapping - nothing more to reach */
+          	}
+          
+          	mmput(mm);
+          	put_task_struct(t);
+          
+          	if (ret && !done)
+          		return ret;
+          	return done;
+          }
+          
+          /* ------------------------------------------------------------ module base */
+          
+          /*
+           * Lowest mapping of a shared object, i.e. its load base.  Walked from the
+           * target's own mm rather than from /proc/<pid>/maps, so it works even if the
+           * map file is closed off.
+           */
+          static long towa_find_base(pid_t pid, const char __user *uname, unsigned long *out)
+          {
+          	struct task_struct *t;
+          	struct mm_struct *mm;
+          	struct vm_area_struct *vma;
+          	char name[64];
+          	unsigned long base = 0;
+          	size_t nlen;
+          
+          	if (copy_from_user(name, uname, sizeof(name)))
+          		return -EFAULT;
+          	name[sizeof(name) - 1] = '\0';
+          	nlen = strlen(name);
+          	if (!nlen)
+          		return -EINVAL;
+          
+          	t = towa_get_task(pid);
+          	if (!t)
+          		return -ESRCH;
+          	mm = get_task_mm(t);
+          	put_task_struct(t);
+          	if (!mm)
+          		return -EINVAL;
+          
+          	down_read(&mm->mmap_sem);
+          	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+          		const struct qstr *q;
+          		int hit;
+          
+          		if (!vma->vm_file)
+          			continue;
+          
+          		rcu_read_lock();
+          		q = &vma->vm_file->f_path.dentry->d_name;
+          		hit = q->len == nlen && !memcmp(q->name, name, nlen);
+          		rcu_read_unlock();
+          
+          		if (hit) {
+          			base = vma->vm_start;	/* mmap is address-ordered */
+          			break;
+          		}
+          	}
+          	up_read(&mm->mmap_sem);
+          	mmput(mm);
+          
+          	if (!base)
+          		return -ENOENT;
+          	*out = base;
+          
+          	return 0;
+          }
+          
+          /* ------------------------------------------------------ hardware breakpoints */
+          
+          #ifdef CONFIG_HAVE_HW_BREAKPOINT
+          /*
+           * Hardware breakpoints - the reason a kernel side is worth having.
+           *
+           * Nothing about the target changes.  The address goes into one of the four
+           * debug registers, and the CPU tells us when it gets there.  There is no
+           * patched byte, no page made writable, no trampoline and no leftover rwxp
+           * mapping, so there is nothing to find by comparing the process against a
+           * clean copy of itself - and nothing that survives the game being restarted.
+           *
+           * The handler runs in debug-exception context: no sleeping, no locks, no
+           * allocation.  It counts, remembers the pc, and does what the slot was armed
+           * to do.
+           */
+          struct towa_hbp {
+          	struct perf_event	*bp;
+          	unsigned long		addr;
+          	unsigned long long	hits;
+          	unsigned long		last_pc;
+          	unsigned long long	spent;
+          	unsigned long		action;
+          	unsigned long		value;
+          	unsigned long		reg;
+          };
+          
+          static struct towa_hbp towa_hbp[TOWA_HBP_SLOTS];
+          
+          static void towa_hbp_triggered(struct perf_event *bp,
+          			       struct perf_sample_data *data,
+          			       struct pt_regs *regs)
+          {
+          	struct towa_hbp *h = bp->overflow_handler_context;
+          
+          	if (!h)
+          		return;
+          
+          	h->hits++;
+          	if (regs)
+          		h->last_pc = regs->pc;
+          
+          	if (h->action == TOWA_ACT_NONE) {
+          		/*
+          		 * Counting mode.  An execute breakpoint traps before the
+          		 * instruction runs, so if the kernel does not single-step it
+          		 * the CPU retries and traps again; after TOWA_HBP_TRIP hits we
+          		 * skip it once.  That derails at most the thread that tripped
+          		 * it, where letting it spin would take the core with it.
+          		 */
+          		if (h->hits == TOWA_HBP_TRIP && regs) {
+          			regs->pc += 4;
+          			h->spent = 1;
+          		}
+          		return;
+          	}
+          
+          	if (!regs)
+          		return;
+          
+          	/*
+          	 * Every action below leaves pc somewhere other than this address.
+          	 * One that did not would trip again on the same instruction and never
+          	 * get out - which is why there is no "set the register and carry on".
+          	 */
+          	switch (h->action) {
+          	case TOWA_ACT_SKIP:
+          		regs->pc += 4;
+          		break;
+          	case TOWA_ACT_RET:
+          		/* Return from the function now, answering with `value`. */
+          		regs->pc = regs->regs[30];
+          		regs->regs[0] = h->value;
+          		break;
+          	case TOWA_ACT_PC:
+          		regs->pc = h->value;
+          		break;
+          	case TOWA_ACT_X0:
+          		regs->regs[0] = h->value;
+          		regs->pc += 4;
+          		break;
+          	case TOWA_ACT_REG:
+          		if (h->reg < 31)
+          			regs->regs[h->reg] = h->value;
+          		regs->pc += 4;
+          		break;
+          	}
+          }
+          
+          static long towa_hbp_set(pid_t pid, unsigned long addr, unsigned long type,
+          			 unsigned long len, unsigned long action,
+          			 unsigned long value, unsigned long reg)
+          {
+          	struct perf_event_attr attr;
+          	struct task_struct *t;
+          	struct perf_event *bp;
+          	int slot;
+          
+          	for (slot = 0; slot < TOWA_HBP_SLOTS; slot++)
+          		if (!towa_hbp[slot].bp)
+          			break;
+          	if (slot == TOWA_HBP_SLOTS)
+          		return -ENOSPC;
+          
+          	t = towa_get_task(pid);
+          	if (!t)
+          		return -ESRCH;
+          
+          	hw_breakpoint_init(&attr);
+          	attr.bp_addr = addr;
+          	attr.bp_len  = len ? len : HW_BREAKPOINT_LEN_4;
+          	attr.bp_type = type ? HW_BREAKPOINT_W : HW_BREAKPOINT_X;
+          
+          	bp = register_user_hw_breakpoint(&attr, towa_hbp_triggered,
+          					 &towa_hbp[slot], t);
+          	put_task_struct(t);
+          
+          	if (IS_ERR(bp))
+          		return PTR_ERR(bp);
+          
+          	towa_hbp[slot].bp      = bp;
+          	towa_hbp[slot].addr    = addr;
+          	towa_hbp[slot].hits    = 0;
+          	towa_hbp[slot].last_pc = 0;
+          	towa_hbp[slot].spent   = 0;
+          	towa_hbp[slot].action  = action;
+          	towa_hbp[slot].value   = value;
+          	towa_hbp[slot].reg     = reg;
+          
+          	return slot;
+          }
+          
+          static long towa_hbp_del(unsigned long slot)
+          {
+          	if (slot >= TOWA_HBP_SLOTS || !towa_hbp[slot].bp)
+          		return -EINVAL;
+          
+          	unregister_hw_breakpoint(towa_hbp[slot].bp);
+          	towa_hbp[slot].bp = NULL;
+          
+          	return 0;
+          }
+          
+          static long towa_hbp_stat(unsigned long slot, unsigned long __user *uout)
+          {
+          	u64 v[4];
+          
+          	if (slot >= TOWA_HBP_SLOTS || !towa_hbp[slot].bp)
+          		return -EINVAL;
+          
+          	v[0] = towa_hbp[slot].hits;
+          	v[1] = towa_hbp[slot].last_pc;
+          	v[2] = towa_hbp[slot].spent;
+          	v[3] = towa_hbp[slot].addr;
+          
+          	return copy_to_user(uout, v, sizeof(v)) ? -EFAULT : 0;
+          }
+          
+          static void towa_hbp_cleanup(void)
+          {
+          	int slot;
+          
+          	for (slot = 0; slot < TOWA_HBP_SLOTS; slot++)
+          		if (towa_hbp[slot].bp) {
+          			unregister_hw_breakpoint(towa_hbp[slot].bp);
+          			towa_hbp[slot].bp = NULL;
+          		}
+          }
+          #else /* !CONFIG_HAVE_HW_BREAKPOINT */
+          static void towa_hbp_cleanup(void) { }
+          #endif /* CONFIG_HAVE_HW_BREAKPOINT */
+          
+          /* -------------------------------------------------------- wanbai.h compatibility */
+          /*
+           * Compatibility with the wanbai.h family of clients.
+           *
+           * Those hacks do not know about us and never will: they open a device node
+           * and issue ioctl 0x800..0x803.
+           *
+           *   0x800  initKey, a per-build key string
+           *   0x801  {int pid; uintptr_t addr; void *buffer; size_t size;}
+           *   0x802  the same struct, writing
+           *   0x803  {int pid; char *name; uintptr_t base;}
+           *
+           * Those struct layouts are copied from their header, so the offsets match
+           * exactly.  One node per name they hunt for, plus a fake /proc entry for the
+           * rt-proc shape, lets an unmodified hack work against us by picking its own
+           * menu entry - nothing to recompile and nothing to rebuild.
+           *
+           * The key is accepted whatever it is.  We are not the build that minted it,
+           * and refusing an unknown key would only break the handshake.
+           *
+           * Set TOWA_COMPAT to 0 when you want no device nodes at all.
+           */
+          #define TOWA_COMPAT_DEVS "wanbai,CheckMe,Ckanri,lanran,video188"
+          #define TOWA_COMPAT_PROC "kvmstats"
+          
+          #define TOWA_IOCTL_INIT_KEY	0x800
+          #define TOWA_IOCTL_READ_MEM	0x801
+          #define TOWA_IOCTL_WRITE_MEM	0x802
+          #define TOWA_IOCTL_MODULE_BASE	0x803
+          
+          struct towa_copy_memory {
+          	pid_t		pid;
+          	uintptr_t	addr;
+          	void		*buffer;
+          	size_t		size;
+          };
+          
+          struct towa_module_base {
+          	pid_t		pid;
+          	char		*name;
+          	uintptr_t	base;
+          };
+          
+          static long towa_compat_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+          {
+          	void __user *uarg = (void __user *)arg;
+          
+          	switch (cmd) {
+          	case TOWA_IOCTL_INIT_KEY:
+          		/* any key, any length, even none */
+          		return 0;
+          
+          	case TOWA_IOCTL_READ_MEM: {
+          		struct towa_copy_memory cm;
+          		long r;
+          
+          		if (copy_from_user(&cm, uarg, sizeof(cm)))
+          			return -EFAULT;
+          		if (!cm.buffer || !cm.size)
+          			return -EINVAL;
+          
+          		r = towa_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, false);
+          		return r == (long)cm.size ? 0 : (r < 0 ? r : -EFAULT);
+          	}
+          
+          	case TOWA_IOCTL_WRITE_MEM: {
+          		struct towa_copy_memory cm;
+          		long r;
+          
+          		if (copy_from_user(&cm, uarg, sizeof(cm)))
+          			return -EFAULT;
+          		if (!cm.buffer || !cm.size)
+          			return -EINVAL;
+          
+          		r = towa_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, true);
+          		return r == (long)cm.size ? 0 : (r < 0 ? r : -EFAULT);
+          	}
+          
+          	case TOWA_IOCTL_MODULE_BASE: {
+          		struct towa_module_base mb;
+          		unsigned long base = 0;
+          		long r;
+          
+          		if (copy_from_user(&mb, uarg, sizeof(mb)))
+          			return -EFAULT;
+          		if (!mb.name)
+          			return -EINVAL;
+          
+          		r = towa_find_base(mb.pid, (const char __user *)mb.name, &base);
+          		if (r)
+          			return r;
+          		if (put_user(base, &((struct towa_module_base __user *)uarg)->base))
+          			return -EFAULT;
+          		return 0;
+          	}
+          
+          	default:
+          		return -ENOTTY;
+          	}
+          }
+          
+          static const struct file_operations towa_compat_fops = {
+          	.owner		= THIS_MODULE,
+          	.unlocked_ioctl	= towa_compat_ioctl,
+          	.compat_ioctl	= towa_compat_ioctl,
+          };
+          
+          #define TOWA_COMPAT_MAX	8
+          
+          static struct miscdevice towa_misc[TOWA_COMPAT_MAX];
+          static char towa_misc_name[TOWA_COMPAT_MAX][32];
+          static int towa_misc_n;
+          static struct proc_dir_entry *towa_proc;
+          
+          static int towa_compat_init(void)
+          {
+          	char list[160];
+          	char *p = list;
+          	char *tok;
+          	int i;
+          
+          	/* miscdevice.name has to outlive this call, hence the static copies */
+          	strlcpy(list, TOWA_COMPAT_DEVS, sizeof(list));
+          
+          	while (p && *p && towa_misc_n < TOWA_COMPAT_MAX) {
+          		tok = strsep(&p, ",");
+          		if (!tok || !*tok)
+          			continue;
+          
+          		for (i = 0; i < towa_misc_n; i++)
+          			if (!strcmp(towa_misc_name[i], tok))
+          				break;
+          		if (i < towa_misc_n)
+          			continue;
+          
+          		strlcpy(towa_misc_name[towa_misc_n], tok, 32);
+          		towa_misc[towa_misc_n].name  = towa_misc_name[towa_misc_n];
+          		towa_misc[towa_misc_n].minor = MISC_DYNAMIC_MINOR;
+          		towa_misc[towa_misc_n].fops  = &towa_compat_fops;
+          		towa_misc[towa_misc_n].mode  = 0666;
+          
+          		if (misc_register(&towa_misc[towa_misc_n]))
+          			continue;
+          
+          		towa_misc_n++;
+          	}
+          
+          	towa_proc = proc_create(TOWA_COMPAT_PROC, 0666, NULL, &towa_compat_fops);
+          
+          	return 0;
+          }
+          
+          static void towa_compat_cleanup(void)
+          {
+          	int i;
+          
+          	if (towa_proc) {
+          		remove_proc_entry(TOWA_COMPAT_PROC, NULL);
+          		towa_proc = NULL;
+          	}
+          
+          	for (i = 0; i < towa_misc_n; i++)
+          		misc_deregister(&towa_misc[i]);
+          	towa_misc_n = 0;
+          }
+          
+          /* ------------------------------------------------------------------ dispatch */
+          
+          static long towa_dispatch(unsigned long op, unsigned long a1, unsigned long a2,
+          			  unsigned long a3, unsigned long a4)
+          {
+          	switch (op) {
+          	case TOWA_OP_PING:
+          		return TOWA_MAGIC;
+          
+          	case TOWA_OP_READ:
+          		return towa_rw((pid_t)a1, a2, (void __user *)a3, a4, false);
+          	case TOWA_OP_WRITE:
+          		return towa_rw((pid_t)a1, a2, (void __user *)a3, a4, true);
+          
+          	case TOWA_OP_BASE: {
+          		unsigned long b = 0;
+          		long r = towa_find_base((pid_t)a1, (const char __user *)a2, &b);
+          
+          		if (r)
+          			return r;
+          		return put_user(b, (unsigned long __user *)a3) ? -EFAULT : 0;
+          	}
+          
+          	case TOWA_OP_HWBP_SET:
+          	case TOWA_OP_HWBP_DEL:
+          	case TOWA_OP_HWBP_STAT:
+          	case TOWA_OP_HWBP_ARM:
+          #ifdef CONFIG_HAVE_HW_BREAKPOINT
+          		if (op == TOWA_OP_HWBP_SET)
+          			return towa_hbp_set((pid_t)a1, a2, a3, a4,
+          					    TOWA_ACT_NONE, 0, 0);
+          		if (op == TOWA_OP_HWBP_ARM) {
+          			struct towa_hbp_cfg cfg;
+          
+          			if (copy_from_user(&cfg, (void __user *)a1, sizeof(cfg)))
+          				return -EFAULT;
+          			return towa_hbp_set(cfg.pid, cfg.addr, cfg.type, cfg.len,
+          					    cfg.action, cfg.value, cfg.reg);
+          		}
+          		if (op == TOWA_OP_HWBP_DEL)
+          			return towa_hbp_del(a1);
+          		return towa_hbp_stat(a1, (unsigned long __user *)a2);
+          #else
+          		return -EOPNOTSUPP;
+          #endif
+          
+          	case TOWA_OP_WATCH_ARM:
+          		return towa_watch_arm((pid_t)a1, a2, a3);
+          
+          	case TOWA_OP_WATCH_STAT: {
+          		struct towa_watch_info info;
+          		long r = towa_watch_stat(a1, &info);
+          
+          		if (r)
+          			return r;
+          		return copy_to_user((void __user *)a2, &info, sizeof(info))
+          			? -EFAULT : 0;
+          	}
+          
+          	case TOWA_OP_WATCH_OFF:
+          		return towa_watch_off(a1);
+          
+          	default:
+          		return -EINVAL;
+          	}
+          }
+          
+          static int __init towa_core_init(void)
+          {
+          	towa_set_handler(towa_dispatch);
+          	towa_compat_init();
+          	return 0;
+          }
+          
+          #ifdef MODULE
+          static void __exit towa_core_exit(void)
+          {
+          	towa_compat_cleanup();
+          	towa_hbp_cleanup();
+          	towa_set_handler(NULL);
+          }
+          
+          module_init(towa_core_init);
+          module_exit(towa_core_exit);
+          MODULE_LICENSE("GPL");
+          MODULE_DESCRIPTION("towa core");
+          #else
+          late_initcall(towa_core_init);
+          #endif
+          TW_C
+          cat > drivers/towa/Makefile <<'TW_M'
+          # The syscall stub and the page-watch code are built into the kernel: the first
+          # because a syscall table entry can only be emitted at build time, the second
+          # because it needs a call site inside do_page_fault() and the core mm helpers.
+          obj-y				+= towa_syscall.o
+          obj-y				+= towa_watch.o
+          
+          # Everything that actually touches memory, and therefore everything that gets
+          # iterated: =m gives towa_core.ko.
+          obj-$(CONFIG_TOWA_CORE)		+= towa_core.o
+          TW_M
+          cat > drivers/towa/Kconfig <<'TW_K'
+          config TOWA_CORE
+          	tristate "towa kernel-assisted memory access"
+          	default n
+          	help
+          	  The worker half of the towa syscall: memory read/write, module base,
+          	  hardware breakpoints and page watches.  As a module (=m) it can be
+          	  loaded and unloaded at will and the syscall is inert while it is out;
+          	  built in (=y) it arms itself at boot and nothing shows up in
+          	  /proc/modules at all.
+          
+          	  The syscall itself and the page-fault hook are always built in,
+          	  because neither can live in a module.
+          TW_K
+          cat > include/linux/towa_watch.h <<'TW_I'
+          /* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _LINUX_TOWA_WATCH_H
+          #define _LINUX_TOWA_WATCH_H
+          
+          struct pt_regs;
+          
+          /*
+           * Call site is inside do_page_fault(), with mm->mmap_sem held for read and the
+           * faulting task being current.  Observes only: it never claims the fault, so
+           * the normal handling always goes ahead and the access always succeeds.
+           * Costs one perfectly-predicted branch while no watch is armed.
+           */
+          int towa_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr);
+          
+          #endif /* _LINUX_TOWA_WATCH_H */
+          TW_I
+          echo "--- written ---"
+          ls -l drivers/towa/ include/linux/towa_watch.h
+          wc -l drivers/towa/*.c drivers/towa/*.h
+      - name: Hook the page-fault path
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          F=arch/arm64/mm/fault.c
+          test -f "$F" || { echo "no $F"; exit 1; }
+          
+          python3 - "$F" <<'PYFAULT'
+          import re, sys
+          
+          path = sys.argv[1]
+          src = open(path).read()
+          
+          # ---- 1. the prototype -------------------------------------------------------
+          if 'towa_watch.h' not in src:
+              anchor = '#include <asm/tlbflush.h>'
+              if anchor in src:
+                  src = src.replace(anchor, anchor + '\n#include <linux/towa_watch.h>', 1)
+              else:
+                  lines = src.split('\n')
+                  last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
+                  lines.insert(last + 1, '#include <linux/towa_watch.h>')
+                  src = '\n'.join(lines)
+              print('added the include')
+          
+          # ---- 2. the call site, inside do_page_fault, with mmap_sem held -------------
+          CALL = 'towa_watch_fault(regs, addr, esr);'
+          if CALL not in src:
+              m = None
+              for pat in (r'\nstatic int __kprobes do_page_fault\(',
+                          r'\ndo_page_fault\(unsigned long addr'):
+                  m = re.search(pat, src)
+                  if m:
+                      break
+              if not m:
+                  sys.exit('do_page_fault not found in %s - the tree changed' % path)
+          
+              j = src.find('down_read(&mm->mmap_sem);', m.start())
+              if j < 0:
+                  sys.exit('no down_read(&mm->mmap_sem) after do_page_fault in %s' % path)
+          
+              eol = src.find('\n', j)
+              ins = ('\n\n\t/*\n'
+                     '\t * towa page watches.  Runs before the normal handling, with\n'
+                     '\t * mmap_sem held for read, and never claims the fault.\n'
+                     '\t */\n'
+                     '\ttowa_watch_fault(regs, addr, esr);')
+              src = src[:eol] + ins + src[eol:]
+              print('added the call site')
+          
+          assert CALL in src, 'the call site did not land'
+          open(path, 'w').write(src)
+          PYFAULT
+          
+          echo "--- what the fault path now looks like ---"
+          grep -n 'towa_watch' "$F"
+          echo "--- context ---"
+          awk '/towa_watch_fault\(regs, addr, esr\);/{for(i=NR-12;i<=NR+2;i++) want[i]=1} {l[NR]=$0} END{for(i=1;i<=NR;i++) if(want[i]) print i": "l[i]}' "$F"
+      - name: Add the towa syscall number
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          U=include/uapi/asm-generic/unistd.h
+          NR=$(grep -m1 '^#define __NR_syscalls' "$U" | awk '{print $3}')
+          echo "highest existing syscall number = $NR  -> towa will be $NR"
+
+          python3 - "$U" "$NR" <<'PYEOF'
+          import sys
+          path, nr = sys.argv[1], int(sys.argv[2])
+          lines = open(path).read().split('\n')
+
+          # Insert immediately before the LAST "#undef __NR_syscalls", i.e. at the
+          # end of the syscall list, and bump the table size to match.
+          last = max(i for i, l in enumerate(lines) if l.startswith('#undef __NR_syscalls'))
+          lines[last:last] = [
+              '#define __NR_towa %d' % nr,
+              '#ifndef __SYSCALL_COMPAT',
+              '__SYSCALL(__NR_towa, sys_towa)',
+              '#endif',
+          ]
+          for i in range(len(lines) - 1, -1, -1):
+              if lines[i].startswith('#define __NR_syscalls'):
+                  lines[i] = '#define __NR_syscalls %d' % (nr + 1)
+                  break
+          open(path, 'w').write('\n'.join(lines))
+          PYEOF
+
+          echo "--- tail of $U ---"
+          tail -14 "$U"
+          echo "--- who else builds a table from this header ---"
+          grep -rn '__SYSCALL_COMPAT' arch/arm64/kernel/ arch/arm64/include/asm/unistd.h 2>/dev/null || echo "  none in arch/arm64"
+
+          # drivers/Makefile + drivers/Kconfig
+          grep -q 'towa/' drivers/Makefile || printf 'obj-y\t\t\t\t+= towa/\n' >> drivers/Makefile
+          grep -q 'drivers/towa/Kconfig' drivers/Kconfig || printf 'source "drivers/towa/Kconfig"\n' >> drivers/Kconfig
+          grep -n 'towa' drivers/Makefile drivers/Kconfig
+
+      # ------------------------------------------------------------ config tweaks
+      - name: Kernel config
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
           DEF="arch/arm64/configs/vendor/m23xq_eur_open_defconfig"
           [ -f "$DEF" ] || DEF="arch/arm64/configs/vendor/lito-perf_defconfig"
-          if [ ! -f "$DEF" ]; then
-            echo "!! $DEF not found. Available vendor defconfigs:"
-            ls arch/arm64/configs/vendor/ 2>/dev/null || true
-            ls arch/arm64/configs/ 2>/dev/null | head -20 || true
-            exit 1
-          fi
-          if grep -q '^CONFIG_HARDENED_USERCOPY=y' "$DEF"; then
-            echo "already enabled"
-          else
-            # drop any "# CONFIG_HARDENED_USERCOPY is not set" first
-            sed -i '/^# CONFIG_HARDENED_USERCOPY is not set$/d' "$DEF"
-            echo 'CONFIG_HARDENED_USERCOPY=y' >> "$DEF"
-            echo "appended"
-          fi
-          grep -n 'HARDENED_USERCOPY' "$DEF"
-          echo "--- module signing (must be OFF on the 191 tree) ---"
-          grep -nE '^(# )?CONFIG_MODULE_SIG[ _]' "$DEF" || true
+          [ -f "$DEF" ] || { echo "no defconfig"; ls arch/arm64/configs/vendor/ | head -30; exit 1; }
+          echo "defconfig: $DEF"
 
-          # BakaSU on 4.19 can only hook via KSU_MANUAL_HOOK (the tracepoint
-          # method needs 5.10+, and SUSFS needs kernel-side integration). That
-          # hook patches sys_call_table - which is exactly what the RT driver
-          # wants for [__NR_ioctl]. So for an APatch build we remove KernelSU
-          # entirely and let APatch root the boot image instead.
-          if [ "${{ inputs.ksu }}" = "n" ]; then
-            echo "--- building ROOTLESS (APatch target) ---"
-            sed -i -e '/^CONFIG_KSU=/d' \
-                   -e '/^# CONFIG_KSU is not set$/d' \
-                   -e '/^CONFIG_KSU_MANUAL_HOOK=/d' \
-                   -e '/^# CONFIG_KSU_MANUAL_HOOK is not set$/d' "$DEF"
-            printf '# CONFIG_KSU is not set\n# CONFIG_KSU_MANUAL_HOOK is not set\n' >> "$DEF"
-            # the submodule is still cloned; it just will not be compiled
-            grep -n '^# CONFIG_KSU' "$DEF"
+          # n -> =m: a loadable towa_core.ko, which is what gets iterated.
+          # y -> =y: armed at boot, and /proc/modules stays empty.
+          if [ "${{ inputs.builtin }}" = "y" ]; then
+            TOWAMODE=y
           else
-            echo "--- building WITH KernelSU (manual hook) ---"
-            grep -nE '^(# )?CONFIG_KSU' "$DEF" || true
+            TOWAMODE=m
           fi
+          sed -i -e '/^CONFIG_TOWA_CORE=/d' -e '/^# CONFIG_TOWA_CORE is not set$/d' "$DEF"
+          printf 'CONFIG_TOWA_CORE=%s\n' "$TOWAMODE" >> "$DEF"
+          echo "towa_core will be built as: $TOWAMODE"
+
+          # The running 191 kernel already has these; the tree may not.
+          sed -i -e '/^CONFIG_MODULE_FORCE_LOAD=/d' -e '/^# CONFIG_MODULE_FORCE_LOAD is not set$/d' "$DEF"
+          printf 'CONFIG_MODULE_FORCE_LOAD=y\n' >> "$DEF"
+
+          if grep -q 'CONFIG_MODULE_SIG=y' "$DEF"; then
+            sed -i -e '/^CONFIG_MODULE_SIG=/d' -e '/^# CONFIG_MODULE_SIG is not set$/d' \
+                   -e '/^CONFIG_MODULE_SIG_FORCE=/d' -e '/^# CONFIG_MODULE_SIG_FORCE is not set$/d' "$DEF"
+            printf '# CONFIG_MODULE_SIG is not set\n' >> "$DEF"
+          fi
+
+          # Belt and braces for the tree that force-enables it (the 325 one does).
+          F=kernel/module.c
+          if grep -q '^static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);$' "$F"; then
+            sed -i 's/^static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);$/static bool sig_enforce = false;/' "$F"
+            echo "sig_enforce forced off in kernel/module.c"
+          else
+            echo "sig_enforce line not present - leaving module.c alone"
+          fi
+
+          grep -n 'TOWA_CORE\|MODULE_FORCE_LOAD\|MODULE_SIG' "$DEF"
 
       - name: Build kernel
         working-directory: ${{ github.workspace }}/kernel
         run: |
           set -e
           chmod +x tools/* 2>/dev/null || true
-          # build_kernel.sh calls make without -j, which would build serially
-          # for hours. MAKEFLAGS is inherited by every make it spawns.
           export MAKEFLAGS="-j$(nproc)"
-          if [ -f build_kernel.sh ]; then
-            echo "using build_kernel.sh (cheetkernel)"
-            chmod +x build_kernel.sh
-            cat build_kernel.sh
-            ./build_kernel.sh
-          elif [ -f build_lito_kernel.sh ]; then
+          # lito first: that is the script on Boostkernel2-cip (the 325 tree), and
+          # the one the device's own kernels were built with. cheetkernel has
+          # build_kernel.sh instead.
+          if [ -f build_lito_kernel.sh ]; then
+            echo "using build_lito_kernel.sh"
             chmod +x build_lito_kernel.sh
             sed -i 's/^BUILD_JOB_NUMBER=8$/BUILD_JOB_NUMBER=4/' build_lito_kernel.sh
             echo "${{ inputs.model }}" | ./build_lito_kernel.sh
+          elif [ -f build_kernel.sh ]; then
+            echo "using build_kernel.sh"
+            chmod +x build_kernel.sh
+            ./build_kernel.sh
           else
-            echo "no build script - falling back to a direct build"
-            CC="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin/clang"
-            GCC="$HOME/aarch64-linux-android-4.9"
-            export PATH="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin:$GCC/bin:$PATH"
-            P="CC=clang LLVM_IAS=1 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- DTC_OVERLAY_TEST_EXT=$PWD/tools/ufdt_apply_overlay"
-            DEF=$(ls arch/arm64/configs/vendor/*perf_defconfig 2>/dev/null | head -1)
-            echo "using defconfig: $DEF"
-            make O=out $P ARCH=arm64 "$DEF" \
-                 vendor/samsung/lito-sec-common.config \
-                 "vendor/samsung/${{ inputs.model }}.config"
-            make O=out $P ARCH=arm64 olddefconfig
-            make O=out -j4 $P ARCH=arm64
-            if [ -x tools/mkdtimg ]; then
-              ./tools/mkdtimg create out/arch/arm64/boot/dtbo.img --page_size=4096 \
-                $(find out/arch/arm64/boot/dts/samsung/m23/${{ inputs.model }}/ -name '*.dtbo') || true
-            fi
+            echo "no build script"; ls -l *.sh; exit 1
           fi
+
+      # A plain `make` builds vmlinux; modules are a separate target. This step
+      # is also what produces towa_core.ko.
+      - name: Build towa_core.ko
+        if: ${{ inputs.builtin != 'y' }}
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          export PATH="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin:$HOME/aarch64-linux-android-4.9/bin:$PATH"
+          if [ -f out/Module.symvers ]; then OOPT="O=out"; else OOPT=""; fi
+          echo "O option: '$OOPT'"
+          make $OOPT ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+               CROSS_COMPILE=aarch64-linux-gnu- M=drivers/towa modules
+          KO=$(find . -name 'towa_core.ko' | head -1)
+          [ -n "$KO" ] || { echo "towa_core.ko NOT BUILT"; exit 1; }
+          echo "--- $KO ---"
+          ls -l "$KO"
+          echo "--- vermagic (must match the Image built in this same run) ---"
+          modinfo -F vermagic "$KO"
+          echo "--- did the breakpoint symbols resolve? (modpost would already have failed otherwise) ---"
+          nm -u "$KO" 2>/dev/null | grep -i 'hw_breakpoint\|perf' || echo "  no unresolved breakpoint symbols"
+          nm "$KO" 2>/dev/null | grep -i 'towa_hbp\|towa_read\|towa_dispatch' || true
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$KO" "$GITHUB_WORKSPACE/out/towa_core.ko"
 
       - name: Collect and verify output
         working-directory: ${{ github.workspace }}/kernel
@@ -193,16 +1560,14 @@ jobs:
           set -e
           IMG=out/arch/arm64/boot/Image
           test -s "$IMG" || { echo "MISSING $IMG"; find out -name 'Image*' | head; exit 1; }
-          echo "--- banner ---"
-          strings -a "$IMG" | grep -m1 '^Linux version'
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp "$IMG" "$GITHUB_WORKSPACE/out/Image"
+          echo "--- banner ---"
+          strings -a "$IMG" | grep -m1 '^Linux version'
           DTB=$(ls out/arch/arm64/boot/dts/vendor/qcom/lagoon.dtb 2>/dev/null || find out/arch/arm64/boot -name 'lagoon.dtb' | head -1)
           [ -n "$DTB" ] && cp "$DTB" "$GITHUB_WORKSPACE/out/dtb" || echo "WARN: no lagoon.dtb"
           [ -s out/arch/arm64/boot/dtbo.img ] && cp out/arch/arm64/boot/dtbo.img "$GITHUB_WORKSPACE/out/dtbo" || echo "WARN: no dtbo.img"
 
-          # Read the config back out of the built Image - this is the step that
-          # proves the option actually took effect.
           python3 - "$IMG" <<'PYEOF'
           import sys, gzip, re
           d = open(sys.argv[1], 'rb').read()
@@ -210,18 +1575,744 @@ jobs:
           if s < 0 or e < s:
               print('no embedded config found'); sys.exit(0)
           cfg = gzip.decompress(d[s+8:e]).decode('utf-8', 'replace')
-          for opt in ('CONFIG_HARDENED_USERCOPY', 'CONFIG_MODULE_SIG',
+          for opt in ('CONFIG_TOWA_CORE', 'CONFIG_MODULES', 'CONFIG_MODULE_SIG',
                       'CONFIG_MODULE_SIG_FORCE', 'CONFIG_MODULE_FORCE_LOAD',
-                      'CONFIG_MODVERSIONS', 'CONFIG_KPROBES'):
+                      'CONFIG_STRICT_KERNEL_RWX', 'CONFIG_MODVERSIONS',
+                      'CONFIG_HAVE_HW_BREAKPOINT', 'CONFIG_PERF_EVENTS'):
               m = [l for l in cfg.splitlines() if re.match(r'^(# )?' + opt + r'[ =]', l)]
               print('  %-30s %s' % (opt, m[0] if m else 'ABSENT'))
           PYEOF
+
+          # The stub has to be in the linked kernel, or the whole point is lost.
+          VML=$(ls out/vmlinux 2>/dev/null || echo "")
+          if [ -n "$VML" ]; then
+            echo "--- is the syscall in vmlinux? ---"
+            nm "$VML" 2>/dev/null | grep -i 'sys_towa\|towa_set_handler' || echo "  NOT FOUND (built-in table entry missing)"
+            echo "--- and is the kernel able to give us breakpoints? ---"
+            nm "$VML" 2>/dev/null | grep -i 'register_user_hw_breakpoint\|hw_breakpoint_init' || echo "  not present"
+          fi
           ls -l "$GITHUB_WORKSPACE/out/"
 
+      - name: Build the client (towacli)
+        run: |
+          set -e
+          # The kernel build is finished and its outputs are in $GITHUB_WORKSPACE/out, so
+          # the object files can go - the NDK needs the room.
+          rm -rf "$GITHUB_WORKSPACE/kernel/out"
+          df -h / | tail -1
+          
+          mkdir -p "$GITHUB_WORKSPACE/tools"
+          cat > "$GITHUB_WORKSPACE/tools/towacli.cpp" <<'TW_CLI'
+          // towacli.cpp - talk to the towa kernel syscall.
+          //
+          // Build this in AIDE Pro as a plain C++ native executable. It needs no root,
+          // no su, no zygisk and no injection: the kernel does the cross-process memory
+          // access, and the syscall itself has no permission check, so SELinux, ptrace
+          // scope, /proc/<pid>/mem's EACCES and the target's own VMA permissions are all
+          // irrelevant.
+          //
+          // If the build log printed a syscall number other than 294, either change
+          // NR_TOWA below or pass -n <number> as the first argument.
+          
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdint>
+          #include <cerrno>
+          #include <string>
+          #include <vector>
+          #include <dirent.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/syscall.h>
+          #include <sys/ioctl.h>
+          
+          #define TOWA_COOKIE 0x9E3779B97F4A7C15ULL
+          #define TOWA_MAGIC  0x5032300AUL
+          
+          static const unsigned long kElfMagic = 0x464C457FUL;   // "\x7fELF" little-endian
+          
+          enum {
+              TOWA_OP_PING       = 0,
+              TOWA_OP_READ       = 1,
+              TOWA_OP_WRITE      = 2,
+              TOWA_OP_BASE       = 3,
+              TOWA_OP_HWBP_SET   = 4,
+              TOWA_OP_HWBP_DEL   = 5,
+              TOWA_OP_HWBP_STAT  = 6,
+              TOWA_OP_HWBP_ARM   = 7,
+              TOWA_OP_WATCH_ARM  = 8,
+              TOWA_OP_WATCH_STAT = 9,
+              TOWA_OP_WATCH_OFF  = 10,
+          };
+          
+          #define TOWA_BP_X 0
+          #define TOWA_BP_W 1
+          
+          #define TOWA_ACT_NONE 0
+          #define TOWA_ACT_SKIP 1
+          #define TOWA_ACT_RET  2
+          #define TOWA_ACT_PC   3
+          #define TOWA_ACT_X0   4
+          #define TOWA_ACT_REG  5
+          
+          #define TOWA_WATCH_WRITE  0
+          #define TOWA_WATCH_ACCESS 1
+          
+          #define TOWA_WF_ARMED  0x1
+          #define TOWA_WF_SPENT  0x2
+          #define TOWA_WF_WRITE  0x4
+          #define TOWA_WF_ACCESS 0x8
+          
+          // Layouts must match struct towa_hbp_cfg / towa_watch_info in towa.h exactly.
+          struct towa_hbp_cfg {
+              int pid;
+              unsigned long type;
+              unsigned long addr;
+              unsigned long len;
+              unsigned long action;
+              unsigned long value;
+              unsigned long reg;
+          };
+          
+          struct towa_watch_info {
+              unsigned long long hits;
+              unsigned long long last_pc;
+              unsigned long long last_task;
+              unsigned long addr;
+              unsigned long flags;
+          };
+          
+          #ifndef NR_TOWA
+          #define NR_TOWA 294
+          #endif
+          
+          static unsigned long g_nr = NR_TOWA;
+          
+          static long towa(unsigned long op, unsigned long a1 = 0, unsigned long a2 = 0,
+                           unsigned long a3 = 0, unsigned long a4 = 0)
+          {
+              return syscall((long)g_nr, (unsigned long)TOWA_COOKIE, op, a1, a2, a3, a4);
+          }
+          
+          static void perr(const char *what, long r)
+          {
+              fprintf(stderr, "%-10s failed: %s (%ld)\n", what, strerror((int)-r), r);
+          }
+          
+          // ---------------------------------------------------------------- process lookup
+          
+          static bool first_token_is(const char *path, const char *want)
+          {
+              int fd = open(path, O_RDONLY);
+              if (fd < 0) return false;
+          
+              char buf[256];
+              ssize_t n = read(fd, buf, sizeof(buf) - 1);
+              close(fd);
+              if (n <= 0) return false;
+              buf[n] = '\0';
+          
+              return strcmp(buf, want) == 0;
+          }
+          
+          static bool any_token_is(const char *path, const char *want)
+          {
+              int fd = open(path, O_RDONLY);
+              if (fd < 0) return false;
+          
+              char buf[512];
+              ssize_t n = read(fd, buf, sizeof(buf) - 1);
+              close(fd);
+              if (n <= 0) return false;
+              buf[n] = '\0';
+          
+              for (ssize_t i = 0; i < n; i++)
+                  if (buf[i] == '\0') buf[i] = ' ';
+          
+              return strstr(buf, want) != NULL;
+          }
+          
+          // Prefer the main process: its cmdline is exactly the package name. The
+          // helpers (":prime", ":unity") are matched only if nothing else is.
+          static int find_pid(const char *name)
+          {
+              DIR *d = opendir("/proc");
+              if (!d) return -1;
+          
+              int exact = -1, loose = -1;
+              struct dirent *e;
+          
+              while ((e = readdir(d)) != NULL) {
+                  if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+          
+                  char path[64];
+                  snprintf(path, sizeof(path), "/proc/%s/cmdline", e->d_name);
+          
+                  if (exact < 0 && first_token_is(path, name))
+                      exact = atoi(e->d_name);
+                  else if (loose < 0 && any_token_is(path, name))
+                      loose = atoi(e->d_name);
+              }
+              closedir(d);
+          
+              return exact >= 0 ? exact : loose;
+          }
+          
+          // ---------------------------------------------------------------- towa wrappers
+          
+          static int towa_read(int pid, unsigned long addr, void *buf, unsigned long len)
+          {
+              long r = towa(TOWA_OP_READ, (unsigned long)pid, addr,
+                            (unsigned long)buf, len);
+              if (r < 0) { perr("read", r); return -1; }
+              return (int)r;
+          }
+          
+          static int towa_write(int pid, unsigned long addr, const void *buf, unsigned long len)
+          {
+              long r = towa(TOWA_OP_WRITE, (unsigned long)pid, addr,
+                            (unsigned long)buf, len);
+              if (r < 0) { perr("write", r); return -1; }
+              return (int)r;
+          }
+          
+          static unsigned long towa_base(int pid, const char *soname)
+          {
+              char name[64];
+              unsigned long out = 0;
+          
+              snprintf(name, sizeof(name), "%s", soname);
+          
+              long r = towa(TOWA_OP_BASE, (unsigned long)pid, (unsigned long)name,
+                            (unsigned long)&out, 0);
+              if (r < 0) { perr("base", r); return 0; }
+              return out;
+          }
+          
+          // ---------------------------------------------------------------- breakpoints
+          
+          static long towa_hbp_arm(int pid, unsigned long addr, unsigned long type,
+                                   unsigned long action, unsigned long value,
+                                   unsigned long reg)
+          {
+              towa_hbp_cfg cfg;
+              memset(&cfg, 0, sizeof(cfg));
+              cfg.pid    = pid;
+              cfg.type   = type;
+              cfg.addr   = addr;
+              cfg.action = action;
+              cfg.value  = value;
+              cfg.reg    = reg;
+          
+              long r = towa(TOWA_OP_HWBP_ARM, (unsigned long)&cfg);
+              if (r < 0) perr("hbp arm", r);
+              return r;
+          }
+          
+          static long towa_hbp_del(unsigned long slot)
+          {
+              long r = towa(TOWA_OP_HWBP_DEL, slot);
+              if (r < 0) perr("hbp del", r);
+              return r;
+          }
+          
+          static void towa_hbp_stat(unsigned long slot)
+          {
+              unsigned long long v[4] = { 0, 0, 0, 0 };
+          
+              long r = towa(TOWA_OP_HWBP_STAT, slot, (unsigned long)v);
+              if (r < 0) { perr("hbp stat", r); return; }
+          
+              printf("slot %lu  hits %llu  at 0x%llx  last pc 0x%llx%s\n",
+                     slot, v[0], v[3], v[1],
+                     v[2] ? "  <-- tripped the guard: it was looping, so one instruction was skipped"
+                          : "");
+          }
+          
+          // --------------------------------------------------------- page watches
+          //
+          // Arm one page in one process. The next time that process touches it the kernel
+          // records who, from where, and whether it was a write, then puts the page back
+          // and lets the access through. Nothing in the game's memory is modified.
+          
+          static long towa_watch_arm(int pid, unsigned long addr, unsigned long mode)
+          {
+              long r = towa(TOWA_OP_WATCH_ARM, (unsigned long)pid, addr, mode);
+              if (r < 0) perr("watch arm", r);
+              return r;
+          }
+          
+          static long towa_watch_off(unsigned long slot)
+          {
+              long r = towa(TOWA_OP_WATCH_OFF, slot);
+              if (r < 0) perr("watch off", r);
+              return r;
+          }
+          
+          static bool towa_watch_stat(unsigned long slot)
+          {
+              towa_watch_info w;
+              memset(&w, 0, sizeof(w));
+          
+              long r = towa(TOWA_OP_WATCH_STAT, slot, (unsigned long)&w);
+              if (r < 0) { perr("watch stat", r); return false; }
+          
+              printf("slot %lu  page 0x%lx  hits %llu  %-6s  %s",
+                     slot, w.addr, w.hits,
+                     (w.flags & TOWA_WF_ACCESS) ? "access" : "write",
+                     (w.flags & TOWA_WF_SPENT) ? "" : "(still armed) ");
+          
+              if (w.hits) {
+                  printf("pid %llu pc 0x%llx  %s",
+                         w.last_task, w.last_pc,
+                         (w.flags & TOWA_WF_WRITE) ? "WROTE it" : "read/executed it");
+              }
+              printf("\n");
+          
+              return w.hits != 0;
+          }
+          
+          // ------------------------------------------------- the wanbai.h-style path
+          //
+          // This is what a scene hack does: find a device node, open it, send the key,
+          // then ioctl 0x801/0x802/0x803 with their structs. Nothing here uses the
+          // syscall - it is the compatibility path being tested, from the outside.
+          
+          #define TOWA_IOCTL_INIT_KEY    0x800
+          #define TOWA_IOCTL_READ_MEM    0x801
+          #define TOWA_IOCTL_MODULE_BASE 0x803
+          
+          struct towa_copy_memory {
+              int pid;
+              unsigned long addr;
+              void *buffer;
+              unsigned long size;
+          };
+          
+          struct towa_module_base {
+              int pid;
+              char *name;
+              unsigned long base;
+          };
+          
+          static bool try_node(const char *path, int pid, unsigned int elfmagic)
+          {
+              printf("%-22s ", path);
+          
+              int fd = open(path, O_RDWR);
+              if (fd < 0) {
+                  printf("cannot open (%s)\n", strerror(errno));
+                  return false;
+              }
+          
+              // Their clients always send a key. Any string is accepted on our side.
+              if (ioctl(fd, TOWA_IOCTL_INIT_KEY, (void *)"towacli") != 0) {
+                  printf("initKey refused\n");
+                  close(fd);
+                  return false;
+              }
+              printf("key ok  ");
+          
+              struct towa_module_base mb;
+              mb.pid  = pid;
+              mb.name = (char *)"libil2cpp.so";
+              mb.base = 0;
+          
+              if (ioctl(fd, TOWA_IOCTL_MODULE_BASE, &mb) != 0 || !mb.base) {
+                  printf("module base failed\n");
+                  close(fd);
+                  return false;
+              }
+          
+              unsigned int magic = 0;
+              struct towa_copy_memory cm;
+              cm.pid    = pid;
+              cm.addr   = mb.base;
+              cm.buffer = &magic;
+              cm.size   = 4;
+          
+              if (ioctl(fd, TOWA_IOCTL_READ_MEM, &cm) != 0) {
+                  printf("read failed\n");
+                  close(fd);
+                  return false;
+              }
+          
+              printf("base 0x%lx  first word 0x%08x  %s\n", mb.base, magic,
+                     magic == elfmagic ? "ELF - a hack would be in business" : "NOT elf");
+              close(fd);
+              return true;
+          }
+          
+          static int cmd_compat(void)
+          {
+              static const char *names[] = {
+                  "wanbai", "CheckMe", "Ckanri", "lanran", "video188",
+              };
+          
+              int pid = find_pid("com.dts.freefireth");
+              printf("pid        : %d\n", pid);
+              printf("--- looking for the nodes our module registers ---\n");
+          
+              bool any = false;
+              for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+                  char path[64];
+                  snprintf(path, sizeof(path), "/dev/%s", names[i]);
+                  if (access(path, F_OK) != 0 && access(path, R_OK) != 0)
+                      continue;
+                  any = true;
+                  try_node(path, pid, kElfMagic);
+              }
+              if (!any) {
+                  printf("none of them exist - is towa_core.ko loaded, and is the compat\n"
+                         "block enabled (TOWA_COMPAT 1 in towa_core.c)?\n");
+                  return 1;
+              }
+          
+              printf("--- the rt-proc shape ---\n");
+              printf("/proc/kvmstats          %s\n",
+                     access("/proc/kvmstats", F_OK) == 0 ? "exists" : "missing");
+          
+              return 0;
+          }
+          
+          // ---------------------------------------------------------------- utilities
+          
+          static bool hex_to_bytes(const char *s, std::vector<unsigned char> &out)
+          {
+              size_t n = strlen(s);
+              if (n == 0 || n % 2) return false;
+          
+              for (size_t i = 0; i < n; i += 2) {
+                  unsigned v;
+                  if (sscanf(s + i, "%2x", &v) != 1) return false;
+                  out.push_back((unsigned char)v);
+              }
+              return true;
+          }
+          
+          static void hexdump(unsigned long addr, const unsigned char *p, int n)
+          {
+              for (int i = 0; i < n; i += 16) {
+                  printf("%016lx  ", addr + i);
+                  for (int j = 0; j < 16; j++) {
+                      if (i + j < n) printf("%02x ", p[i + j]);
+                      else           printf("   ");
+                      if (j == 7) printf(" ");
+                  }
+                  printf(" |");
+                  for (int j = 0; j < 16 && i + j < n; j++) {
+                      unsigned char c = p[i + j];
+                      printf("%c", (c >= 32 && c < 127) ? c : '.');
+                  }
+                  printf("|\n");
+              }
+          }
+          
+          // ---------------------------------------------------------------- the one test
+          
+          static int cmd_test(int pid)
+          {
+              printf("syscall    : %lu\n", g_nr);
+          
+              long r = towa(TOWA_OP_PING);
+              if (r < 0) {
+                  perr("ping", r);
+                  if (-r == ENOSYS)
+                      printf("           ENOSYS means either the number is wrong or "
+                             "towa_core.ko is not loaded\n");
+                  return 1;
+              }
+              if ((unsigned long)r != TOWA_MAGIC) {
+                  printf("ping       : unexpected reply 0x%lx\n", (unsigned long)r);
+                  return 1;
+              }
+              printf("ping       : ok (0x%lx)\n", (unsigned long)r);
+          
+              if (pid <= 0) {
+                  printf("no pid given and no process matched\n");
+                  return 1;
+              }
+              printf("pid        : %d\n", pid);
+          
+              unsigned long base = towa_base(pid, "libil2cpp.so");
+              if (!base) return 1;
+              printf("libil2cpp  : 0x%lx\n", base);
+          
+              unsigned int magic = 0;
+              if (towa_read(pid, base, &magic, 4) < 0) return 1;
+              printf("first word : 0x%08x  (%s)\n", magic,
+                     magic == kElfMagic ? "ELF - the kernel really read it" : "NOT elf, something is off");
+          
+              return magic == kElfMagic ? 0 : 1;
+          }
+          
+          // ---------------------------------------------------------------- main
+          
+          static void usage(const char *me)
+          {
+              printf(
+                  "towacli [-n <syscall nr>] <command>\n"
+                  "\n"
+                  "  ping                          is the syscall there?\n"
+                  "  test [pid]                    ping + libil2cpp base + ELF check\n"
+                  "  compat                        the same thing a scene hack does, through\n"
+                  "                                /dev/wanbai and ioctl 0x800..0x803\n"
+                  "  pid <name>                    find a pid by process name\n"
+                  "  base <pid> <soname>           load address of a shared object\n"
+                  "  read <pid> <hexaddr> <len>    hexdump from the target\n"
+                  "  write <pid> <hexaddr> <hex>   write bytes into the target\n"
+                  "\n"
+                  "hardware breakpoints (no byte of the target is touched):\n"
+                  "  hbp add   <x|w> <pid> <addr>            count hits, nothing else\n"
+                  "  hbp arm   <x|w> <pid> <addr> [act] [v] [reg]\n"
+                  "      act: none  skip        pc += 4, the instruction does not run\n"
+                  "           ret   <v>        return from the function now, x0 = v\n"
+                  "           pc    <addr>     jump\n"
+                  "           x0    <v>        x0 = v, then skip that instruction\n"
+                  "           reg   <v> <rn>   regs[rn] = v, then skip it\n"
+                  "  hbp sweep <x|w> <pid> <addr> [act] [v]  arm, watch for 10 s, disarm\n"
+                  "  hbp stat  <slot>                        hits, last pc, address\n"
+                  "  hbp off   <slot>                        disarm\n"
+                  "\n"
+                  "page watches (the page table is touched, not the page):\n"
+                  "  watch   <pid> <addr> [w|a]    next write (w) or next access (a)\n"
+                  "  watch sweep <pid> <addr> [w|a]  arm, wait up to 20 s, report, disarm\n"
+                  "  watch stat <slot>             who touched it, from which pc\n"
+                  "  watch off  <slot>             disarm\n"
+                  "\n"
+                  "example:  towacli test\n"
+                  "          towacli read 12345 0x71c2a5b000 64\n"
+                  "          towacli hbp sweep x 12345 0x71c2a5b000\n"
+                  "          towacli hbp arm x 12345 0x71c2a5b000 ret 1\n"
+                  "          towacli watch sweep 12345 0x71c2a5b400 w\n",
+                  me);
+          }
+          
+          int main(int argc, char **argv)
+          {
+              std::vector<std::string> a;
+              for (int i = 1; i < argc; i++) {
+                  if (!strcmp(argv[i], "-n") && i + 1 < argc) {
+                      g_nr = strtoul(argv[++i], NULL, 0);
+                      continue;
+                  }
+                  a.push_back(argv[i]);
+              }
+          
+              if (a.empty()) { usage(argv[0]); return 2; }
+          
+              const std::string &cmd = a[0];
+          
+              if (cmd == "ping") {
+                  long r = towa(TOWA_OP_PING);
+                  if (r < 0) { perr("ping", r); return 1; }
+                  printf("towa alive, magic 0x%lx, syscall %lu\n", (unsigned long)r, g_nr);
+                  return 0;
+              }
+          
+              if (cmd == "test") {
+                  int pid = a.size() > 1 ? atoi(a[1].c_str()) : find_pid("com.dts.freefireth");
+                  return cmd_test(pid);
+              }
+          
+              if (cmd == "compat") {
+                  return cmd_compat();
+              }
+          
+              if (cmd == "pid") {
+                  if (a.size() < 2) { usage(argv[0]); return 2; }
+                  int pid = find_pid(a[1].c_str());
+                  if (pid < 0) { printf("no process matching '%s'\n", a[1].c_str()); return 1; }
+                  printf("%d\n", pid);
+                  return 0;
+              }
+          
+              if (cmd == "base") {
+                  if (a.size() < 3) { usage(argv[0]); return 2; }
+                  unsigned long b = towa_base(atoi(a[1].c_str()), a[2].c_str());
+                  if (!b) return 1;
+                  printf("0x%lx\n", b);
+                  return 0;
+              }
+          
+              // Hardware breakpoints. Nothing is written to the target: the address just
+              // goes into a debug register, so unlike a hook there is no patched byte for
+              // anything to find.
+              if (cmd == "hbp") {
+                  if (a.size() < 2) { usage(argv[0]); return 2; }
+          
+                  if (a[1] == "stat") {
+                      if (a.size() < 3) { usage(argv[0]); return 2; }
+                      towa_hbp_stat(strtoul(a[2].c_str(), NULL, 0));
+                      return 0;
+                  }
+          
+                  if (a[1] == "off") {
+                      if (a.size() < 3) { usage(argv[0]); return 2; }
+                      long r = towa_hbp_del(strtoul(a[2].c_str(), NULL, 0));
+                      if (r < 0) return 1;
+                      printf("slot %s cleared\n", a[2].c_str());
+                      return 0;
+                  }
+          
+                  // add | arm | sweep  <x|w>  <pid>  <hexaddr>  [action] [value] [reg]
+                  bool sweep = a[1] == "sweep";
+                  if ((a[1] != "add" && a[1] != "arm" && !sweep) || a.size() < 5) {
+                      usage(argv[0]);
+                      return 2;
+                  }
+          
+                  unsigned long type = (a[2] == "w") ? TOWA_BP_W : TOWA_BP_X;
+                  int pid = atoi(a[3].c_str());
+                  unsigned long addr = strtoul(a[4].c_str(), NULL, 16);
+          
+                  unsigned long action = TOWA_ACT_NONE, value = 0, reg = 0;
+                  if (a.size() > 5) {
+                      const std::string &act = a[5];
+                      if      (act == "skip") action = TOWA_ACT_SKIP;
+                      else if (act == "ret")  action = TOWA_ACT_RET;
+                      else if (act == "pc")   action = TOWA_ACT_PC;
+                      else if (act == "x0")   action = TOWA_ACT_X0;
+                      else if (act == "reg")  action = TOWA_ACT_REG;
+                      else if (act != "none") { printf("unknown action '%s'\n", act.c_str()); return 2; }
+          
+                      if (a.size() > 6) value = strtoul(a[6].c_str(), NULL, 0);
+                      if (a.size() > 7) reg   = strtoul(a[7].c_str(), NULL, 0);
+                  }
+          
+                  long slot = towa_hbp_arm(pid, addr, type, action, value, reg);
+                  if (slot < 0) {
+                      printf("(ENOSPC = all four debug registers in use;  "
+                             "EINVAL/ENOTSUPP = the kernel will not take that address/type)\n");
+                      return 1;
+                  }
+          
+                  const char *what = type == TOWA_BP_W ? "write" : "execute";
+                  if (action == TOWA_ACT_NONE)
+                      printf("armed slot %ld on pid %d at 0x%lx (%s, counting)\n",
+                             slot, pid, addr, what);
+                  else
+                      printf("armed slot %ld on pid %d at 0x%lx (%s, action %s, value 0x%lx)\n",
+                             slot, pid, addr, what, a[5].c_str(), value);
+          
+                  if (sweep) {
+                      for (int i = 0; i < 10; i++) { sleep(1); towa_hbp_stat(slot); }
+                      towa_hbp_del(slot);
+                      printf("disarmed slot %ld\n", slot);
+                  }
+                  return 0;
+              }
+          
+              // Page watches: arm one page, see who touches it, put it back.
+              if (cmd == "watch") {
+                  if (a.size() < 2) { usage(argv[0]); return 2; }
+          
+                  if (a[1] == "stat") {
+                      if (a.size() < 3) { usage(argv[0]); return 2; }
+                      towa_watch_stat(strtoul(a[2].c_str(), NULL, 0));
+                      return 0;
+                  }
+          
+                  if (a[1] == "off") {
+                      if (a.size() < 3) { usage(argv[0]); return 2; }
+                      long r = towa_watch_off(strtoul(a[2].c_str(), NULL, 0));
+                      if (r < 0) return 1;
+                      printf("watch slot %s disarmed\n", a[2].c_str());
+                      return 0;
+                  }
+          
+                  // watch | sweep  <pid>  <hexaddr>  [w|a]
+                  bool sweep = a[1] == "sweep";
+                  if ((a[1] != "watch" && !sweep) || a.size() < 4) { usage(argv[0]); return 2; }
+          
+                  int pid = atoi(a[2].c_str());
+                  unsigned long addr = strtoul(a[3].c_str(), NULL, 16);
+                  unsigned long mode = (a.size() > 4 && a[4] == "a") ? TOWA_WATCH_ACCESS
+                                                                     : TOWA_WATCH_WRITE;
+          
+                  long slot = towa_watch_arm(pid, addr, mode);
+                  if (slot < 0) {
+                      printf("(EFAULT = that page is not faulted in yet, touch it first;  "
+                             "EOPNOTSUPP = access mode was refused - it needs a read-only\n"
+                             " file page, use write mode on anything else)\n");
+                      return 1;
+                  }
+                  printf("watching slot %ld: pid %d page 0x%lx, next %s\n",
+                         slot, pid, addr & ~0xfffUL,
+                         mode == TOWA_WATCH_ACCESS ? "read/write/execute" : "write");
+          
+                  if (sweep) {
+                      for (int i = 0; i < 20; i++) {
+                          sleep(1);
+                          if (towa_watch_stat(slot)) break;
+                      }
+                      towa_watch_off(slot);
+                  }
+                  return 0;
+              }
+          
+              if (cmd == "read") {
+                  if (a.size() < 4) { usage(argv[0]); return 2; }
+                  int pid = atoi(a[1].c_str());
+                  unsigned long addr = strtoul(a[2].c_str(), NULL, 16);
+                  unsigned long len = strtoul(a[3].c_str(), NULL, 0);
+                  if (len > 1024 * 1024) { printf("len too big\n"); return 2; }
+          
+                  std::vector<unsigned char> buf(len);
+                  int got = towa_read(pid, addr, &buf[0], len);
+                  if (got < 0) return 1;
+                  hexdump(addr, &buf[0], got);
+                  return 0;
+              }
+          
+              if (cmd == "write") {
+                  if (a.size() < 4) { usage(argv[0]); return 2; }
+                  int pid = atoi(a[1].c_str());
+                  unsigned long addr = strtoul(a[2].c_str(), NULL, 16);
+          
+                  std::vector<unsigned char> bytes;
+                  if (!hex_to_bytes(a[3].c_str(), bytes)) { printf("bad hex\n"); return 2; }
+          
+                  int put = towa_write(pid, addr, &bytes[0], bytes.size());
+                  if (put < 0) return 1;
+                  printf("wrote %d bytes to 0x%lx\n", put, addr);
+                  return 0;
+              }
+          
+              usage(argv[0]);
+              return 2;
+          }
+          TW_CLI
+          
+          curl -fSL --retry 5 --retry-delay 5 --retry-all-errors --no-progress-meter \
+            -o /tmp/ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          rm -f /tmp/ndk.zip
+          
+          NDK=$(ls -d /opt/android-ndk-* | head -1)
+          CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++"
+          test -x "$CXX" || { echo "no ndk clang++ at $CXX"; ls -d /opt/android-ndk-* 2>/dev/null; exit 1; }
+          
+          # -static-libstdc++ so the binary does not need libc++_shared.so pushed next to
+          # it; libc, libm and libdl are on the device already.
+          "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -o "$GITHUB_WORKSPACE/tools/towacli" \
+                 "$GITHUB_WORKSPACE/tools/towacli.cpp"
+          
+          echo "--- what we built ---"
+          ls -l "$GITHUB_WORKSPACE/tools/towacli"
+          file "$GITHUB_WORKSPACE/tools/towacli" || true
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$GITHUB_WORKSPACE/tools/towacli" | grep -E 'Class|Type|Machine'
+          echo "--- libraries it asks for (libc/libm/libdl only) ---"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d "$GITHUB_WORKSPACE/tools/towacli" | grep NEEDED
+          
+          rm -rf /opt/android-ndk-*
+          echo "--- usage it prints for itself ---"
+          "$GITHUB_WORKSPACE/tools/towacli" 2>&1 | head -5 || true
       - name: Package AnyKernel3 zip
         run: |
           set -e
-          # mrsiri's own AnyKernel3 fork, so the flash template matches theirs
           curl -fsSL "https://codeload.github.com/Aflaungos/AnyKernel3/tar.gz/refs/heads/m23xq" -o /tmp/ak3.tar.gz
           mkdir -p /tmp/ak3 && tar -xzf /tmp/ak3.tar.gz -C /tmp/ak3 --strip-components=1
           cd /tmp/ak3
@@ -229,9 +2320,29 @@ jobs:
           cp "$GITHUB_WORKSPACE/out/Image" Image
           [ -f "$GITHUB_WORKSPACE/out/dtb" ]  && cp "$GITHUB_WORKSPACE/out/dtb"  dtb
           [ -f "$GITHUB_WORKSPACE/out/dtbo" ] && cp "$GITHUB_WORKSPACE/out/dtbo" dtbo
+          # The module rides inside the zip too, so one download has everything.
+          # With builtin=y there is no module and the block below does nothing.
+          if [ -f "$GITHUB_WORKSPACE/out/towa_core.ko" ]; then
+            cp "$GITHUB_WORKSPACE/out/towa_core.ko" towa_core.ko
+          fi
+          # Appended after write_boot, which is plain shell by that point.
+          cat >> anykernel.sh <<'AK3EOF'
+
+          # towa: leave the module somewhere that survives, so it does not have to
+          # be pushed again after every flash
+          for d in "$AKHOME" .; do
+            if [ -f "$d/towa_core.ko" ]; then
+              mkdir -p /data/adb/towa
+              cp "$d/towa_core.ko" /data/adb/towa/towa_core.ko
+              chmod 0644 /data/adb/towa/towa_core.ko
+              ui_print "  towa_core.ko -> /data/adb/towa/"
+              break
+            fi
+          done
+          AK3EOF
           rm -rf .github README.md
-          Z="$GITHUB_WORKSPACE/CheetKernal-191-${{ github.run_number }}.zip"
-          zip -r9 "$Z" . -x '.git/*' -x '.github/*' -x 'README.md' -x '*placeholder' >/dev/null
+          Z="$GITHUB_WORKSPACE/towa-kernel-${{ github.run_number }}.zip"
+          zip -r9 "$Z" . -x '.git/*' -x '.github/*' -x 'README.md' >/dev/null
           echo "--- contents ---"; unzip -l "$Z" | head -25
           echo "--- self-test ---"; unzip -t "$Z" | tail -3
           echo "--- sha256 ---"; sha256sum "$Z"
@@ -239,18 +2350,49 @@ jobs:
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: CheetKernal-191-${{ github.run_number }}
-          path: ${{ github.workspace }}/CheetKernal-191-*.zip
+          name: towa-kernel-${{ github.run_number }}
+          path: ${{ github.workspace }}/towa-kernel-*.zip
           if-no-files-found: error
 
-      - name: Attach zip to a release
+      - name: Upload towa_core.ko
+        if: ${{ inputs.builtin != 'y' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: towa_core-ko-${{ github.run_number }}
+          path: ${{ github.workspace }}/out/towa_core.ko
+          if-no-files-found: error
+
+      - name: Upload towacli
+        uses: actions/upload-artifact@v4
+        with:
+          name: towacli-${{ github.run_number }}
+          path: ${{ github.workspace }}/tools/towacli
+          if-no-files-found: error
+
+      - name: Attach to a release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          Z="$GITHUB_WORKSPACE/CheetKernal-191-${{ github.run_number }}.zip"
-          gh release create "cheet-${{ github.run_number }}" "$Z" \
+          Z="$GITHUB_WORKSPACE/towa-kernel-${{ github.run_number }}.zip"
+          FILES="$Z"
+          E="/tmp/extra.txt"
+          if [ -f "$GITHUB_WORKSPACE/tools/towacli" ]; then
+            cp "$GITHUB_WORKSPACE/tools/towacli" /tmp/towacli
+            FILES="$FILES /tmp/towacli"
+          fi
+          if [ -f "$GITHUB_WORKSPACE/out/towa_core.ko" ]; then
+            cp "$GITHUB_WORKSPACE/out/towa_core.ko" /tmp/towa_core.ko
+            FILES="$FILES /tmp/towa_core.ko"
+            echo "towa_core.ko is in this release" > "$E"
+          else
+            echo "built-in build: towa_core is in the Image, no .ko" > "$E"
+          fi
+          NR=$(grep -m1 '^#define __NR_syscalls' kernel/include/uapi/asm-generic/unistd.h | awk '{print $3}')
+          gh release create "towa-${{ github.run_number }}" $FILES \
             --repo "$GITHUB_REPOSITORY" \
-            --title "CheetKernal 191 build ${{ github.run_number }}" \
-            --notes "sha256: $(sha256sum "$Z" | cut -d' ' -f1)" \
-          || gh release upload "cheet-${{ github.run_number }}" "$Z" \
+            --title "towa kernel build ${{ github.run_number }}" \
+            --notes "TOWA_NR=$((NR-1))  cookie=0x9E3779B97F4A7C15  branch=${{ inputs.branch }}  builtin=${{ inputs.builtin }}
+          $(cat "$E")
+          sha256=$(sha256sum "$Z" | cut -d' ' -f1)" \
+          || gh release upload "towa-${{ github.run_number }}" $FILES \
             --repo "$GITHUB_REPOSITORY" --clobber
