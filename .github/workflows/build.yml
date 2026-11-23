@@ -1607,7 +1607,12 @@ jobs:
 
           rc=0
           : > /tmp/towa.log
-          for o in drivers/towa/towa_syscall.o drivers/towa/towa_watch.o drivers/towa/towa_core.o; do
+          # Our three files, plus the two tree files we patched.  The patched
+          # ones are the only integration points, and compiling them here costs
+          # seconds instead of being discovered ten minutes into the real build.
+          for o in drivers/towa/towa_syscall.o drivers/towa/towa_watch.o \
+                   drivers/towa/towa_core.o \
+                   arch/arm64/kernel/sys.o arch/arm64/mm/fault.o; do
             echo "=== $o" >> /tmp/towa.log
             make O=out $P ARCH=arm64 "$o" >> /tmp/towa.log 2>&1 || rc=1
           done
@@ -1616,9 +1621,29 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "=========== OUR ERRORS (with context) ==========="
             grep -n -B 2 -A 6 -E 'error:|错误' /tmp/towa.log || tail -40 /tmp/towa.log
+            # also as an annotation, so it shows on the run summary page
+            grep -m 8 -E 'error:' /tmp/towa.log | while IFS= read -r l; do
+              echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"
+            done
           else
-            echo "our three objects compiled cleanly:"
+            echo "all five objects compiled cleanly:"
             ls -l out/drivers/towa/ 2>/dev/null
+
+            # A compile proves nothing about the link, and the link is where a
+            # 10-minute run actually died.  So compare the two symbols the
+            # patched tree files need against our objects' definitions, here,
+            # in seconds.
+            echo "--- what the patched files ask for, and what we provide ---"
+            for pair in "arch/arm64/kernel/sys.o:__arm64_sys_towa" \
+                        "arch/arm64/mm/fault.o:towa_watch_fault"; do
+              obj="out/${pair%%:*}"; sym="${pair##*:}"
+              echo "  $sym"
+              nm "$obj" 2>/dev/null | grep -E "[UT] $sym\$" | sed 's/^/    needed: /' \
+                || echo "    needed: (not referenced - the patch did not land?)"
+              nm "out/drivers/towa/$( [ "$sym" = towa_watch_fault ] && echo towa_watch.o || echo towa_syscall.o )" \
+                2>/dev/null | grep -E "T $sym\$" | sed 's/^/    given : /' \
+                || echo "    given : MISSING - this is the unresolved symbol"
+            done
           fi
           exit $rc
 
@@ -1662,6 +1687,19 @@ jobs:
             first=$(grep -n -m1 'error:' /tmp/build.log | cut -d: -f1)
             if [ -n "$first" ]; then
               sed -n "$(( first > 12 ? first - 12 : 1 )),$(( first + 8 ))p" /tmp/build.log
+            fi
+
+            # Annotations appear on the RUN SUMMARY page itself, so the cause is
+            # readable without opening (or scrolling) a 40-minute log.  A link
+            # error has no "error:" line, so fall back to the undefined-symbol
+            # and last-resort lines.
+            ann() { grep -m 8 -E "$1" /tmp/build.log | while IFS= read -r l; do
+                      echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"; done; }
+            ann 'error:'
+            ann 'undefined reference|undefined symbol|multiple definition'
+            if ! grep -qE 'error:|undefined reference|undefined symbol' /tmp/build.log; then
+              tail -3 /tmp/build.log | while IFS= read -r l; do
+                echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"; done
             fi
             echo "=========== OUR OWN FILES IN THE LOG ==========="
             grep -n 'drivers/towa' /tmp/build.log | tail -20
@@ -2517,6 +2555,17 @@ jobs:
           echo "--- contents ---"; unzip -l "$Z" | head -25
           echo "--- self-test ---"; unzip -t "$Z" | tail -3
           echo "--- sha256 ---"; sha256sum "$Z"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            /tmp/build.log
+            /tmp/towa.log
+            /tmp/cfg.log
+          if-no-files-found: warn
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
