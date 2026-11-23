@@ -2398,8 +2398,13 @@ jobs:
               int pid = find_pid("com.dts.freefireth");
               if (pid <= 0) { printf("the game is not running\n"); return 1; }
           
-              /* slots stay held once used, so clear them out first */
-              for (int i = 0; i < 4; i++) towa_watch_off(i);
+              /*
+               * Slots stay held once used, so clear them first - but quietly: on a
+               * fresh boot none of them are armed and every one of those calls
+               * answers -EINVAL, which is not a failure.
+               */
+              for (int i = 0; i < 4; i++)
+                  towa(TOWA_OP_WATCH_OFF, (unsigned long)i);
           
               char dir[64];
               snprintf(dir, sizeof(dir), "/proc/%d/task", pid);
