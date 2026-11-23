@@ -787,15 +787,26 @@ jobs:
            */
           #define TOWA_COMPAT	1
           
+          /*
+           * find_task_by_vpid() is NOT exported to modules, and this file is a module -
+           * modpost refuses the link over it.  find_get_pid() and get_pid_task() are both
+           * EXPORT_SYMBOL_GPL, and get_pid_task() hands back a task reference, which is
+           * exactly what the rcu_read_lock + get_task_struct dance was doing by hand.
+           *
+           * (The built-in half, towa_watch.c, keeps using find_task_by_vpid(): built-in
+           * code may use unexported symbols, and it is already proven to link.)
+           */
           static struct task_struct *towa_get_task(pid_t pid)
           {
+          	struct pid *p;
           	struct task_struct *t;
           
-          	rcu_read_lock();
-          	t = find_task_by_vpid(pid);
-          	if (t)
-          		get_task_struct(t);
-          	rcu_read_unlock();
+          	p = find_get_pid(pid);
+          	if (!p)
+          		return NULL;
+          
+          	t = get_pid_task(p, PIDTYPE_PID);
+          	put_pid(p);
           
           	return t;
           }
@@ -1681,7 +1692,7 @@ jobs:
 
           if [ "$rc" -ne 0 ]; then
             echo "=========== ERROR LINES ==========="
-            grep -n -m 25 -E 'error:|Error [1-9]|错误|No rule to make|undefined!' /tmp/build.log \
+            grep -n -m 25 -E 'error:|ERROR:|Error [1-9]|错误|No rule to make|undefined!|undefined reference|multiple definition' /tmp/build.log \
               || echo "  (no line matched 'error:' - see the tail above)"
             echo "=========== CONTEXT AROUND THE FIRST 'error:' ==========="
             first=$(grep -n -m1 'error:' /tmp/build.log | cut -d: -f1)
@@ -1695,9 +1706,9 @@ jobs:
             # and last-resort lines.
             ann() { grep -m 8 -E "$1" /tmp/build.log | while IFS= read -r l; do
                       echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"; done; }
-            ann 'error:'
-            ann 'undefined reference|undefined symbol|multiple definition'
-            if ! grep -qE 'error:|undefined reference|undefined symbol' /tmp/build.log; then
+            ann 'error:|ERROR:'
+            ann 'undefined!|undefined reference|undefined symbol|multiple definition'
+            if ! grep -qE 'error:|ERROR:|undefined!|undefined reference|undefined symbol' /tmp/build.log; then
               tail -3 /tmp/build.log | while IFS= read -r l; do
                 echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"; done
             fi
