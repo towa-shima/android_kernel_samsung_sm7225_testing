@@ -1854,6 +1854,7 @@ jobs:
           #include <unistd.h>
           #include <sys/syscall.h>
           #include <sys/ioctl.h>
+          #include <sys/mman.h>
           
           #define TOWA_COOKIE 0x9E3779B97F4A7C15ULL
           #define TOWA_MAGIC  0x5032300AUL
@@ -2341,6 +2342,7 @@ jobs:
                   char perms[8] = { 0 };
                   char dev[16] = { 0 };
                   unsigned long ino = 0;
+                  (void)dev; (void)ino;   /* parsed, not used */
           
                   memset(&m, 0, sizeof(m));
                   int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %255[^\n]",
@@ -2405,7 +2407,8 @@ jobs:
               DIR *d = opendir(dir);
               if (!d) { perror("task"); return 1; }
           
-              struct { int tid; char comm[64]; unsigned long sp; } cand[512];
+              struct thread_cand { int tid; char comm[64]; unsigned long sp; };
+              thread_cand cand[512];
               int nc = 0;
               struct dirent *e;
           
@@ -2438,7 +2441,7 @@ jobs:
               for (int i = 0; i < nc; i++)
                   for (int j = i + 1; j < nc; j++)
                       if (cand[j].sp && !cand[i].sp) {
-                          typeof(cand[0]) t = cand[i]; cand[i] = cand[j]; cand[j] = t;
+                          thread_cand t = cand[i]; cand[i] = cand[j]; cand[j] = t;
                       }
           
               int armed = 0;
