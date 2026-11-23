@@ -291,6 +291,11 @@ jobs:
           			       unsigned long a2, unsigned long a3,
           			       unsigned long a4);
           
+          /* Implemented in towa_syscall.c.  towa_core.c has to register itself through
+           * this, so it needs the prototype - which it did not have, and this tree builds
+           * with -Werror=implicit-function-declaration. */
+          void towa_set_handler(towa_handler_t fn);
+          
           /* Implemented in towa_watch.c, which is built into the kernel, not the module:
            * it needs the page-fault path and the core mm helpers. */
           int towa_watch_arm(pid_t pid, unsigned long addr, unsigned long mode);
@@ -402,6 +407,9 @@ jobs:
           #include <asm/tlbflush.h>
           #include <asm/ptrace.h>
           #include <asm/esr.h>
+          
+          #include <linux/towa_watch.h>	/* so our definition is checked against the
+          				 * prototype fault.c calls us through */
           
           #include "towa.h"
           
