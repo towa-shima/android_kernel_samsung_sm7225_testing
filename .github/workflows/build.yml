@@ -100,11 +100,24 @@ jobs:
             [ -x "${{ inputs.clang_dir }}/bin/clang" ] || { echo "  no bin/clang"; return 1; }
             "${{ inputs.clang_dir }}/bin/clang" --version || return 1
           }
+          # AOSP prunes old revisions out of prebuilts/clang/host/linux-x86, so
+          # whether a given revision is still downloadable depends entirely on
+          # who mirrored it.  Which mirror exists is NOT the same for the two
+          # trees this workflow can build: r563880 (the 325 tree) lives in
+          # Aeron-Aeron's and kiy017's imports, r487747c (the 191 tree) in
+          # halogenOS's and project-raspberry's.  So try all of them and let the
+          # first that answers win - a list that only covers one revision is how
+          # this failed the first time, with three 404s and a 400.
           D="${{ inputs.clang_dir }}"
-          fetch "https://codeload.github.com/halogenOS/android_prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/XOS-13.0" 1 \
+          fetch "https://codeload.github.com/Aeron-Aeron/linux-x86-clang-21.0.0-${D#clang-}/tar.gz/refs/heads/main" 1 \
+          || fetch "https://github.com/kiy017/${D}c/releases/download/release/linux-x86-f8439f0628d799092dd07df440a6334cab28939c-${D}c.tar.gz" 1 \
+          || fetch "https://codeload.github.com/halogenOS/android_prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/XOS-13.0" 1 \
           || fetch "https://codeload.github.com/project-raspberry/prebuilts_clang_host_linux-x86_$D/tar.gz/refs/heads/fifteen" 1 \
           || fetch "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/$D.tar.gz" 0 \
-          || { echo "ALL CLANG SOURCES FAILED"; exit 1; }
+          || { echo "ALL CLANG SOURCES FAILED - no mirror of $D answered"; df -h /; exit 1; }
+
+          echo "--- which clang did we actually end up with? ---"
+          ls -d "$HOME/linux-x86-main/$D" && "$HOME/linux-x86-main/$D/bin/clang" --version
 
       - name: Toolchain - aarch64-linux-android-4.9
         run: |
