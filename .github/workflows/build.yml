@@ -1,4 +1,4 @@
-name: Build towa kernel (325 / 191 + towa syscall)
+name: Build towa kernel
 
 # One run gives you two files:
 #   * a flashable AnyKernel3 zip whose kernel carries a NEW syscall, and
@@ -346,6 +346,7 @@ jobs:
           #include <linux/jump_label.h>
           #include <linux/rmap.h>
           #include <linux/pagemap.h>
+          #include <linux/mmap_lock.h>
           #include <asm/pgtable.h>
           #include <asm/tlbflush.h>
           #include <asm/ptrace.h>
@@ -384,7 +385,7 @@ jobs:
           };
           
           /*
-           * Walk to the PTE for addr.  Caller must hold mm->mmap_sem for read.  Returns
+           * Walk to the PTE for addr.  Caller must hold mmap_sem for read.  Returns
            * 0 with ptep locked, or an error with nothing held.
            */
           static int towa_pte_lock(struct mm_struct *mm, unsigned long addr,
@@ -406,8 +407,9 @@ jobs:
           	if (pmd_none(*pmd) || pmd_bad(*pmd))
           		return -EFAULT;
           
-          	/* A huge mapping has no PTE to take access from. */
-          	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
+          	/* A huge mapping has no PTE to take access from.  (No pmd_devmap
+          	 * here: this tree has not got it.) */
+          	if (pmd_trans_huge(*pmd))
           		return -EOPNOTSUPP;
           
           	out->pmd  = pmd;
@@ -463,7 +465,7 @@ jobs:
           	if (!mm)
           		return -EINVAL;
           
-          	down_read(&mm->mmap_sem);
+          	mmap_read_lock(mm);
           
           	vma = find_vma(mm, addr);
           	if (!vma || vma->vm_start > addr) {
@@ -520,7 +522,7 @@ jobs:
           		ptep_get_and_clear(mm, addr, p.ptep);
           
           	towa_pte_unlock(&p);
-          	up_read(&mm->mmap_sem);
+          	mmap_read_unlock(mm);
           
           	/*
           	 * The PTE changed, so every CPU that might have it cached has to be
@@ -540,7 +542,7 @@ jobs:
           out_pte:
           	towa_pte_unlock(&p);
           out_unlock:
-          	up_read(&mm->mmap_sem);
+          	mmap_read_unlock(mm);
           	mmput(mm);
           	return ret;
           }
@@ -549,7 +551,7 @@ jobs:
           /* -------------------------------------------------------------- restoring */
           
           /*
-           * Called from the fault path with mm->mmap_sem held for read and the faulting
+           * Called from the fault path with mmap_sem held for read and the faulting
            * task being current.  Puts the PTE back and marks the slot spent.
            */
           static void towa_watch_release(struct towa_watch_slot *w, unsigned long addr)
@@ -641,13 +643,13 @@ jobs:
           
           	/* Still armed and still write-protected?  Give the write bit back. */
           	if (w->mode == TOWA_WATCH_WRITE && (flags & TOWA_WF_ARMED)) {
-          		down_read(&mm->mmap_sem);
+          		mmap_read_lock(mm);
           		if (!towa_pte_lock(mm, w->addr, &p)) {
           			set_pte_at(mm, w->addr, p.ptep, w->saved);
           			towa_pte_unlock(&p);
           			flush_tlb_mm(mm);
           		}
-          		up_read(&mm->mmap_sem);
+          		mmap_read_unlock(mm);
           	}
           
           	WRITE_ONCE(w->flags, 0);
@@ -715,6 +717,7 @@ jobs:
           #include <linux/perf_event.h>
           #include <linux/hw_breakpoint.h>
           #include <linux/pagemap.h>
+          #include <linux/mmap_lock.h>
           #include <linux/highmem.h>
           
           #include "towa.h"
@@ -868,7 +871,7 @@ jobs:
           	if (!mm)
           		return -EINVAL;
           
-          	down_read(&mm->mmap_sem);
+          	mmap_read_lock(mm);
           	for (vma = mm->mmap; vma; vma = vma->vm_next) {
           		const struct qstr *q;
           		int hit;
@@ -886,7 +889,7 @@ jobs:
           			break;
           		}
           	}
-          	up_read(&mm->mmap_sem);
+          	mmap_read_unlock(mm);
           	mmput(mm);
           
           	if (!base)
@@ -1397,27 +1400,33 @@ jobs:
           # ---- 2. the call site, inside do_page_fault, with mmap_sem held -------------
           CALL = 'towa_watch_fault(regs, addr, esr);'
           if CALL not in src:
-              m = None
-              for pat in (r'\nstatic int __kprobes do_page_fault\(',
-                          r'\ndo_page_fault\(unsigned long addr'):
-                  m = re.search(pat, src)
-                  if m:
+              # The call has to go where mmap_sem is already held and addr, esr, regs and
+              # mm are all live: the line that hands the fault on.  Do NOT anchor on
+              # down_read(&mm->mmap_sem) - this tree has no such call.  It backported the
+              # 5.x mmap locking API, so the lock is taken with mmap_read_lock(), and it
+              # sits inside an if/else that is only half the paths.
+              lines = src.split('\n')
+          
+              hit = None
+              for i, l in enumerate(lines):
+                  if l.strip().startswith('fault = __do_page_fault('):
+                      hit = i
                       break
-              if not m:
-                  sys.exit('do_page_fault not found in %s - the tree changed' % path)
+              if hit is None:
+                  sys.exit('no "fault = __do_page_fault(" call in %s - the tree changed' % path)
           
-              j = src.find('down_read(&mm->mmap_sem);', m.start())
-              if j < 0:
-                  sys.exit('no down_read(&mm->mmap_sem) after do_page_fault in %s' % path)
-          
-              eol = src.find('\n', j)
-              ins = ('\n\n\t/*\n'
-                     '\t * towa page watches.  Runs before the normal handling, with\n'
-                     '\t * mmap_sem held for read, and never claims the fault.\n'
-                     '\t */\n'
-                     '\ttowa_watch_fault(regs, addr, esr);')
-              src = src[:eol] + ins + src[eol:]
-              print('added the call site')
+              indent = lines[hit][:len(lines[hit]) - len(lines[hit].lstrip())]
+              lines[hit:hit] = [
+                  indent + '/*',
+                  indent + ' * towa page watches.  mmap_sem is held by this point, and',
+                  indent + ' * addr, esr and regs are all live.  Observes only - it never',
+                  indent + ' * claims the fault, so the access always succeeds.',
+                  indent + ' */',
+                  indent + 'towa_watch_fault(regs, addr, esr);',
+                  '',
+              ]
+              src = '\n'.join(lines)
+              print('added the call site before the __do_page_fault() call')
           
           assert CALL in src, 'the call site did not land'
           open(path, 'w').write(src)
@@ -1683,8 +1692,13 @@ jobs:
               unsigned long flags;
           };
           
+          // The syscall number is NOT fixed: it is whatever was free in the tree the
+          // kernel was built from (this one's table already runs to 442).  The CI compiles
+          // this file with -DNR_TOWA=<the number it just installed>.  Built without it,
+          // there is no safe guess - calling a random number with six arguments would hit
+          // somebody else's syscall - so the default is 0 and main() refuses to run.
           #ifndef NR_TOWA
-          #define NR_TOWA 294
+          #define NR_TOWA 0
           #endif
           
           static unsigned long g_nr = NR_TOWA;
@@ -2102,6 +2116,15 @@ jobs:
           
               if (a.empty()) { usage(argv[0]); return 2; }
           
+              if (!g_nr) {
+                  fprintf(stderr,
+                          "towacli was built without -DNR_TOWA=<number>, so it does not\n"
+                          "know the syscall.  Either use the binary the build produces, or\n"
+                          "pass -n <number>.  Do not guess: the wrong number is another\n"
+                          "syscall, with six arguments you did not mean.\n");
+                  return 2;
+              }
+          
               const std::string &cmd = a[0];
           
               if (cmd == "ping") {
@@ -2295,10 +2318,19 @@ jobs:
           CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++"
           test -x "$CXX" || { echo "no ndk clang++ at $CXX"; ls -d /opt/android-ndk-* 2>/dev/null; exit 1; }
           
+          # The syscall number comes from the tree we just built, because it is NOT 294:
+          # this kernel's table already runs to 442, so 294 is somebody else's syscall and
+          # calling it with six arguments would be worse than useless.
+          NR=$(grep -m1 '^#define __NR_syscalls' \
+                 "$GITHUB_WORKSPACE/kernel/include/uapi/asm-generic/unistd.h" | awk '{print $3}')
+          NR=$((NR-1))
+          echo "building against TOWA_NR=$NR"
+          test "$NR" -gt 0 || { echo "could not read the syscall number"; exit 1; }
+          
           # -static-libstdc++ so the binary does not need libc++_shared.so pushed next to
           # it; libc, libm and libdl are on the device already.
-          "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -o "$GITHUB_WORKSPACE/tools/towacli" \
-                 "$GITHUB_WORKSPACE/tools/towacli.cpp"
+          "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -DNR_TOWA=$NR \
+                 -o "$GITHUB_WORKSPACE/tools/towacli" "$GITHUB_WORKSPACE/tools/towacli.cpp"
           
           echo "--- what we built ---"
           ls -l "$GITHUB_WORKSPACE/tools/towacli"
