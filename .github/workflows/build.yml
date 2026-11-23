@@ -1920,6 +1920,12 @@ jobs:
           #define NR_TOWA 0
           #endif
           
+          // Filled in by the build with the date and time, so there is never any doubt
+          // about which binary is being run.
+          #ifndef TOWACLI_BUILD
+          #define TOWACLI_BUILD "unstamped"
+          #endif
+          
           static unsigned long g_nr = NR_TOWA;
           
           static long towa(unsigned long op, unsigned long a1 = 0, unsigned long a2 = 0,
@@ -2614,6 +2620,7 @@ jobs:
           
           static void usage(const char *me)
           {
+              printf("towacli %s\n\n", TOWACLI_BUILD);
               printf(
                   "towacli [-n <syscall nr>] <command>\n"
                   "\n"
@@ -2697,7 +2704,8 @@ jobs:
               if (cmd == "ping") {
                   long r = towa(TOWA_OP_PING);
                   if (r < 0) { perr("ping", r); return 1; }
-                  printf("towa alive, magic 0x%lx, syscall %lu\n", (unsigned long)r, g_nr);
+                  printf("towa alive, magic 0x%lx, syscall %lu, %s\n",
+                         (unsigned long)r, g_nr, TOWACLI_BUILD);
                   return 0;
               }
           
@@ -3021,7 +3029,11 @@ jobs:
           
           # -static-libstdc++ so the binary does not need libc++_shared.so pushed next to
           # it; libc, libm and libdl are on the device already.
+          STAMP=$(date -u +%Y%m%d.%H%M)
+          echo "towacli build stamp: $STAMP"
+          
           "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -DNR_TOWA=$NR \
+                 -DTOWACLI_BUILD="\"$STAMP\"" \
                  -o "$GITHUB_WORKSPACE/tools/towacli" "$GITHUB_WORKSPACE/tools/towacli.cpp"
           
           echo "--- what we built ---"
