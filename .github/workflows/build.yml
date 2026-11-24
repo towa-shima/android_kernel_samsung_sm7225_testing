@@ -305,6 +305,10 @@ jobs:
           	unsigned long		flags;
           };
           
+          /* The prctl pass-through, registered in kdbg.c. */
+          typedef long (*kdbg_prctl_t)(unsigned long cmd, void __user *arg);
+          void kdbg_set_prctl(kdbg_prctl_t fn);
+          
           /* What kdbg_syscall.c holds and calls. */
           typedef long (*kdbg_handler_t)(unsigned long op, unsigned long a1,
           			       unsigned long a2, unsigned long a3,
@@ -342,6 +346,8 @@ jobs:
           #include <linux/mutex.h>
           #include <linux/export.h>
           
+          #include <linux/kdbg.h>
+          
           #include "kdbg.h"
           
           static kdbg_handler_t kdbg_handler __read_mostly;
@@ -374,6 +380,39 @@ jobs:
           	mutex_lock(&kdbg_mutex);
           	fn = kdbg_handler;
           	ret = fn ? fn(op, a1, a2, a3, a4) : -ENOSYS;
+          	mutex_unlock(&kdbg_mutex);
+          
+          	return ret;
+          }
+          
+          /* ---------------------------------------------------------------- prctl ---- */
+          
+          static kdbg_prctl_t kdbg_prctl_fn __read_mostly;
+          
+          void kdbg_set_prctl(kdbg_prctl_t fn)
+          {
+          	mutex_lock(&kdbg_mutex);
+          	kdbg_prctl_fn = fn;
+          	mutex_unlock(&kdbg_mutex);
+          }
+          EXPORT_SYMBOL_GPL(kdbg_set_prctl);
+          
+          /*
+           * Called from SYSCALL_DEFINE5(prctl, ...) for the one magic option.  Same shape
+           * as the syscall front end: nothing but "call the registered handler", so the
+           * prctl path costs a single predictable branch for every other caller.
+           */
+          long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3)
+          {
+          	kdbg_prctl_t fn;
+          	long ret;
+          
+          	if (option != KDBG_PRCTL_MAGIC)
+          		return -EINVAL;
+          
+          	mutex_lock(&kdbg_mutex);
+          	fn = kdbg_prctl_fn;
+          	ret = fn ? fn(a2, (void __user *)a3) : -EINVAL;
           	mutex_unlock(&kdbg_mutex);
           
           	return ret;
@@ -791,6 +830,8 @@ jobs:
           #include <linux/pagemap.h>
           #include <linux/mmap_lock.h>
           #include <linux/highmem.h>
+          #include <linux/capability.h>
+          #include <linux/workqueue.h>
           
           #include "kdbg.h"
           
@@ -799,6 +840,13 @@ jobs:
            * (see the block below).  0 = syscall only, no nodes.
            */
           #define KDBG_COMPAT	1
+          
+          /*
+           * 1 = answer the prctl probe for anyone, not just root.  0 is the safer
+           * default: an unprivileged caller asking and being told "yes" would be one way
+           * to discover the driver, and -EINVAL is what a kernel without it returns.
+           */
+          #define KDBG_PROBE_ANYONE	0
           
           /*
            * find_task_by_vpid() is NOT exported to modules, and this file is a module -
@@ -1179,6 +1227,22 @@ jobs:
           static void kdbg_hbp_cleanup(void) { }
           #endif /* CONFIG_HAVE_HW_BREAKPOINT */
           
+          /*
+           * Only root may read or write another process's memory.
+           *
+           * This matters more than it looks.  The prctl magic is written in every scene
+           * header, so it is effectively public knowledge - without this check any app on
+           * the phone could use the driver, and worse, the game's own anti-cheat (which
+           * runs unprivileged, inside the game process) could call the magic and discover
+           * the driver just by asking.  With the check it gets -EPERM and learns nothing.
+           *
+           * Every scene client runs as root, so nothing legitimate is lost.
+           */
+          static bool kdbg_allowed(void)
+          {
+          	return capable(CAP_SYS_PTRACE);
+          }
+          
           /* -------------------------------------------------------- wanbai.h compatibility */
           /*
            * Compatibility with the wanbai.h family of clients.
@@ -1244,6 +1308,9 @@ jobs:
           
           	case KDBG_IOCTL_READ_MEM:
           	case KDBG_IOCTL_BING_READ: {
+          		if (!kdbg_allowed())
+          			return -EPERM;
+          
           		struct kdbg_copy_memory cm;
           		long r;
           
@@ -1258,6 +1325,9 @@ jobs:
           
           	case KDBG_IOCTL_WRITE_MEM:
           	case KDBG_IOCTL_BING_WRITE: {
+          		if (!kdbg_allowed())
+          			return -EPERM;
+          
           		struct kdbg_copy_memory cm;
           		long r;
           
@@ -1272,6 +1342,9 @@ jobs:
           
           	case KDBG_IOCTL_MODULE_BASE:
           	case KDBG_IOCTL_BING_BASE: {
+          		if (!kdbg_allowed())
+          			return -EPERM;
+          
           		struct kdbg_module_base mb;
           		unsigned long base = 0;
           		long r;
@@ -1294,11 +1367,81 @@ jobs:
           	}
           }
           
+          /*
+           * The nodes tidy themselves up.
+           *
+           * Nothing in the driver knows whether a hack is still running, so instead of
+           * waiting for someone to remember `compat off`, every open and close is
+           * counted: when the last client lets go, a timer starts, and if nothing opens
+           * a node again before it expires the whole set is taken away.  The linger
+           * matters - clients often open, validate, close and reopen while the game
+           * loads, and tearing the nodes down in one of those gaps would break them.
+           */
+          #define KDBG_LINGER_S		30
+          
+          static atomic_t kdbg_open_count = ATOMIC_INIT(0);
+          static DECLARE_DELAYED_WORK(kdbg_linger_work, kdbg_linger);
+          static DEFINE_MUTEX(kdbg_compat_lock);
+          
+          static void kdbg_compat_up(void);
+          static void kdbg_compat_down(void);
+          static void kdbg_linger(struct work_struct *work);
+          
+          static void kdbg_linger(struct work_struct *work)
+          {
+          	mutex_lock(&kdbg_compat_lock);
+          	if (atomic_read(&kdbg_open_count) == 0)
+          		kdbg_compat_down();
+          	mutex_unlock(&kdbg_compat_lock);
+          }
+          
+          static int kdbg_compat_open(struct inode *ino, struct file *f)
+          {
+          	mutex_lock(&kdbg_compat_lock);
+          	atomic_inc(&kdbg_open_count);
+          	cancel_delayed_work(&kdbg_linger_work);
+          	mutex_unlock(&kdbg_compat_lock);
+          
+          	return 0;
+          }
+          
+          static int kdbg_compat_release(struct inode *ino, struct file *f)
+          {
+          	if (atomic_dec_and_test(&kdbg_open_count))
+          		schedule_delayed_work(&kdbg_linger_work, KDBG_LINGER_S * HZ);
+          
+          	return 0;
+          }
+          
           static const struct file_operations kdbg_compat_fops = {
           	.owner		= THIS_MODULE,
+          	.open		= kdbg_compat_open,
+          	.release	= kdbg_compat_release,
           	.unlocked_ioctl	= kdbg_compat_ioctl,
           	.compat_ioctl	= kdbg_compat_ioctl,
           };
+          
+          /* the pair the rest of the driver - and the syscall - actually uses */
+          static int kdbg_compat_init(void)
+          {
+          	int n;
+          
+          	mutex_lock(&kdbg_compat_lock);
+          	cancel_delayed_work(&kdbg_linger_work);
+          	kdbg_compat_up();
+          	n = kdbg_misc_n;
+          	mutex_unlock(&kdbg_compat_lock);
+          
+          	return n;
+          }
+          
+          static void kdbg_compat_cleanup(void)
+          {
+          	mutex_lock(&kdbg_compat_lock);
+          	cancel_delayed_work_sync(&kdbg_linger_work);
+          	kdbg_compat_down();
+          	mutex_unlock(&kdbg_compat_lock);
+          }
           
           #define KDBG_COMPAT_MAX	8
           
@@ -1321,7 +1464,7 @@ jobs:
           static int kdbg_misc_n;
           static struct proc_dir_entry *kdbg_proc;
           
-          static int kdbg_compat_init(void)
+          static void kdbg_compat_up(void)
           {
           	char list[160];
           	char *p = list;
@@ -1329,7 +1472,7 @@ jobs:
           	int i;
           
           	if (kdbg_misc_n || kdbg_proc)
-          		return kdbg_misc_n;	/* already up */
+          		return;			/* already up */
           
           	/* miscdevice.name has to outlive this call, hence the static copies */
           	strlcpy(list, KDBG_COMPAT_DEVS, sizeof(list));
@@ -1358,11 +1501,9 @@ jobs:
           	}
           
           	kdbg_proc = proc_create(KDBG_COMPAT_PROC, 0666, NULL, &kdbg_compat_fops);
-          
-          	return 0;
           }
           
-          static void kdbg_compat_cleanup(void)
+          static void kdbg_compat_down(void)
           {
           	int i;
           
@@ -1374,6 +1515,94 @@ jobs:
           	for (i = 0; i < kdbg_misc_n; i++)
           		misc_deregister(&kdbg_misc[i]);
           	kdbg_misc_n = 0;
+          }
+          
+          /* ------------------------------------------------------------- prctl family */
+          /*
+           * The KPM/Neo family carries the same two operations in a struct through
+           * prctl() instead of an ioctl on a node:
+           *
+           *	prctl(0x4E41, 1 /* READ_MEM  *\/, &cmd, 0, 0);
+           *	prctl(0x4E41, 2 /* WRITE_MEM *\/, &cmd, 0, 0);
+           *	prctl(0x4E41, 5 /* GET_PID   *\/, &cmd, 0, 0);
+           *
+           * Layout must match struct na_cmd in the client header byte for byte.
+           *
+           * The payload never leaves user memory: only the little header is copied in,
+           * and kdbg_rw writes straight to and from the caller's own data[] array.
+           */
+          #define KDBG_NA_MAX_RW	4096
+          #define KDBG_NA_CMD_READ	1
+          #define KDBG_NA_CMD_WRITE	2
+          #define KDBG_NA_CMD_GET_PID	5
+          
+          struct kdbg_na_cmd {
+          	u32 op;
+          	u32 pid;
+          	u64 addr;
+          	u32 size;
+          	s32 result;
+          	s32 screen_w;
+          	s32 screen_h;
+          	char pkg[256];
+          	u8 data[KDBG_NA_MAX_RW];
+          };
+          
+          static long kdbg_prctl(unsigned long cmd, void __user *uarg)
+          {
+          	struct kdbg_na_cmd __user *uc = uarg;
+          	struct kdbg_na_cmd h;
+          	long r;
+          
+          	if (!uarg)
+          		return -EFAULT;
+          
+          	/* header only - the 4 KB payload stays where the caller put it */
+          	if (copy_from_user(&h, uc, offsetof(struct kdbg_na_cmd, pkg)))
+          		return -EFAULT;
+          
+          	switch (cmd) {
+          	case KDBG_NA_CMD_GET_PID:
+          		/*
+          		 * The probe used to answer for anyone, on the reasoning that a
+          		 * client may ask it before it elevates.  Closed by default
+          		 * instead: the magic is printed in every scene header, so an
+          		 * unprivileged caller asking and getting a "yes" would be a way
+          		 * to discover the driver.  Returning -EINVAL is exactly what a
+          		 * kernel without this option returns, so nothing is revealed.
+          		 *
+          		 * Set KDBG_PROBE_ANYONE to 1 if a hack turns out to probe
+          		 * before it takes root and its DIT option stops being found.
+          		 */
+          #if !KDBG_PROBE_ANYONE
+          		if (!kdbg_allowed())
+          			return -EINVAL;
+          #endif
+          		h.pid = current->tgid;
+          		h.result = 0;
+          		break;
+          
+          	case KDBG_NA_CMD_READ:
+          	case KDBG_NA_CMD_WRITE:
+          		if (!kdbg_allowed())
+          			return -EPERM;
+          		if (!h.size || h.size > KDBG_NA_MAX_RW) {
+          			h.result = -EINVAL;
+          			break;
+          		}
+          		r = kdbg_rw(h.pid, h.addr, (void __user *)&uc->data, h.size,
+          			    cmd == KDBG_NA_CMD_WRITE);
+          		h.result = (r == (long)h.size) ? 0 : (r < 0 ? r : -EIO);
+          		break;
+          
+          	default:
+          		return -EINVAL;
+          	}
+          
+          	if (put_user(h.pid, &uc->pid) || put_user(h.result, &uc->result))
+          		return -EFAULT;
+          
+          	return 0;
           }
           
           /* ------------------------------------------------------------------ dispatch */
@@ -1452,6 +1681,7 @@ jobs:
           static int __init kdbg_core_init(void)
           {
           	kdbg_set_handler(kdbg_dispatch);
+          	kdbg_set_prctl(kdbg_prctl);
           	if (kdbg_compat)
           		kdbg_compat_init();
           	return 0;
@@ -1463,6 +1693,7 @@ jobs:
           	kdbg_compat_cleanup();
           	kdbg_hbp_cleanup();
           	kdbg_watch_off_all();	/* pages go back to normal before we leave */
+          	kdbg_set_prctl(NULL);
           	kdbg_set_handler(NULL);
           }
           
@@ -1513,6 +1744,19 @@ jobs:
            * Costs one perfectly-predicted branch while no watch is armed.
            */
           int kdbg_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr);
+          
+          /*
+           * A second family of clients talks through prctl() instead of a device node:
+           *
+           *	prctl(0x4E41, NA_CMD_READ_MEM, &cmd, 0, 0)
+           *
+           * so the driver needs nothing in /dev, nothing in /proc, and no node for anyone
+           * to scan for.  kernel/sys.c forwards that one option here and passes everything
+           * else straight through to the real prctl.
+           */
+          #define KDBG_PRCTL_MAGIC	0x4E41
+          
+          long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3);
           
           #endif /* _LINUX_KDBG_WATCH_H */
           TW_I
@@ -1628,6 +1872,53 @@ jobs:
           
           echo "--- what the filter looks like ---"
           grep -n -B4 -A4 'strstr(iter->name' "$F"
+      - name: Forward one prctl option
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          F=kernel/sys.c
+          test -f "$F" || { echo "no $F"; exit 1; }
+          
+          python3 - "$F" <<'PYPRCTL'
+          import sys
+          
+          path = sys.argv[1]
+          src = open(path).read()
+          
+          if 'kdbg.h' not in src:
+              anchor = '#include <linux/syscalls.h>'
+              if anchor in src:
+                  src = src.replace(anchor, anchor + '\n#include <linux/kdbg.h>', 1)
+              else:
+                  lines = src.split('\n')
+                  last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
+                  lines.insert(last + 1, '#include <linux/kdbg.h>')
+                  src = '\n'.join(lines)
+              print('added the include')
+          
+          OLD = ("SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,\n"
+                 "\t\tunsigned long, arg4, unsigned long, arg5)\n"
+                 "{\n")
+          
+          NEW = OLD + ("\t/*\n"
+              "\t * kdbg: one magic option, forwarded to the driver.  Every other\n"
+              "\t * caller falls through to the real prctl below.\n"
+              "\t */\n"
+              "\tif (option == KDBG_PRCTL_MAGIC)\n"
+              "\t\treturn kdbg_prctl_entry(option, arg2, arg3);\n\n")
+          
+          if 'KDBG_PRCTL_MAGIC' in src:
+              print('already forwarded')
+          elif OLD in src:
+              src = src.replace(OLD, NEW, 1)
+              open(path, 'w').write(src)
+              print('added the forwarding')
+          else:
+              sys.exit('the prctl definition does not look as expected in %s' % path)
+          PYPRCTL
+          
+          echo "--- what the prctl entry now does ---"
+          grep -n -B2 -A6 'KDBG_PRCTL_MAGIC' "$F"
       - name: Add the kdbg syscall number
         working-directory: ${{ github.workspace }}/kernel
         run: |
@@ -1946,6 +2237,7 @@ jobs:
           #include <sys/syscall.h>
           #include <sys/ioctl.h>
           #include <sys/mman.h>
+          #include <sys/prctl.h>
           
           #define TOWA_COOKIE 0x9E3779B97F4A7C15ULL
           #define TOWA_MAGIC  0x5032300AUL
@@ -2646,6 +2938,59 @@ jobs:
               return 0;
           }
           
+          // ------------------------------------------------------- the prctl family
+          //
+          // The KPM/Neo family carries the same two operations through prctl() with a
+          // magic option, so it needs no device node at all.  Layout must match
+          // struct kdbg_na_cmd in the kernel byte for byte.
+          #define KDBG_PRCTL_MAGIC 0x4E41
+          
+          struct na_cmd {
+              unsigned int  op;
+              unsigned int  pid;
+              unsigned long long addr;
+              unsigned int  size;
+              int           result;
+              int           screen_w;
+              int           screen_h;
+              char          pkg[256];
+              unsigned char data[4096];
+          };
+          
+          static int cmd_kpm(int pid, unsigned long addr, unsigned long len)
+          {
+              static struct na_cmd c;      /* 4 KB - deliberately not on the stack */
+          
+              if (len == 0 || len > sizeof(c.data)) { printf("len 1..4096\n"); return 2; }
+          
+              memset(&c, 0, sizeof(c));
+              errno = 0;
+              long r = prctl(KDBG_PRCTL_MAGIC, 5, &c, 0, 0);
+              printf("probe : prctl(0x4E41, GET_PID) -> %ld %s\n", r,
+                     r ? strerror(errno) : "(driver present)");
+              if (r) {
+                  printf("        no prctl driver, or you are not root\n");
+                  return 1;
+              }
+          
+              memset(&c, 0, sizeof(c));
+              c.pid  = (unsigned int)pid;
+              c.addr = addr;
+              c.size = (unsigned int)len;
+          
+              errno = 0;
+              r = prctl(KDBG_PRCTL_MAGIC, 1, &c, 0, 0);
+              if (r || c.result) {
+                  printf("read  : prctl(0x4E41, READ_MEM) -> %ld result %d %s\n",
+                         r, c.result, r ? strerror(errno) : "");
+                  return 1;
+              }
+          
+              printf("read  : ok through prctl, %lu bytes from 0x%lx\n", len, addr);
+              hexdump(addr, c.data, (int)len);
+              return 0;
+          }
+          
           // ---------------------------------------------------------------- utilities
           
           static bool hex_to_bytes(const char *s, std::vector<unsigned char> &out)
@@ -2733,6 +3078,8 @@ jobs:
                   "  compat                        the same thing a scene hack does, through\n"
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
                   "  pid <name>                    find a pid by process name\n"
+                  "  kpm <pid> <hexaddr> <len>     read through the prctl family instead of a\n"
+                  "                                node - needs root, and needs no /dev entry\n"
                   "  selftest                      arm a watch on our own page, write to it,\n"
                   "                                report - proves the watcher with\n"
                   "                                nothing at stake.  Run this first\n"
@@ -2863,6 +3210,14 @@ jobs:
           
                   printf("selftest: done - if that said hits 1 WROTE it, the watcher works\n");
                   return 0;
+              }
+          
+              if (cmd == "kpm") {
+                  if (a.size() < 4) { usage(argv[0]); return 2; }
+                  int pid = resolve_pid(a[1].c_str());
+                  if (pid <= 0) { printf("no such process\n"); return 1; }
+                  return cmd_kpm(pid, strtoul(a[2].c_str(), NULL, 16),
+                                 strtoul(a[3].c_str(), NULL, 0));
               }
           
               if (cmd == "hunt")   return cmd_hunt();
@@ -3148,7 +3503,7 @@ jobs:
           echo "towacli build stamp: $STAMP"
           
           "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -DNR_TOWA=$NR \
-                 -DKDBGCLI_BUILD="\"$STAMP\"" \
+                 -DTOWACLI_BUILD="\"$STAMP\"" \
                  -o "$GITHUB_WORKSPACE/tools/towacli" "$GITHUB_WORKSPACE/tools/towacli.cpp"
           
           echo "--- what we built ---"
