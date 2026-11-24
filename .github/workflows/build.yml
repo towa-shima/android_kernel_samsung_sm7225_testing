@@ -1,8 +1,8 @@
-name: Build towa kernel
+name: Build kdbg kernel
 
 # One run gives you two files:
 #   * a flashable AnyKernel3 zip whose kernel carries a NEW syscall, and
-#   * towa_core.ko - the module that holds the actual read/write logic.
+#   * kdbg.ko - the module that holds the actual read/write logic.
 #
 # Why split it that way:
 #   RT and CShell get their syscall by writing sys_call_table[] at runtime. On
@@ -41,9 +41,9 @@ on:
         required: true
         default: 'clang-r563880'
       builtin:
-        description: 'y = build towa into the kernel (nothing in /proc/modules), n = loadable towa_core.ko'
+        description: 'y = build kdbg into the kernel (nothing in /proc/modules, nothing to insmod), n = loadable kdbg.ko'
         required: true
-        default: 'n'
+        default: 'y'
 
 jobs:
   build:
@@ -165,35 +165,35 @@ jobs:
             | tar -xz -C "$HOME/aarch64-linux-android-4.9"
           ls "$HOME/aarch64-linux-android-4.9/bin" | head
 
-      # ------------------------------------------------------- the towa source
+      # ------------------------------------------------------- the kdbg source
       # The four files are written here so this workflow stays a single upload.
-      - name: Write towa sources
+      - name: Write kdbg sources
         working-directory: ${{ github.workspace }}/kernel
         run: |
           set -e
-          mkdir -p drivers/towa include/linux
-          cat > drivers/towa/towa.h <<'TW_H'
+          mkdir -p drivers/kdbg include/linux
+          cat > drivers/kdbg/kdbg.h <<'TW_H'
           /* SPDX-License-Identifier: GPL-2.0 */
-          #ifndef _TOWA_H
-          #define _TOWA_H
+          #ifndef _KDBG_H
+          #define _KDBG_H
           
           /*
            * Shared between the kernel side and the userspace client.
            *
-           * TOWA_COOKIE is the first argument of every call. Without it the syscall
+           * KDBG_COOKIE is the first argument of every call. Without it the syscall
            * answers -ENOSYS, so a blind probe of the number sees the same thing it would
            * see from an unused table slot.
            */
-          #define TOWA_COOKIE	0x9E3779B97F4A7C15ULL
+          #define KDBG_COOKIE	0x9E3779B97F4A7C15ULL
           
-          /* TOWA_OP_PING returns this. */
-          #define TOWA_MAGIC	0x5032300AUL
+          /* KDBG_OP_PING returns this. */
+          #define KDBG_MAGIC	0x5032300AUL
           
           enum {
-          	TOWA_OP_PING       = 0,	/* -> TOWA_MAGIC				*/
-          	TOWA_OP_READ       = 1,	/* a1=pid a2=addr a3=buf a4=len -> bytes	*/
-          	TOWA_OP_WRITE      = 2,	/* a1=pid a2=addr a3=buf a4=len -> bytes	*/
-          	TOWA_OP_BASE       = 3,	/* a1=pid a2=name a3=&out -> 0		*/
+          	KDBG_OP_PING       = 0,	/* -> KDBG_MAGIC				*/
+          	KDBG_OP_READ       = 1,	/* a1=pid a2=addr a3=buf a4=len -> bytes	*/
+          	KDBG_OP_WRITE      = 2,	/* a1=pid a2=addr a3=buf a4=len -> bytes	*/
+          	KDBG_OP_BASE       = 3,	/* a1=pid a2=name a3=&out -> 0		*/
           
           	/*
           	 * Hardware breakpoints.  A breakpoint costs no code change at all:
@@ -201,10 +201,10 @@ jobs:
           	 * nothing that survives a restart of the game.  Four registers is what
           	 * the architecture gives us.
           	 */
-          	TOWA_OP_HWBP_SET   = 4,	/* a1=pid a2=addr a3=type a4=len -> slot	*/
-          	TOWA_OP_HWBP_DEL   = 5,	/* a1=slot -> 0				*/
-          	TOWA_OP_HWBP_STAT  = 6,	/* a1=slot a2=&u64[3] -> 0		*/
-          	TOWA_OP_HWBP_ARM   = 7,	/* a1=&struct towa_hbp_cfg -> slot		*/
+          	KDBG_OP_HWBP_SET   = 4,	/* a1=pid a2=addr a3=type a4=len -> slot	*/
+          	KDBG_OP_HWBP_DEL   = 5,	/* a1=slot -> 0				*/
+          	KDBG_OP_HWBP_STAT  = 6,	/* a1=slot a2=&u64[3] -> 0		*/
+          	KDBG_OP_HWBP_ARM   = 7,	/* a1=&struct kdbg_hbp_cfg -> slot		*/
           
           	/*
           	 * Page watches - the fault-path half of a PTE hook.  Arming takes the
@@ -213,22 +213,30 @@ jobs:
           	 * write, then lets the access through.  The page's own contents are
           	 * never modified, which is the point.
           	 */
-          	TOWA_OP_WATCH_ARM  = 8,	/* a1=&struct towa_watch_cfg -> slot		*/
-          	TOWA_OP_WATCH_STAT = 9,	/* a1=slot a2=&struct towa_watch_info -> 0	*/
-          	TOWA_OP_WATCH_OFF  = 10,/* a1=slot -> 0				*/
+          	KDBG_OP_WATCH_ARM  = 8,	/* a1=&struct kdbg_watch_cfg -> slot		*/
+          	KDBG_OP_WATCH_STAT = 9,	/* a1=slot a2=&struct kdbg_watch_info -> 0	*/
+          	KDBG_OP_WATCH_OFF  = 10,/* a1=slot -> 0				*/
+          
+          	/*
+          	 * Turn the compatibility device nodes on or off at runtime.  They are the
+          	 * most visible thing this driver does - a set of /dev entries and
+          	 * /sys/class/misc entries that any process can see - so they are OFF
+          	 * unless asked for.  Nothing else here is visible at rest.
+          	 */
+          	KDBG_OP_COMPAT     = 11,/* a1=0 off / 1 on -> nodes registered	*/
           };
           
-          /* a3 of TOWA_OP_HWBP_SET.  X = execute, i.e. call me at this address.
+          /* a3 of KDBG_OP_HWBP_SET.  X = execute, i.e. call me at this address.
            *
-           * TOWA_BP_W (a data watchpoint) is REFUSED by the kernel: the debug exception
+           * KDBG_BP_W (a data watchpoint) is REFUSED by the kernel: the debug exception
            * is taken before the access completes, this kernel does not single-step it,
            * and the access therefore re-executes and traps forever - a storm that freezes
            * the target, whose only escape is skipping the access, which corrupts it.
-           * Use a page watch (TOWA_OP_WATCH_*) to find out who touches memory. */
-          #define TOWA_BP_X	0
-          #define TOWA_BP_W	1
+           * Use a page watch (KDBG_OP_WATCH_*) to find out who touches memory. */
+          #define KDBG_BP_X	0
+          #define KDBG_BP_W	1
           
-          #define TOWA_HBP_SLOTS	4
+          #define KDBG_HBP_SLOTS	4
           
           /*
            * Safety net.  An execute breakpoint traps *before* the instruction runs, so
@@ -236,7 +244,7 @@ jobs:
            * and traps again - a livelock that pins a core.  In counting mode, after this
            * many hits the handler skips the instruction once and stops being a loop.
            */
-          #define TOWA_HBP_TRIP	64
+          #define KDBG_HBP_TRIP	64
           
           /*
            * What the breakpoint handler does when it fires.
@@ -246,34 +254,34 @@ jobs:
            * Nothing here needs a trampoline, so nothing here copies the game's code.
            */
           /*
-           * TOWA_ACT_NONE is also REFUSED: counting needs the instruction to execute
+           * KDBG_ACT_NONE is also REFUSED: counting needs the instruction to execute
            * again after the trap, which is the same storm.  There is no safe way to count
            * hits without single-stepping, so an action is mandatory.
            */
-          #define TOWA_ACT_NONE	0	/* refused - see above */
-          #define TOWA_ACT_SKIP	1	/* pc += 4 - the instruction does not run  */
-          #define TOWA_ACT_RET	2	/* return from the function: pc = x30,
+          #define KDBG_ACT_NONE	0	/* refused - see above */
+          #define KDBG_ACT_SKIP	1	/* pc += 4 - the instruction does not run  */
+          #define KDBG_ACT_RET	2	/* return from the function: pc = x30,
           				   x0 = value.  A function that answers
           				   "yes" forever costs not one byte.        */
-          #define TOWA_ACT_PC	3	/* pc = value                              */
-          #define TOWA_ACT_X0	4	/* x0 = value, then skip that instruction  */
-          #define TOWA_ACT_REG	5	/* regs[reg] = value, then skip it         */
+          #define KDBG_ACT_PC	3	/* pc = value                              */
+          #define KDBG_ACT_X0	4	/* x0 = value, then skip that instruction  */
+          #define KDBG_ACT_REG	5	/* regs[reg] = value, then skip it         */
           
-          /* TOWA_OP_WATCH_ARM modes. */
-          #define TOWA_WATCH_WRITE	0	/* next write to the page			*/
-          #define TOWA_WATCH_ACCESS	1	/* next read, write or execute		*/
+          /* KDBG_OP_WATCH_ARM modes. */
+          #define KDBG_WATCH_WRITE	0	/* next write to the page			*/
+          #define KDBG_WATCH_ACCESS	1	/* next read, write or execute		*/
           
-          #define TOWA_WATCH_SLOTS	4
+          #define KDBG_WATCH_SLOTS	4
           
-          #define TOWA_MAX_XFER		(1024 * 1024)
+          #define KDBG_MAX_XFER		(1024 * 1024)
           
-          /* towa_watch_info.flags */
-          #define TOWA_WF_ARMED	0x0001
-          #define TOWA_WF_SPENT	0x0002
-          #define TOWA_WF_WRITE	0x0004	/* the access that fired was a write	*/
-          #define TOWA_WF_ACCESS	0x0008	/* armed in ACCESS mode			*/
+          /* kdbg_watch_info.flags */
+          #define KDBG_WF_ARMED	0x0001
+          #define KDBG_WF_SPENT	0x0002
+          #define KDBG_WF_WRITE	0x0004	/* the access that fired was a write	*/
+          #define KDBG_WF_ACCESS	0x0008	/* armed in ACCESS mode			*/
           
-          struct towa_hbp_cfg {
+          struct kdbg_hbp_cfg {
           	int		pid;
           	unsigned long	type;
           	unsigned long	addr;
@@ -283,13 +291,13 @@ jobs:
           	unsigned long	reg;
           };
           
-          struct towa_watch_cfg {
+          struct kdbg_watch_cfg {
           	int		pid;
           	unsigned long	addr;
           	unsigned long	mode;
           };
           
-          struct towa_watch_info {
+          struct kdbg_watch_info {
           	unsigned long long	hits;
           	unsigned long long	last_pc;
           	unsigned long long	last_task;
@@ -297,26 +305,26 @@ jobs:
           	unsigned long		flags;
           };
           
-          /* What towa_syscall.c holds and calls. */
-          typedef long (*towa_handler_t)(unsigned long op, unsigned long a1,
+          /* What kdbg_syscall.c holds and calls. */
+          typedef long (*kdbg_handler_t)(unsigned long op, unsigned long a1,
           			       unsigned long a2, unsigned long a3,
           			       unsigned long a4);
           
-          /* Implemented in towa_syscall.c.  towa_core.c has to register itself through
+          /* Implemented in kdbg_syscall.c.  kdbg_core.c has to register itself through
            * this, so it needs the prototype - which it did not have, and this tree builds
            * with -Werror=implicit-function-declaration. */
-          void towa_set_handler(towa_handler_t fn);
+          void kdbg_set_handler(kdbg_handler_t fn);
           
-          /* Implemented in towa_watch.c, which is built into the kernel, not the module:
+          /* Implemented in kdbg_watch.c, which is built into the kernel, not the module:
            * it needs the page-fault path and the core mm helpers. */
-          int towa_watch_arm(pid_t pid, unsigned long addr, unsigned long mode);
-          int towa_watch_off(unsigned long slot);
-          int towa_watch_stat(unsigned long slot, struct towa_watch_info *out);
-          void towa_watch_off_all(void);
+          int kdbg_watch_arm(pid_t pid, unsigned long addr, unsigned long mode);
+          int kdbg_watch_off(unsigned long slot);
+          int kdbg_watch_stat(unsigned long slot, struct kdbg_watch_info *out);
+          void kdbg_watch_off_all(void);
           
-          #endif /* _TOWA_H */
+          #endif /* _KDBG_H */
           TW_H
-          cat > drivers/towa/towa_syscall.c <<'TW_S'
+          cat > drivers/kdbg/kdbg_syscall.c <<'TW_S'
           // SPDX-License-Identifier: GPL-2.0
           /*
            * The syscall front end.
@@ -326,7 +334,7 @@ jobs:
            * - no set_memory_rw, no text poking, no rwxp page, and nothing for another
            * hook to collide with.
            *
-           * If no handler is installed (towa_core.ko not loaded) this returns -ENOSYS,
+           * If no handler is installed (kdbg_core.ko not loaded) this returns -ENOSYS,
            * which is what an unimplemented table slot returns anyway.
            */
           #include <linux/kernel.h>
@@ -334,27 +342,27 @@ jobs:
           #include <linux/mutex.h>
           #include <linux/export.h>
           
-          #include "towa.h"
+          #include "kdbg.h"
           
-          static towa_handler_t towa_handler __read_mostly;
-          static DEFINE_MUTEX(towa_mutex);
+          static kdbg_handler_t kdbg_handler __read_mostly;
+          static DEFINE_MUTEX(kdbg_mutex);
           
-          void towa_set_handler(towa_handler_t fn)
+          void kdbg_set_handler(kdbg_handler_t fn)
           {
-          	mutex_lock(&towa_mutex);
-          	towa_handler = fn;
-          	mutex_unlock(&towa_mutex);
+          	mutex_lock(&kdbg_mutex);
+          	kdbg_handler = fn;
+          	mutex_unlock(&kdbg_mutex);
           }
-          EXPORT_SYMBOL_GPL(towa_set_handler);
+          EXPORT_SYMBOL_GPL(kdbg_set_handler);
           
-          SYSCALL_DEFINE6(towa, unsigned long, cookie, unsigned long, op,
+          SYSCALL_DEFINE6(kdbg, unsigned long, cookie, unsigned long, op,
           		unsigned long, a1, unsigned long, a2,
           		unsigned long, a3, unsigned long, a4)
           {
-          	towa_handler_t fn;
+          	kdbg_handler_t fn;
           	long ret;
           
-          	if (cookie != TOWA_COOKIE)
+          	if (cookie != KDBG_COOKIE)
           		return -ENOSYS;
           
           	/*
@@ -363,15 +371,15 @@ jobs:
           	 * while a call is still inside it (module_exit takes the same lock to
           	 * clear the handler).
           	 */
-          	mutex_lock(&towa_mutex);
-          	fn = towa_handler;
+          	mutex_lock(&kdbg_mutex);
+          	fn = kdbg_handler;
           	ret = fn ? fn(op, a1, a2, a3, a4) : -ENOSYS;
-          	mutex_unlock(&towa_mutex);
+          	mutex_unlock(&kdbg_mutex);
           
           	return ret;
           }
           TW_S
-          cat > drivers/towa/towa_watch.c <<'TW_W'
+          cat > drivers/kdbg/kdbg_watch.c <<'TW_W'
           // SPDX-License-Identifier: GPL-2.0
           /*
            * Page watches - the fault-path half of a PTE hook.
@@ -420,19 +428,19 @@ jobs:
           #include <asm/ptrace.h>
           #include <asm/esr.h>
           
-          #include <linux/towa_watch.h>	/* so our definition is checked against the
+          #include <linux/kdbg.h>	/* so our definition is checked against the
           				 * prototype fault.c calls us through */
           
-          #include "towa.h"
+          #include "kdbg.h"
           
           /*
            * Off unless something is armed.  A static branch compiles to a no-op that the
            * CPU predicts perfectly, so do_page_fault() pays nothing for the call below
            * while no watch exists.
            */
-          DEFINE_STATIC_KEY_FALSE(towa_watch_key);
+          DEFINE_STATIC_KEY_FALSE(kdbg_watch_key);
           
-          struct towa_watch_slot {
+          struct kdbg_watch_slot {
           	struct mm_struct	*mm;		/* NULL = free */
           	unsigned long		addr;		/* page aligned */
           	unsigned long		mode;
@@ -443,12 +451,12 @@ jobs:
           	unsigned long		flags;
           };
           
-          static struct towa_watch_slot towa_watch[TOWA_WATCH_SLOTS];
-          static int towa_watch_live;
+          static struct kdbg_watch_slot kdbg_watch[KDBG_WATCH_SLOTS];
+          static int kdbg_watch_live;
           
           /* ------------------------------------------------------------- page table */
           
-          struct towa_pte {
+          struct kdbg_pte {
           	pmd_t		*pmd;
           	pte_t		*ptep;
           	spinlock_t	*ptl;
@@ -458,8 +466,8 @@ jobs:
            * Walk to the PTE for addr.  Caller must hold mmap_sem for read.  Returns
            * 0 with ptep locked, or an error with nothing held.
            */
-          static int towa_pte_lock(struct mm_struct *mm, unsigned long addr,
-          			 struct towa_pte *out)
+          static int kdbg_pte_lock(struct mm_struct *mm, unsigned long addr,
+          			 struct kdbg_pte *out)
           {
           	pgd_t *pgd;
           	pud_t *pud;
@@ -491,7 +499,7 @@ jobs:
           	return 0;
           }
           
-          static void towa_pte_unlock(struct towa_pte *p)
+          static void kdbg_pte_unlock(struct kdbg_pte *p)
           {
           	if (p->ptep)
           		pte_unmap_unlock(p->ptep, p->ptl);
@@ -499,23 +507,23 @@ jobs:
           
           /* ---------------------------------------------------------------- arming */
           
-          int towa_watch_arm(pid_t pid, unsigned long addr, unsigned long mode)
+          int kdbg_watch_arm(pid_t pid, unsigned long addr, unsigned long mode)
           {
-          	struct towa_watch_slot *w = NULL;
+          	struct kdbg_watch_slot *w = NULL;
           	struct task_struct *t;
           	struct mm_struct *mm;
           	struct vm_area_struct *vma;
-          	struct towa_pte p = { NULL, NULL, NULL };
+          	struct kdbg_pte p = { NULL, NULL, NULL };
           	unsigned long pgaddr = addr & PAGE_MASK;
           	pte_t pte, new;
           	int slot, ret;
           
-          	if (mode != TOWA_WATCH_WRITE && mode != TOWA_WATCH_ACCESS)
+          	if (mode != KDBG_WATCH_WRITE && mode != KDBG_WATCH_ACCESS)
           		return -EINVAL;
           
-          	for (slot = 0; slot < TOWA_WATCH_SLOTS; slot++)
-          		if (!towa_watch[slot].mm) {
-          			w = &towa_watch[slot];
+          	for (slot = 0; slot < KDBG_WATCH_SLOTS; slot++)
+          		if (!kdbg_watch[slot].mm) {
+          			w = &kdbg_watch[slot];
           			break;
           		}
           	if (!w)
@@ -543,7 +551,7 @@ jobs:
           		goto out_unlock;
           	}
           
-          	ret = towa_pte_lock(mm, addr, &p);
+          	ret = kdbg_pte_lock(mm, addr, &p);
           	if (ret)
           		goto out_unlock;
           
@@ -555,7 +563,7 @@ jobs:
           	}
           
           	new = pte;
-          	if (mode == TOWA_WATCH_WRITE) {
+          	if (mode == KDBG_WATCH_WRITE) {
           		/*
           		 * Safe on anything: clearing the write bit is exactly what
           		 * copy-on-write does, and the page is not lost, only made
@@ -581,16 +589,16 @@ jobs:
           	w->last_pc = 0;
           	w->last_task = 0;
           	w->last_addr = 0;
-          	w->flags = TOWA_WF_ARMED;
-          	if (mode == TOWA_WATCH_ACCESS)
-          		w->flags |= TOWA_WF_ACCESS;
+          	w->flags = KDBG_WF_ARMED;
+          	if (mode == KDBG_WATCH_ACCESS)
+          		w->flags |= KDBG_WF_ACCESS;
           
-          	if (mode == TOWA_WATCH_WRITE)
+          	if (mode == KDBG_WATCH_WRITE)
           		set_pte_at(mm, addr, p.ptep, new);
           	else
           		ptep_get_and_clear(mm, addr, p.ptep);
           
-          	towa_pte_unlock(&p);
+          	kdbg_pte_unlock(&p);
           	mmap_read_unlock(mm);
           
           	/*
@@ -599,8 +607,8 @@ jobs:
           	 */
           	flush_tlb_mm(mm);
           
-          	if (towa_watch_live++ == 0)
-          		static_branch_enable(&towa_watch_key);
+          	if (kdbg_watch_live++ == 0)
+          		static_branch_enable(&kdbg_watch_key);
           
           	/* Published last: the fault path keys off w->mm. */
           	smp_wmb();
@@ -609,13 +617,13 @@ jobs:
           	return slot;
           
           out_pte:
-          	towa_pte_unlock(&p);
+          	kdbg_pte_unlock(&p);
           out_unlock:
           	mmap_read_unlock(mm);
           	mmput(mm);
           	return ret;
           }
-          EXPORT_SYMBOL_GPL(towa_watch_arm);
+          EXPORT_SYMBOL_GPL(kdbg_watch_arm);
           
           /* -------------------------------------------------------------- restoring */
           
@@ -624,27 +632,27 @@ jobs:
            * the way it was, and returns so the normal handling goes ahead and the access
            * succeeds.  Nothing here can fail the target's access.
            */
-          int towa_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr)
+          int kdbg_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr)
           {
           	struct mm_struct *mm;
-          	struct towa_watch_slot *w;
+          	struct kdbg_watch_slot *w;
           	unsigned long flags;
           	int i;
           
-          	if (!static_branch_unlikely(&towa_watch_key))
+          	if (!static_branch_unlikely(&kdbg_watch_key))
           		return 0;
           
           	mm = current->mm;
           	if (!mm)
           		return 0;
           
-          	for (i = 0; i < TOWA_WATCH_SLOTS; i++) {
-          		w = &towa_watch[i];
+          	for (i = 0; i < KDBG_WATCH_SLOTS; i++) {
+          		w = &kdbg_watch[i];
           		if (w->mm != mm)
           			continue;
           
           		flags = READ_ONCE(w->flags);
-          		if (!(flags & TOWA_WF_ARMED))
+          		if (!(flags & KDBG_WF_ARMED))
           			continue;
           		if ((addr & PAGE_MASK) != w->addr)
           			continue;
@@ -653,14 +661,14 @@ jobs:
           		 * Take the slot first: a second CPU faulting on the same page
           		 * must not record a second, phantom event.
           		 */
-          		WRITE_ONCE(w->flags, flags | TOWA_WF_SPENT);
+          		WRITE_ONCE(w->flags, flags | KDBG_WF_SPENT);
           
           		w->hits++;
           		w->last_pc = regs ? regs->pc : 0;
           		w->last_task = current->tgid;
           		w->last_addr = addr;
           		if (esr & ESR_ELx_WNR)
-          			WRITE_ONCE(w->flags, READ_ONCE(w->flags) | TOWA_WF_WRITE);
+          			WRITE_ONCE(w->flags, READ_ONCE(w->flags) | KDBG_WF_WRITE);
           
           		/*
           		 * That is all.  No page table work, no TLB shootdown, no lock
@@ -674,19 +682,19 @@ jobs:
           
           	return 0;
           }
-          EXPORT_SYMBOL_GPL(towa_watch_fault);
+          EXPORT_SYMBOL_GPL(kdbg_watch_fault);
           
           /* ---------------------------------------------------------------- disarm */
           
-          int towa_watch_off(unsigned long slot)
+          int kdbg_watch_off(unsigned long slot)
           {
-          	struct towa_watch_slot *w;
+          	struct kdbg_watch_slot *w;
           	struct mm_struct *mm;
           
-          	if (slot >= TOWA_WATCH_SLOTS)
+          	if (slot >= KDBG_WATCH_SLOTS)
           		return -EINVAL;
           
-          	w = &towa_watch[slot];
+          	w = &kdbg_watch[slot];
           	if (!w->mm)
           		return -EINVAL;
           
@@ -705,12 +713,12 @@ jobs:
           	w->mm = NULL;
           	mmput(mm);
           
-          	if (towa_watch_live > 0 && --towa_watch_live == 0)
-          		static_branch_disable(&towa_watch_key);
+          	if (kdbg_watch_live > 0 && --kdbg_watch_live == 0)
+          		static_branch_disable(&kdbg_watch_key);
           
           	return 0;
           }
-          EXPORT_SYMBOL_GPL(towa_watch_off);
+          EXPORT_SYMBOL_GPL(kdbg_watch_off);
           
           /*
            * Release every slot.  Called from module_exit: the watches live in this
@@ -718,24 +726,24 @@ jobs:
            * write-protected and the fault hook still firing - the module would look like
            * the cause of a freeze it can no longer clear.
            */
-          void towa_watch_off_all(void)
+          void kdbg_watch_off_all(void)
           {
           	int i;
           
-          	for (i = 0; i < TOWA_WATCH_SLOTS; i++)
-          		if (towa_watch[i].mm)
-          			towa_watch_off(i);
+          	for (i = 0; i < KDBG_WATCH_SLOTS; i++)
+          		if (kdbg_watch[i].mm)
+          			kdbg_watch_off(i);
           }
-          EXPORT_SYMBOL_GPL(towa_watch_off_all);
+          EXPORT_SYMBOL_GPL(kdbg_watch_off_all);
           
-          int towa_watch_stat(unsigned long slot, struct towa_watch_info *out)
+          int kdbg_watch_stat(unsigned long slot, struct kdbg_watch_info *out)
           {
-          	struct towa_watch_slot *w;
+          	struct kdbg_watch_slot *w;
           
-          	if (slot >= TOWA_WATCH_SLOTS)
+          	if (slot >= KDBG_WATCH_SLOTS)
           		return -EINVAL;
           
-          	w = &towa_watch[slot];
+          	w = &kdbg_watch[slot];
           	if (!w->mm)
           		return -EINVAL;
           
@@ -747,12 +755,12 @@ jobs:
           
           	return 0;
           }
-          EXPORT_SYMBOL_GPL(towa_watch_stat);
+          EXPORT_SYMBOL_GPL(kdbg_watch_stat);
           TW_W
-          cat > drivers/towa/towa_core.c <<'TW_C'
+          cat > drivers/kdbg/kdbg.c <<'TW_C'
           // SPDX-License-Identifier: GPL-2.0
           /*
-           * towa core - everything that actually touches memory.
+           * kdbg core - everything that actually touches memory.
            *
            * There is no device node, no proc entry, no sysfs attribute and not one
            * printk: logcat is one of the few channels the anti-cheat really does read,
@@ -784,13 +792,13 @@ jobs:
           #include <linux/mmap_lock.h>
           #include <linux/highmem.h>
           
-          #include "towa.h"
+          #include "kdbg.h"
           
           /*
            * 1 = also answer as a device node the wanbai.h family of clients can find
            * (see the block below).  0 = syscall only, no nodes.
            */
-          #define TOWA_COMPAT	1
+          #define KDBG_COMPAT	1
           
           /*
            * find_task_by_vpid() is NOT exported to modules, and this file is a module -
@@ -798,10 +806,10 @@ jobs:
            * EXPORT_SYMBOL_GPL, and get_pid_task() hands back a task reference, which is
            * exactly what the rcu_read_lock + get_task_struct dance was doing by hand.
            *
-           * (The built-in half, towa_watch.c, keeps using find_task_by_vpid(): built-in
+           * (The built-in half, kdbg_watch.c, keeps using find_task_by_vpid(): built-in
            * code may use unexported symbols, and it is already proven to link.)
            */
-          static struct task_struct *towa_get_task(pid_t pid)
+          static struct task_struct *kdbg_get_task(pid_t pid)
           {
           	struct pid *p;
           	struct task_struct *t;
@@ -827,22 +835,22 @@ jobs:
            * FOLL_FORCE is what makes a write into a read-only mapping work: it breaks
            * copy-on-write rather than refusing.
            */
-          #define TOWA_BATCH	32
+          #define KDBG_BATCH	32
           
-          static long towa_rw(pid_t pid, unsigned long addr, void __user *ubuf,
+          static long kdbg_rw(pid_t pid, unsigned long addr, void __user *ubuf,
           		    unsigned long len, bool write)
           {
-          	struct page *pages[TOWA_BATCH];
+          	struct page *pages[KDBG_BATCH];
           	struct task_struct *t;
           	struct mm_struct *mm;
           	unsigned long done = 0;
           	unsigned int gup_flags = FOLL_FORCE;
           	int ret = 0;
           
-          	if (!len || len > TOWA_MAX_XFER || !ubuf)
+          	if (!len || len > KDBG_MAX_XFER || !ubuf)
           		return -EINVAL;
           
-          	t = towa_get_task(pid);
+          	t = kdbg_get_task(pid);
           	if (!t)
           		return -ESRCH;
           	mm = get_task_mm(t);
@@ -856,7 +864,7 @@ jobs:
           
           	while (done < len) {
           		unsigned long chunk = min_t(unsigned long, len - done,
-          					    (unsigned long)TOWA_BATCH * PAGE_SIZE);
+          					    (unsigned long)KDBG_BATCH * PAGE_SIZE);
           		int npages, i;
           		unsigned long off = 0;
           
@@ -922,7 +930,7 @@ jobs:
            * target's own mm rather than from /proc/<pid>/maps, so it works even if the
            * map file is closed off.
            */
-          static long towa_find_base(pid_t pid, const char __user *uname, unsigned long *out)
+          static long kdbg_find_base(pid_t pid, const char __user *uname, unsigned long *out)
           {
           	struct task_struct *t;
           	struct mm_struct *mm;
@@ -938,7 +946,7 @@ jobs:
           	if (!nlen)
           		return -EINVAL;
           
-          	t = towa_get_task(pid);
+          	t = kdbg_get_task(pid);
           	if (!t)
           		return -ESRCH;
           	mm = get_task_mm(t);
@@ -990,7 +998,7 @@ jobs:
            * allocation.  It counts, remembers the pc, and does what the slot was armed
            * to do.
            */
-          struct towa_hbp {
+          struct kdbg_hbp {
           	struct perf_event	*bp;
           	unsigned long		addr;
           	unsigned long long	hits;
@@ -1001,13 +1009,13 @@ jobs:
           	unsigned long		reg;
           };
           
-          static struct towa_hbp towa_hbp[TOWA_HBP_SLOTS];
+          static struct kdbg_hbp kdbg_hbp[KDBG_HBP_SLOTS];
           
-          static void towa_hbp_triggered(struct perf_event *bp,
+          static void kdbg_hbp_triggered(struct perf_event *bp,
           			       struct perf_sample_data *data,
           			       struct pt_regs *regs)
           {
-          	struct towa_hbp *h = bp->overflow_handler_context;
+          	struct kdbg_hbp *h = bp->overflow_handler_context;
           
           	if (!h)
           		return;
@@ -1016,15 +1024,15 @@ jobs:
           	if (regs)
           		h->last_pc = regs->pc;
           
-          	if (h->action == TOWA_ACT_NONE) {
+          	if (h->action == KDBG_ACT_NONE) {
           		/*
           		 * Counting mode.  An execute breakpoint traps before the
           		 * instruction runs, so if the kernel does not single-step it
-          		 * the CPU retries and traps again; after TOWA_HBP_TRIP hits we
+          		 * the CPU retries and traps again; after KDBG_HBP_TRIP hits we
           		 * skip it once.  That derails at most the thread that tripped
           		 * it, where letting it spin would take the core with it.
           		 */
-          		if (h->hits == TOWA_HBP_TRIP && regs) {
+          		if (h->hits == KDBG_HBP_TRIP && regs) {
           			regs->pc += 4;
           			h->spent = 1;
           		}
@@ -1040,22 +1048,22 @@ jobs:
           	 * get out - which is why there is no "set the register and carry on".
           	 */
           	switch (h->action) {
-          	case TOWA_ACT_SKIP:
+          	case KDBG_ACT_SKIP:
           		regs->pc += 4;
           		break;
-          	case TOWA_ACT_RET:
+          	case KDBG_ACT_RET:
           		/* Return from the function now, answering with `value`. */
           		regs->pc = regs->regs[30];
           		regs->regs[0] = h->value;
           		break;
-          	case TOWA_ACT_PC:
+          	case KDBG_ACT_PC:
           		regs->pc = h->value;
           		break;
-          	case TOWA_ACT_X0:
+          	case KDBG_ACT_X0:
           		regs->regs[0] = h->value;
           		regs->pc += 4;
           		break;
-          	case TOWA_ACT_REG:
+          	case KDBG_ACT_REG:
           		if (h->reg < 31)
           			regs->regs[h->reg] = h->value;
           		regs->pc += 4;
@@ -1063,7 +1071,7 @@ jobs:
           	}
           }
           
-          static long towa_hbp_set(pid_t pid, unsigned long addr, unsigned long type,
+          static long kdbg_hbp_set(pid_t pid, unsigned long addr, unsigned long type,
           			 unsigned long len, unsigned long action,
           			 unsigned long value, unsigned long reg)
           {
@@ -1084,7 +1092,7 @@ jobs:
           	 * frame is corrupted.  Both outcomes are worse than not arming.
           	 *
           	 * Only the actions survive, because every one of them moves pc: the
-          	 * instruction is not retried, so nothing storms.  TOWA_ACT_RET is the
+          	 * instruction is not retried, so nothing storms.  KDBG_ACT_RET is the
           	 * useful one - the function returns immediately with a chosen value, and
           	 * not one byte of it is ever written.
           	 *
@@ -1092,18 +1100,18 @@ jobs:
           	 * written, the page's contents are not, nothing traps on the retry path,
           	 * and it reports the pc and the task.
           	 */
-          	if (type == TOWA_BP_W)
+          	if (type == KDBG_BP_W)
           		return -EOPNOTSUPP;
-          	if (action == TOWA_ACT_NONE)
+          	if (action == KDBG_ACT_NONE)
           		return -EOPNOTSUPP;
           
-          	for (slot = 0; slot < TOWA_HBP_SLOTS; slot++)
-          		if (!towa_hbp[slot].bp)
+          	for (slot = 0; slot < KDBG_HBP_SLOTS; slot++)
+          		if (!kdbg_hbp[slot].bp)
           			break;
-          	if (slot == TOWA_HBP_SLOTS)
+          	if (slot == KDBG_HBP_SLOTS)
           		return -ENOSPC;
           
-          	t = towa_get_task(pid);
+          	t = kdbg_get_task(pid);
           	if (!t)
           		return -ESRCH;
           
@@ -1112,63 +1120,63 @@ jobs:
           	attr.bp_len  = len ? len : HW_BREAKPOINT_LEN_4;
           	attr.bp_type = type ? HW_BREAKPOINT_W : HW_BREAKPOINT_X;
           
-          	bp = register_user_hw_breakpoint(&attr, towa_hbp_triggered,
-          					 &towa_hbp[slot], t);
+          	bp = register_user_hw_breakpoint(&attr, kdbg_hbp_triggered,
+          					 &kdbg_hbp[slot], t);
           	put_task_struct(t);
           
           	if (IS_ERR(bp))
           		return PTR_ERR(bp);
           
-          	towa_hbp[slot].bp      = bp;
-          	towa_hbp[slot].addr    = addr;
-          	towa_hbp[slot].hits    = 0;
-          	towa_hbp[slot].last_pc = 0;
-          	towa_hbp[slot].spent   = 0;
-          	towa_hbp[slot].action  = action;
-          	towa_hbp[slot].value   = value;
-          	towa_hbp[slot].reg     = reg;
+          	kdbg_hbp[slot].bp      = bp;
+          	kdbg_hbp[slot].addr    = addr;
+          	kdbg_hbp[slot].hits    = 0;
+          	kdbg_hbp[slot].last_pc = 0;
+          	kdbg_hbp[slot].spent   = 0;
+          	kdbg_hbp[slot].action  = action;
+          	kdbg_hbp[slot].value   = value;
+          	kdbg_hbp[slot].reg     = reg;
           
           	return slot;
           }
           
-          static long towa_hbp_del(unsigned long slot)
+          static long kdbg_hbp_del(unsigned long slot)
           {
-          	if (slot >= TOWA_HBP_SLOTS || !towa_hbp[slot].bp)
+          	if (slot >= KDBG_HBP_SLOTS || !kdbg_hbp[slot].bp)
           		return -EINVAL;
           
-          	unregister_hw_breakpoint(towa_hbp[slot].bp);
-          	towa_hbp[slot].bp = NULL;
+          	unregister_hw_breakpoint(kdbg_hbp[slot].bp);
+          	kdbg_hbp[slot].bp = NULL;
           
           	return 0;
           }
           
-          static long towa_hbp_stat(unsigned long slot, unsigned long __user *uout)
+          static long kdbg_hbp_stat(unsigned long slot, unsigned long __user *uout)
           {
           	u64 v[4];
           
-          	if (slot >= TOWA_HBP_SLOTS || !towa_hbp[slot].bp)
+          	if (slot >= KDBG_HBP_SLOTS || !kdbg_hbp[slot].bp)
           		return -EINVAL;
           
-          	v[0] = towa_hbp[slot].hits;
-          	v[1] = towa_hbp[slot].last_pc;
-          	v[2] = towa_hbp[slot].spent;
-          	v[3] = towa_hbp[slot].addr;
+          	v[0] = kdbg_hbp[slot].hits;
+          	v[1] = kdbg_hbp[slot].last_pc;
+          	v[2] = kdbg_hbp[slot].spent;
+          	v[3] = kdbg_hbp[slot].addr;
           
           	return copy_to_user(uout, v, sizeof(v)) ? -EFAULT : 0;
           }
           
-          static void towa_hbp_cleanup(void)
+          static void kdbg_hbp_cleanup(void)
           {
           	int slot;
           
-          	for (slot = 0; slot < TOWA_HBP_SLOTS; slot++)
-          		if (towa_hbp[slot].bp) {
-          			unregister_hw_breakpoint(towa_hbp[slot].bp);
-          			towa_hbp[slot].bp = NULL;
+          	for (slot = 0; slot < KDBG_HBP_SLOTS; slot++)
+          		if (kdbg_hbp[slot].bp) {
+          			unregister_hw_breakpoint(kdbg_hbp[slot].bp);
+          			kdbg_hbp[slot].bp = NULL;
           		}
           }
           #else /* !CONFIG_HAVE_HW_BREAKPOINT */
-          static void towa_hbp_cleanup(void) { }
+          static void kdbg_hbp_cleanup(void) { }
           #endif /* CONFIG_HAVE_HW_BREAKPOINT */
           
           /* -------------------------------------------------------- wanbai.h compatibility */
@@ -1191,40 +1199,52 @@ jobs:
            * The key is accepted whatever it is.  We are not the build that minted it,
            * and refusing an unknown key would only break the handshake.
            *
-           * Set TOWA_COMPAT to 0 when you want no device nodes at all.
+           * Set KDBG_COMPAT to 0 when you want no device nodes at all.
            */
-          #define TOWA_COMPAT_DEVS "wanbai,CheckMe,Ckanri,lanran,video188"
-          #define TOWA_COMPAT_PROC "kvmstats"
+          #define KDBG_COMPAT_DEVS "wanbai,CheckMe,Ckanri,lanran,video188,bing"
+          #define KDBG_COMPAT_PROC "kvmstats"
           
-          #define TOWA_IOCTL_INIT_KEY	0x800
-          #define TOWA_IOCTL_READ_MEM	0x801
-          #define TOWA_IOCTL_WRITE_MEM	0x802
-          #define TOWA_IOCTL_MODULE_BASE	0x803
+          #define KDBG_IOCTL_INIT_KEY	0x800
+          #define KDBG_IOCTL_READ_MEM	0x801
+          #define KDBG_IOCTL_WRITE_MEM	0x802
+          #define KDBG_IOCTL_MODULE_BASE	0x803
           
-          struct towa_copy_memory {
+          /*
+           * A second family, same idea and the same structs, different opcode range and
+           * different node names.  Answering it too costs one dispatch arm and makes the
+           * "option 7 / Bing" entry in a hack's menu work.
+           */
+          #define KDBG_IOCTL_BING_KEY	0x100
+          #define KDBG_IOCTL_BING_READ	0x101
+          #define KDBG_IOCTL_BING_WRITE	0x102
+          #define KDBG_IOCTL_BING_BASE	0x103
+          
+          struct kdbg_copy_memory {
           	pid_t		pid;
           	uintptr_t	addr;
           	void		*buffer;
           	size_t		size;
           };
           
-          struct towa_module_base {
+          struct kdbg_module_base {
           	pid_t		pid;
           	char		*name;
           	uintptr_t	base;
           };
           
-          static long towa_compat_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+          static long kdbg_compat_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
           {
           	void __user *uarg = (void __user *)arg;
           
           	switch (cmd) {
-          	case TOWA_IOCTL_INIT_KEY:
+          	case KDBG_IOCTL_INIT_KEY:
+          	case KDBG_IOCTL_BING_KEY:
           		/* any key, any length, even none */
           		return 0;
           
-          	case TOWA_IOCTL_READ_MEM: {
-          		struct towa_copy_memory cm;
+          	case KDBG_IOCTL_READ_MEM:
+          	case KDBG_IOCTL_BING_READ: {
+          		struct kdbg_copy_memory cm;
           		long r;
           
           		if (copy_from_user(&cm, uarg, sizeof(cm)))
@@ -1232,12 +1252,13 @@ jobs:
           		if (!cm.buffer || !cm.size)
           			return -EINVAL;
           
-          		r = towa_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, false);
+          		r = kdbg_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, false);
           		return r == (long)cm.size ? 0 : (r < 0 ? r : -EFAULT);
           	}
           
-          	case TOWA_IOCTL_WRITE_MEM: {
-          		struct towa_copy_memory cm;
+          	case KDBG_IOCTL_WRITE_MEM:
+          	case KDBG_IOCTL_BING_WRITE: {
+          		struct kdbg_copy_memory cm;
           		long r;
           
           		if (copy_from_user(&cm, uarg, sizeof(cm)))
@@ -1245,12 +1266,13 @@ jobs:
           		if (!cm.buffer || !cm.size)
           			return -EINVAL;
           
-          		r = towa_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, true);
+          		r = kdbg_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, true);
           		return r == (long)cm.size ? 0 : (r < 0 ? r : -EFAULT);
           	}
           
-          	case TOWA_IOCTL_MODULE_BASE: {
-          		struct towa_module_base mb;
+          	case KDBG_IOCTL_MODULE_BASE:
+          	case KDBG_IOCTL_BING_BASE: {
+          		struct kdbg_module_base mb;
           		unsigned long base = 0;
           		long r;
           
@@ -1259,10 +1281,10 @@ jobs:
           		if (!mb.name)
           			return -EINVAL;
           
-          		r = towa_find_base(mb.pid, (const char __user *)mb.name, &base);
+          		r = kdbg_find_base(mb.pid, (const char __user *)mb.name, &base);
           		if (r)
           			return r;
-          		if (put_user(base, &((struct towa_module_base __user *)uarg)->base))
+          		if (put_user(base, &((struct kdbg_module_base __user *)uarg)->base))
           			return -EFAULT;
           		return 0;
           	}
@@ -1272,123 +1294,140 @@ jobs:
           	}
           }
           
-          static const struct file_operations towa_compat_fops = {
+          static const struct file_operations kdbg_compat_fops = {
           	.owner		= THIS_MODULE,
-          	.unlocked_ioctl	= towa_compat_ioctl,
-          	.compat_ioctl	= towa_compat_ioctl,
+          	.unlocked_ioctl	= kdbg_compat_ioctl,
+          	.compat_ioctl	= kdbg_compat_ioctl,
           };
           
-          #define TOWA_COMPAT_MAX	8
+          #define KDBG_COMPAT_MAX	8
           
-          static struct miscdevice towa_misc[TOWA_COMPAT_MAX];
-          static char towa_misc_name[TOWA_COMPAT_MAX][32];
-          static int towa_misc_n;
-          static struct proc_dir_entry *towa_proc;
+          /*
+           * 0 = do not create the device nodes at load.  They are the only part of this
+           * driver that is visible to every process, so the default is nothing; a session
+           * that needs them asks for them, either with `insmod ... compat=1` or with the
+           * KDBG_OP_COMPAT syscall at runtime.
+           */
+          #ifdef MODULE
+          static int kdbg_compat;
+          module_param(kdbg_compat, int, 0644);
+          MODULE_PARM_DESC(kdbg_compat, "register the wanbai/bing device nodes at load (0/1)");
+          #else
+          static int kdbg_compat;	/* built in: no parameter, so no /sys/module entry */
+          #endif
           
-          static int towa_compat_init(void)
+          static struct miscdevice kdbg_misc[KDBG_COMPAT_MAX];
+          static char kdbg_misc_name[KDBG_COMPAT_MAX][32];
+          static int kdbg_misc_n;
+          static struct proc_dir_entry *kdbg_proc;
+          
+          static int kdbg_compat_init(void)
           {
           	char list[160];
           	char *p = list;
           	char *tok;
           	int i;
           
-          	/* miscdevice.name has to outlive this call, hence the static copies */
-          	strlcpy(list, TOWA_COMPAT_DEVS, sizeof(list));
+          	if (kdbg_misc_n || kdbg_proc)
+          		return kdbg_misc_n;	/* already up */
           
-          	while (p && *p && towa_misc_n < TOWA_COMPAT_MAX) {
+          	/* miscdevice.name has to outlive this call, hence the static copies */
+          	strlcpy(list, KDBG_COMPAT_DEVS, sizeof(list));
+          
+          	while (p && *p && kdbg_misc_n < KDBG_COMPAT_MAX) {
           		tok = strsep(&p, ",");
           		if (!tok || !*tok)
           			continue;
           
-          		for (i = 0; i < towa_misc_n; i++)
-          			if (!strcmp(towa_misc_name[i], tok))
+          		for (i = 0; i < kdbg_misc_n; i++)
+          			if (!strcmp(kdbg_misc_name[i], tok))
           				break;
-          		if (i < towa_misc_n)
+          		if (i < kdbg_misc_n)
           			continue;
           
-          		strlcpy(towa_misc_name[towa_misc_n], tok, 32);
-          		towa_misc[towa_misc_n].name  = towa_misc_name[towa_misc_n];
-          		towa_misc[towa_misc_n].minor = MISC_DYNAMIC_MINOR;
-          		towa_misc[towa_misc_n].fops  = &towa_compat_fops;
-          		towa_misc[towa_misc_n].mode  = 0666;
+          		strlcpy(kdbg_misc_name[kdbg_misc_n], tok, 32);
+          		kdbg_misc[kdbg_misc_n].name  = kdbg_misc_name[kdbg_misc_n];
+          		kdbg_misc[kdbg_misc_n].minor = MISC_DYNAMIC_MINOR;
+          		kdbg_misc[kdbg_misc_n].fops  = &kdbg_compat_fops;
+          		kdbg_misc[kdbg_misc_n].mode  = 0666;
           
-          		if (misc_register(&towa_misc[towa_misc_n]))
+          		if (misc_register(&kdbg_misc[kdbg_misc_n]))
           			continue;
           
-          		towa_misc_n++;
+          		kdbg_misc_n++;
           	}
           
-          	towa_proc = proc_create(TOWA_COMPAT_PROC, 0666, NULL, &towa_compat_fops);
+          	kdbg_proc = proc_create(KDBG_COMPAT_PROC, 0666, NULL, &kdbg_compat_fops);
           
           	return 0;
           }
           
-          static void towa_compat_cleanup(void)
+          static void kdbg_compat_cleanup(void)
           {
           	int i;
           
-          	if (towa_proc) {
-          		remove_proc_entry(TOWA_COMPAT_PROC, NULL);
-          		towa_proc = NULL;
+          	if (kdbg_proc) {
+          		remove_proc_entry(KDBG_COMPAT_PROC, NULL);
+          		kdbg_proc = NULL;
           	}
           
-          	for (i = 0; i < towa_misc_n; i++)
-          		misc_deregister(&towa_misc[i]);
-          	towa_misc_n = 0;
+          	for (i = 0; i < kdbg_misc_n; i++)
+          		misc_deregister(&kdbg_misc[i]);
+          	kdbg_misc_n = 0;
           }
           
           /* ------------------------------------------------------------------ dispatch */
           
-          static long towa_dispatch(unsigned long op, unsigned long a1, unsigned long a2,
+          static long kdbg_dispatch(unsigned long op, unsigned long a1, unsigned long a2,
           			  unsigned long a3, unsigned long a4)
           {
           	switch (op) {
-          	case TOWA_OP_PING:
-          		return TOWA_MAGIC;
+          	case KDBG_OP_PING:
+          		return KDBG_MAGIC;
           
-          	case TOWA_OP_READ:
-          		return towa_rw((pid_t)a1, a2, (void __user *)a3, a4, false);
-          	case TOWA_OP_WRITE:
-          		return towa_rw((pid_t)a1, a2, (void __user *)a3, a4, true);
+          	case KDBG_OP_READ:
+          		return kdbg_rw((pid_t)a1, a2, (void __user *)a3, a4, false);
+          	case KDBG_OP_WRITE:
+          		return kdbg_rw((pid_t)a1, a2, (void __user *)a3, a4, true);
           
-          	case TOWA_OP_BASE: {
+          	case KDBG_OP_BASE: {
           		unsigned long b = 0;
-          		long r = towa_find_base((pid_t)a1, (const char __user *)a2, &b);
+          		long r = kdbg_find_base((pid_t)a1, (const char __user *)a2, &b);
           
           		if (r)
           			return r;
           		return put_user(b, (unsigned long __user *)a3) ? -EFAULT : 0;
           	}
           
-          	case TOWA_OP_HWBP_SET:
-          	case TOWA_OP_HWBP_DEL:
-          	case TOWA_OP_HWBP_STAT:
-          	case TOWA_OP_HWBP_ARM:
+          	case KDBG_OP_HWBP_SET:
+          	case KDBG_OP_HWBP_DEL:
+          	case KDBG_OP_HWBP_STAT:
+          	case KDBG_OP_HWBP_ARM:
           #ifdef CONFIG_HAVE_HW_BREAKPOINT
-          		if (op == TOWA_OP_HWBP_SET)
-          			return towa_hbp_set((pid_t)a1, a2, a3, a4,
-          					    TOWA_ACT_NONE, 0, 0);
-          		if (op == TOWA_OP_HWBP_ARM) {
-          			struct towa_hbp_cfg cfg;
+          		if (op == KDBG_OP_HWBP_SET)
+          			return kdbg_hbp_set((pid_t)a1, a2, a3, a4,
+          					    KDBG_ACT_NONE, 0, 0);
+          		if (op == KDBG_OP_HWBP_ARM) {
+          			struct kdbg_hbp_cfg cfg;
           
           			if (copy_from_user(&cfg, (void __user *)a1, sizeof(cfg)))
           				return -EFAULT;
-          			return towa_hbp_set(cfg.pid, cfg.addr, cfg.type, cfg.len,
+          			return kdbg_hbp_set(cfg.pid, cfg.addr, cfg.type, cfg.len,
           					    cfg.action, cfg.value, cfg.reg);
           		}
-          		if (op == TOWA_OP_HWBP_DEL)
-          			return towa_hbp_del(a1);
-          		return towa_hbp_stat(a1, (unsigned long __user *)a2);
+          		if (op == KDBG_OP_HWBP_DEL)
+          			return kdbg_hbp_del(a1);
+          		return kdbg_hbp_stat(a1, (unsigned long __user *)a2);
           #else
           		return -EOPNOTSUPP;
           #endif
           
-          	case TOWA_OP_WATCH_ARM:
-          		return towa_watch_arm((pid_t)a1, a2, a3);
+          	case KDBG_OP_WATCH_ARM:
+          		return kdbg_watch_arm((pid_t)a1, a2, a3);
           
-          	case TOWA_OP_WATCH_STAT: {
-          		struct towa_watch_info info;
-          		long r = towa_watch_stat(a1, &info);
+          	case KDBG_OP_WATCH_STAT: {
+          		struct kdbg_watch_info info;
+          		long r = kdbg_watch_stat(a1, &info);
           
           		if (r)
           			return r;
@@ -1396,55 +1435,62 @@ jobs:
           			? -EFAULT : 0;
           	}
           
-          	case TOWA_OP_WATCH_OFF:
-          		return towa_watch_off(a1);
+          	case KDBG_OP_WATCH_OFF:
+          		return kdbg_watch_off(a1);
+          
+          	case KDBG_OP_COMPAT:
+          		if (a1)
+          			return kdbg_compat_init();
+          		kdbg_compat_cleanup();
+          		return 0;
           
           	default:
           		return -EINVAL;
           	}
           }
           
-          static int __init towa_core_init(void)
+          static int __init kdbg_core_init(void)
           {
-          	towa_set_handler(towa_dispatch);
-          	towa_compat_init();
+          	kdbg_set_handler(kdbg_dispatch);
+          	if (kdbg_compat)
+          		kdbg_compat_init();
           	return 0;
           }
           
           #ifdef MODULE
-          static void __exit towa_core_exit(void)
+          static void __exit kdbg_core_exit(void)
           {
-          	towa_compat_cleanup();
-          	towa_hbp_cleanup();
-          	towa_watch_off_all();	/* pages go back to normal before we leave */
-          	towa_set_handler(NULL);
+          	kdbg_compat_cleanup();
+          	kdbg_hbp_cleanup();
+          	kdbg_watch_off_all();	/* pages go back to normal before we leave */
+          	kdbg_set_handler(NULL);
           }
           
-          module_init(towa_core_init);
-          module_exit(towa_core_exit);
+          module_init(kdbg_core_init);
+          module_exit(kdbg_core_exit);
           MODULE_LICENSE("GPL");
-          MODULE_DESCRIPTION("towa core");
+          MODULE_DESCRIPTION("kdbg core");
           #else
-          late_initcall(towa_core_init);
+          late_initcall(kdbg_core_init);
           #endif
           TW_C
-          cat > drivers/towa/Makefile <<'TW_M'
+          cat > drivers/kdbg/Makefile <<'TW_M'
           # The syscall stub and the page-watch code are built into the kernel: the first
           # because a syscall table entry can only be emitted at build time, the second
           # because it needs a call site inside do_page_fault() and the core mm helpers.
-          obj-y				+= towa_syscall.o
-          obj-y				+= towa_watch.o
+          obj-y				+= kdbg_syscall.o
+          obj-y				+= kdbg_watch.o
           
           # Everything that actually touches memory, and therefore everything that gets
-          # iterated: =m gives towa_core.ko.
-          obj-$(CONFIG_TOWA_CORE)		+= towa_core.o
+          # iterated: =m gives kdbg_core.ko.
+          obj-$(CONFIG_KDBG_CORE)		+= kdbg.o
           TW_M
-          cat > drivers/towa/Kconfig <<'TW_K'
-          config TOWA_CORE
-          	tristate "towa kernel-assisted memory access"
+          cat > drivers/kdbg/Kconfig <<'TW_K'
+          config KDBG_CORE
+          	tristate "kdbg kernel-assisted memory access"
           	default n
           	help
-          	  The worker half of the towa syscall: memory read/write, module base,
+          	  The worker half of the kdbg syscall: memory read/write, module base,
           	  hardware breakpoints and page watches.  As a module (=m) it can be
           	  loaded and unloaded at will and the syscall is inert while it is out;
           	  built in (=y) it arms itself at boot and nothing shows up in
@@ -1453,10 +1499,10 @@ jobs:
           	  The syscall itself and the page-fault hook are always built in,
           	  because neither can live in a module.
           TW_K
-          cat > include/linux/towa_watch.h <<'TW_I'
+          cat > include/linux/kdbg.h <<'TW_I'
           /* SPDX-License-Identifier: GPL-2.0 */
-          #ifndef _LINUX_TOWA_WATCH_H
-          #define _LINUX_TOWA_WATCH_H
+          #ifndef _LINUX_KDBG_WATCH_H
+          #define _LINUX_KDBG_WATCH_H
           
           struct pt_regs;
           
@@ -1466,13 +1512,13 @@ jobs:
            * the normal handling always goes ahead and the access always succeeds.
            * Costs one perfectly-predicted branch while no watch is armed.
            */
-          int towa_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr);
+          int kdbg_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr);
           
-          #endif /* _LINUX_TOWA_WATCH_H */
+          #endif /* _LINUX_KDBG_WATCH_H */
           TW_I
           echo "--- written ---"
-          ls -l drivers/towa/ include/linux/towa_watch.h
-          wc -l drivers/towa/*.c drivers/towa/*.h
+          ls -l drivers/kdbg/ include/linux/kdbg.h
+          wc -l drivers/kdbg/*.c drivers/kdbg/*.h
       - name: Hook the page-fault path
         working-directory: ${{ github.workspace }}/kernel
         run: |
@@ -1487,19 +1533,19 @@ jobs:
           src = open(path).read()
           
           # ---- 1. the prototype -------------------------------------------------------
-          if 'towa_watch.h' not in src:
+          if 'kdbg.h' not in src:
               anchor = '#include <asm/tlbflush.h>'
               if anchor in src:
-                  src = src.replace(anchor, anchor + '\n#include <linux/towa_watch.h>', 1)
+                  src = src.replace(anchor, anchor + '\n#include <linux/kdbg.h>', 1)
               else:
                   lines = src.split('\n')
                   last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
-                  lines.insert(last + 1, '#include <linux/towa_watch.h>')
+                  lines.insert(last + 1, '#include <linux/kdbg.h>')
                   src = '\n'.join(lines)
               print('added the include')
           
           # ---- 2. the call site, inside do_page_fault, with mmap_sem held -------------
-          CALL = 'towa_watch_fault(regs, addr, esr);'
+          CALL = 'kdbg_watch_fault(regs, addr, esr);'
           if CALL not in src:
               # The call has to go where mmap_sem is already held and addr, esr, regs and
               # mm are all live: the line that hands the fault on.  Do NOT anchor on
@@ -1519,11 +1565,11 @@ jobs:
               indent = lines[hit][:len(lines[hit]) - len(lines[hit].lstrip())]
               lines[hit:hit] = [
                   indent + '/*',
-                  indent + ' * towa page watches.  mmap_sem is held by this point, and',
+                  indent + ' * kdbg page watches.  mmap_sem is held by this point, and',
                   indent + ' * addr, esr and regs are all live.  Observes only - it never',
                   indent + ' * claims the fault, so the access always succeeds.',
                   indent + ' */',
-                  indent + 'towa_watch_fault(regs, addr, esr);',
+                  indent + 'kdbg_watch_fault(regs, addr, esr);',
                   '',
               ]
               src = '\n'.join(lines)
@@ -1534,16 +1580,61 @@ jobs:
           PYFAULT
           
           echo "--- what the fault path now looks like ---"
-          grep -n 'towa_watch' "$F"
+          grep -n 'kdbg_watch' "$F"
           echo "--- context ---"
-          awk '/towa_watch_fault\(regs, addr, esr\);/{for(i=NR-12;i<=NR+2;i++) want[i]=1} {l[NR]=$0} END{for(i=1;i<=NR;i++) if(want[i]) print i": "l[i]}' "$F"
-      - name: Add the towa syscall number
+          awk '/kdbg_watch_fault\(regs, addr, esr\);/{for(i=NR-12;i<=NR+2;i++) want[i]=1} {l[NR]=$0} END{for(i=1;i<=NR;i++) if(want[i]) print i": "l[i]}' "$F"
+      - name: Hide our symbols from /proc/kallsyms
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          F=kernel/kallsyms.c
+          test -f "$F" || { echo "no $F"; exit 1; }
+          
+          python3 - "$F" <<'PYKALL'
+          import sys
+          
+          path = sys.argv[1]
+          src = open(path).read()
+          
+          if 'linux/string.h' not in src:
+              lines = src.split('\n')
+              last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
+              lines.insert(last + 1, '#include <linux/string.h>')
+              src = '\n'.join(lines)
+              print('added the string.h include')
+          
+          OLD = ("\t/* Some debugging symbols have no name.  Ignore them. */\n"
+                 "\tif (!iter->name[0])\n"
+                 "\t\treturn 0;\n")
+          
+          NEW = OLD + ("\n"
+              "\t/*\n"
+              "\t * kdbg symbols are not listed.  Names here are readable by any\n"
+              "\t * process, so they are the only trace this leaves that can be seen\n"
+              "\t * without a kernel read.\n"
+              "\t */\n"
+              "\tif (strstr(iter->name, \"kdbg\"))\n"
+              "\t\treturn 0;\n")
+          
+          if 'strstr(iter->name' in src:
+              print('already filtered')
+          elif OLD in src:
+              src = src.replace(OLD, NEW, 1)
+              open(path, 'w').write(src)
+              print('added the filter')
+          else:
+              sys.exit('s_show does not look as expected in %s' % path)
+          PYKALL
+          
+          echo "--- what the filter looks like ---"
+          grep -n -B4 -A4 'strstr(iter->name' "$F"
+      - name: Add the kdbg syscall number
         working-directory: ${{ github.workspace }}/kernel
         run: |
           set -e
           U=include/uapi/asm-generic/unistd.h
           NR=$(grep -m1 '^#define __NR_syscalls' "$U" | awk '{print $3}')
-          echo "highest existing syscall number = $NR  -> towa will be $NR"
+          echo "highest existing syscall number = $NR  -> kdbg will be $NR"
 
           python3 - "$U" "$NR" <<'PYEOF'
           import sys
@@ -1554,9 +1645,9 @@ jobs:
           # end of the syscall list, and bump the table size to match.
           last = max(i for i, l in enumerate(lines) if l.startswith('#undef __NR_syscalls'))
           lines[last:last] = [
-              '#define __NR_towa %d' % nr,
+              '#define __NR_kdbg %d' % nr,
               '#ifndef __SYSCALL_COMPAT',
-              '__SYSCALL(__NR_towa, sys_towa)',
+              '__SYSCALL(__NR_kdbg, sys_kdbg)',
               '#endif',
           ]
           for i in range(len(lines) - 1, -1, -1):
@@ -1572,9 +1663,9 @@ jobs:
           grep -rn '__SYSCALL_COMPAT' arch/arm64/kernel/ arch/arm64/include/asm/unistd.h 2>/dev/null || echo "  none in arch/arm64"
 
           # drivers/Makefile + drivers/Kconfig
-          grep -q 'towa/' drivers/Makefile || printf 'obj-y\t\t\t\t+= towa/\n' >> drivers/Makefile
-          grep -q 'drivers/towa/Kconfig' drivers/Kconfig || printf 'source "drivers/towa/Kconfig"\n' >> drivers/Kconfig
-          grep -n 'towa' drivers/Makefile drivers/Kconfig
+          grep -q 'kdbg/' drivers/Makefile || printf 'obj-y\t\t\t\t+= kdbg/\n' >> drivers/Makefile
+          grep -q 'drivers/kdbg/Kconfig' drivers/Kconfig || printf 'source "drivers/kdbg/Kconfig"\n' >> drivers/Kconfig
+          grep -n 'kdbg' drivers/Makefile drivers/Kconfig
 
       # ------------------------------------------------------------ config tweaks
       - name: Kernel config
@@ -1586,16 +1677,16 @@ jobs:
           [ -f "$DEF" ] || { echo "no defconfig"; ls arch/arm64/configs/vendor/ | head -30; exit 1; }
           echo "defconfig: $DEF"
 
-          # n -> =m: a loadable towa_core.ko, which is what gets iterated.
+          # n -> =m: a loadable kdbg.ko, which is what gets iterated.
           # y -> =y: armed at boot, and /proc/modules stays empty.
           if [ "${{ inputs.builtin }}" = "y" ]; then
-            TOWAMODE=y
+            KDBGMODE=y
           else
-            TOWAMODE=m
+            KDBGMODE=m
           fi
-          sed -i -e '/^CONFIG_TOWA_CORE=/d' -e '/^# CONFIG_TOWA_CORE is not set$/d' "$DEF"
-          printf 'CONFIG_TOWA_CORE=%s\n' "$TOWAMODE" >> "$DEF"
-          echo "towa_core will be built as: $TOWAMODE"
+          sed -i -e '/^CONFIG_KDBG_CORE=/d' -e '/^# CONFIG_KDBG_CORE is not set$/d' "$DEF"
+          printf 'CONFIG_KDBG_CORE=%s\n' "$KDBGMODE" >> "$DEF"
+          echo "kdbg_core will be built as: $KDBGMODE"
 
           # The running 191 kernel already has these; the tree may not.
           sed -i -e '/^CONFIG_MODULE_FORCE_LOAD=/d' -e '/^# CONFIG_MODULE_FORCE_LOAD is not set$/d' "$DEF"
@@ -1616,17 +1707,17 @@ jobs:
             echo "sig_enforce line not present - leaving module.c alone"
           fi
 
-          grep -n 'TOWA_CORE\|MODULE_FORCE_LOAD\|MODULE_SIG' "$DEF"
+          grep -n 'KDBG_CORE\|MODULE_FORCE_LOAD\|MODULE_SIG' "$DEF"
 
       # Our files, first, alone - about a minute and a half.
       #
       # A kernel build runs four jobs in parallel, so a compile error in
-      # drivers/towa scrolls past among thousands of QCACLD lines and the log
+      # drivers/kdbg scrolls past among thousands of QCACLD lines and the log
       # ends eleven minutes later with a bare "Makefile:1234: drivers Error 2".
       # That is exactly what happened and it cost two round trips. Configuring
       # the tree the way build_lito_kernel.sh does and compiling only our three
       # objects makes any error the only thing in this step's output.
-      - name: Compile towa sources only
+      - name: Compile kdbg sources only
         working-directory: ${{ github.workspace }}/kernel
         run: |
           set +e
@@ -1645,44 +1736,44 @@ jobs:
           make O=out $P ARCH=arm64 olddefconfig >> /tmp/cfg.log 2>&1
           make O=out $P ARCH=arm64 prepare      >> /tmp/cfg.log 2>&1
           echo "--- the three switches that decide what our code compiles as ---"
-          grep -E '^CONFIG_(TOWA_CORE|MODULES|HAVE_HW_BREAKPOINT|PERF_EVENTS)' out/.config || true
+          grep -E '^CONFIG_(KDBG_CORE|MODULES|HAVE_HW_BREAKPOINT|PERF_EVENTS)' out/.config || true
 
           rc=0
-          : > /tmp/towa.log
+          : > /tmp/kdbg.log
           # Our three files, plus the two tree files we patched.  The patched
           # ones are the only integration points, and compiling them here costs
           # seconds instead of being discovered ten minutes into the real build.
-          for o in drivers/towa/towa_syscall.o drivers/towa/towa_watch.o \
-                   drivers/towa/towa_core.o \
+          for o in drivers/kdbg/kdbg_syscall.o drivers/kdbg/kdbg_watch.o \
+                   drivers/kdbg/kdbg.o \
                    arch/arm64/kernel/sys.o arch/arm64/mm/fault.o; do
-            echo "=== $o" >> /tmp/towa.log
-            make O=out $P ARCH=arm64 "$o" >> /tmp/towa.log 2>&1 || rc=1
+            echo "=== $o" >> /tmp/kdbg.log
+            make O=out $P ARCH=arm64 "$o" >> /tmp/kdbg.log 2>&1 || rc=1
           done
 
           echo "### compile exit: $rc"
           if [ "$rc" -ne 0 ]; then
             echo "=========== OUR ERRORS (with context) ==========="
-            grep -n -B 2 -A 6 -E 'error:|错误' /tmp/towa.log || tail -40 /tmp/towa.log
+            grep -n -B 2 -A 6 -E 'error:|错误' /tmp/kdbg.log || tail -40 /tmp/kdbg.log
             # also as an annotation, so it shows on the run summary page
-            grep -m 8 -E 'error:' /tmp/towa.log | while IFS= read -r l; do
+            grep -m 8 -E 'error:' /tmp/kdbg.log | while IFS= read -r l; do
               echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"
             done
           else
             echo "all five objects compiled cleanly:"
-            ls -l out/drivers/towa/ 2>/dev/null
+            ls -l out/drivers/kdbg/ 2>/dev/null
 
             # A compile proves nothing about the link, and the link is where a
             # 10-minute run actually died.  So compare the two symbols the
             # patched tree files need against our objects' definitions, here,
             # in seconds.
             echo "--- what the patched files ask for, and what we provide ---"
-            for pair in "arch/arm64/kernel/sys.o:__arm64_sys_towa" \
-                        "arch/arm64/mm/fault.o:towa_watch_fault"; do
+            for pair in "arch/arm64/kernel/sys.o:__arm64_sys_kdbg" \
+                        "arch/arm64/mm/fault.o:kdbg_watch_fault"; do
               obj="out/${pair%%:*}"; sym="${pair##*:}"
               echo "  $sym"
               nm "$obj" 2>/dev/null | grep -E "[UT] $sym\$" | sed 's/^/    needed: /' \
                 || echo "    needed: (not referenced - the patch did not land?)"
-              nm "out/drivers/towa/$( [ "$sym" = towa_watch_fault ] && echo towa_watch.o || echo towa_syscall.o )" \
+              nm "out/drivers/kdbg/$( [ "$sym" = kdbg_watch_fault ] && echo kdbg_watch.o || echo kdbg_syscall.o )" \
                 2>/dev/null | grep -E "T $sym\$" | sed 's/^/    given : /' \
                 || echo "    given : MISSING - this is the unresolved symbol"
             done
@@ -1744,13 +1835,13 @@ jobs:
                 echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"; done
             fi
             echo "=========== OUR OWN FILES IN THE LOG ==========="
-            grep -n 'drivers/towa' /tmp/build.log | tail -20
+            grep -n 'drivers/kdbg' /tmp/build.log | tail -20
           fi
           exit $rc
 
       # A plain `make` builds vmlinux; modules are a separate target. This step
-      # is also what produces towa_core.ko.
-      - name: Build towa_core.ko
+      # is also what produces kdbg.ko.
+      - name: Build kdbg.ko
         if: ${{ inputs.builtin != 'y' }}
         working-directory: ${{ github.workspace }}/kernel
         run: |
@@ -1759,7 +1850,7 @@ jobs:
           if [ -f out/Module.symvers ]; then OOPT="O=out"; else OOPT=""; fi
           echo "O option: '$OOPT'"
           make $OOPT ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- M=drivers/towa modules \
+               CROSS_COMPILE=aarch64-linux-gnu- M=drivers/kdbg modules \
                > /tmp/ko.log 2>&1
           rc=$?
           echo "### module build exit: $rc"
@@ -1770,17 +1861,17 @@ jobs:
           fi
           [ "$rc" -eq 0 ] || exit $rc
           set -e
-          KO=$(find . -name 'towa_core.ko' | head -1)
-          [ -n "$KO" ] || { echo "towa_core.ko NOT BUILT"; exit 1; }
+          KO=$(find . -name 'kdbg.ko' | head -1)
+          [ -n "$KO" ] || { echo "kdbg.ko NOT BUILT"; exit 1; }
           echo "--- $KO ---"
           ls -l "$KO"
           echo "--- vermagic (must match the Image built in this same run) ---"
           modinfo -F vermagic "$KO"
           echo "--- did the breakpoint symbols resolve? (modpost would already have failed otherwise) ---"
           nm -u "$KO" 2>/dev/null | grep -i 'hw_breakpoint\|perf' || echo "  no unresolved breakpoint symbols"
-          nm "$KO" 2>/dev/null | grep -i 'towa_hbp\|towa_read\|towa_dispatch' || true
+          nm "$KO" 2>/dev/null | grep -i 'kdbg_hbp\|kdbg_read\|kdbg_dispatch' || true
           mkdir -p "$GITHUB_WORKSPACE/out"
-          cp "$KO" "$GITHUB_WORKSPACE/out/towa_core.ko"
+          cp "$KO" "$GITHUB_WORKSPACE/out/kdbg.ko"
 
       - name: Collect and verify output
         working-directory: ${{ github.workspace }}/kernel
@@ -1803,7 +1894,7 @@ jobs:
           if s < 0 or e < s:
               print('no embedded config found'); sys.exit(0)
           cfg = gzip.decompress(d[s+8:e]).decode('utf-8', 'replace')
-          for opt in ('CONFIG_TOWA_CORE', 'CONFIG_MODULES', 'CONFIG_MODULE_SIG',
+          for opt in ('CONFIG_KDBG_CORE', 'CONFIG_MODULES', 'CONFIG_MODULE_SIG',
                       'CONFIG_MODULE_SIG_FORCE', 'CONFIG_MODULE_FORCE_LOAD',
                       'CONFIG_STRICT_KERNEL_RWX', 'CONFIG_MODVERSIONS',
                       'CONFIG_HAVE_HW_BREAKPOINT', 'CONFIG_PERF_EVENTS'):
@@ -1815,7 +1906,7 @@ jobs:
           VML=$(ls out/vmlinux 2>/dev/null || echo "")
           if [ -n "$VML" ]; then
             echo "--- is the syscall in vmlinux? ---"
-            nm "$VML" 2>/dev/null | grep -i 'sys_towa\|towa_set_handler' || echo "  NOT FOUND (built-in table entry missing)"
+            nm "$VML" 2>/dev/null | grep -i 'sys_kdbg\|kdbg_set_handler' || echo "  NOT FOUND (built-in table entry missing)"
             echo "--- and is the kernel able to give us breakpoints? ---"
             nm "$VML" 2>/dev/null | grep -i 'register_user_hw_breakpoint\|hw_breakpoint_init' || echo "  not present"
           fi
@@ -1873,6 +1964,7 @@ jobs:
               TOWA_OP_WATCH_ARM  = 8,
               TOWA_OP_WATCH_STAT = 9,
               TOWA_OP_WATCH_OFF  = 10,
+              TOWA_OP_COMPAT     = 11,
           };
           
           #define TOWA_BP_X 0
@@ -2288,7 +2380,7 @@ jobs:
           static int cmd_compat(void)
           {
               static const char *names[] = {
-                  "wanbai", "CheckMe", "Ckanri", "lanran", "video188",
+                  "wanbai", "CheckMe", "Ckanri", "lanran", "video188", "bing",
               };
           
               int pid = find_pid("com.dts.freefireth");
@@ -2305,8 +2397,9 @@ jobs:
                   try_node(path, pid, kElfMagic);
               }
               if (!any) {
-                  printf("none of them exist - is towa_core.ko loaded, and is the compat\n"
-                         "block enabled (TOWA_COMPAT 1 in towa_core.c)?\n");
+                  printf("none of them exist.  Either towa_core.ko is not loaded, or the\n"
+                         "nodes have not been asked for - they are off by default:\n"
+                         "    towacli compat on\n");
                   return 1;
               }
           
@@ -2634,6 +2727,9 @@ jobs:
                   "\n"
                   "  ping                          is the syscall there?\n"
                   "  test [pid]                    ping + libil2cpp base + ELF check\n"
+                  "  compat on|off                 register/remove the device nodes the scene\n"
+                  "                                hacks look for.  OFF by default - they\n"
+                  "                                are the only visible part of this driver\n"
                   "  compat                        the same thing a scene hack does, through\n"
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
                   "  pid <name>                    find a pid by process name\n"
@@ -2722,7 +2818,18 @@ jobs:
                   return cmd_test(pid);
               }
           
+              // The device nodes are the only thing this driver leaves lying around, so
+              // they are off unless asked for.  On when a hack is about to run, off again
+              // after: nothing in /dev, /sys or /proc while they are not needed.
               if (cmd == "compat") {
+                  if (a.size() > 1 && (a[1] == "on" || a[1] == "off")) {
+                      long r = towa(TOWA_OP_COMPAT, (a[1] == "on") ? 1 : 0);
+                      if (r < 0) { perr("compat", r); return 1; }
+                      printf("compat %s%s\n", a[1].c_str(),
+                             (a[1] == "on") ? " - device nodes registered; run a hack now"
+                                            : " - nodes removed; nothing left in /dev or /sys");
+                      return 0;
+                  }
                   return cmd_compat();
               }
           
@@ -3041,7 +3148,7 @@ jobs:
           echo "towacli build stamp: $STAMP"
           
           "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -DNR_TOWA=$NR \
-                 -DTOWACLI_BUILD="\"$STAMP\"" \
+                 -DKDBGCLI_BUILD="\"$STAMP\"" \
                  -o "$GITHUB_WORKSPACE/tools/towacli" "$GITHUB_WORKSPACE/tools/towacli.cpp"
           
           echo "--- what we built ---"
@@ -3066,20 +3173,20 @@ jobs:
           [ -f "$GITHUB_WORKSPACE/out/dtbo" ] && cp "$GITHUB_WORKSPACE/out/dtbo" dtbo
           # The module rides inside the zip too, so one download has everything.
           # With builtin=y there is no module and the block below does nothing.
-          if [ -f "$GITHUB_WORKSPACE/out/towa_core.ko" ]; then
-            cp "$GITHUB_WORKSPACE/out/towa_core.ko" towa_core.ko
+          if [ -f "$GITHUB_WORKSPACE/out/kdbg.ko" ]; then
+            cp "$GITHUB_WORKSPACE/out/kdbg.ko" kdbg.ko
           fi
           # Appended after write_boot, which is plain shell by that point.
           cat >> anykernel.sh <<'AK3EOF'
 
-          # towa: leave the module somewhere that survives, so it does not have to
+          # kdbg: leave the module somewhere that survives, so it does not have to
           # be pushed again after every flash
           for d in "$AKHOME" .; do
-            if [ -f "$d/towa_core.ko" ]; then
+            if [ -f "$d/kdbg.ko" ]; then
               mkdir -p /data/adb/towa
-              cp "$d/towa_core.ko" /data/adb/towa/towa_core.ko
-              chmod 0644 /data/adb/towa/towa_core.ko
-              ui_print "  towa_core.ko -> /data/adb/towa/"
+              cp "$d/kdbg.ko" /data/adb/towa/kdbg.ko
+              chmod 0644 /data/adb/towa/kdbg.ko
+              ui_print "  kdbg.ko -> /data/adb/towa/"
               break
             fi
           done
@@ -3098,7 +3205,7 @@ jobs:
           name: build-log-${{ github.run_number }}
           path: |
             /tmp/build.log
-            /tmp/towa.log
+            /tmp/kdbg.log
             /tmp/cfg.log
           if-no-files-found: warn
 
@@ -3109,12 +3216,12 @@ jobs:
           path: ${{ github.workspace }}/towa-kernel-*.zip
           if-no-files-found: error
 
-      - name: Upload towa_core.ko
+      - name: Upload kdbg.ko
         if: ${{ inputs.builtin != 'y' }}
         uses: actions/upload-artifact@v4
         with:
-          name: towa_core-ko-${{ github.run_number }}
-          path: ${{ github.workspace }}/out/towa_core.ko
+          name: kdbg_core-ko-${{ github.run_number }}
+          path: ${{ github.workspace }}/out/kdbg.ko
           if-no-files-found: error
 
       - name: Upload towacli
@@ -3135,19 +3242,19 @@ jobs:
             cp "$GITHUB_WORKSPACE/tools/towacli" /tmp/towacli
             FILES="$FILES /tmp/towacli"
           fi
-          if [ -f "$GITHUB_WORKSPACE/out/towa_core.ko" ]; then
-            cp "$GITHUB_WORKSPACE/out/towa_core.ko" /tmp/towa_core.ko
-            FILES="$FILES /tmp/towa_core.ko"
-            echo "towa_core.ko is in this release" > "$E"
+          if [ -f "$GITHUB_WORKSPACE/out/kdbg.ko" ]; then
+            cp "$GITHUB_WORKSPACE/out/kdbg.ko" /tmp/kdbg.ko
+            FILES="$FILES /tmp/kdbg.ko"
+            echo "kdbg.ko is in this release" > "$E"
           else
-            echo "built-in build: towa_core is in the Image, no .ko" > "$E"
+            echo "built-in build: kdbg_core is in the Image, no .ko" > "$E"
           fi
           NR=$(grep -m1 '^#define __NR_syscalls' kernel/include/uapi/asm-generic/unistd.h | awk '{print $3}')
-          gh release create "towa-${{ github.run_number }}" $FILES \
+          gh release create "kdbg-${{ github.run_number }}" $FILES \
             --repo "$GITHUB_REPOSITORY" \
-            --title "towa kernel build ${{ github.run_number }}" \
+            --title "kdbg kernel build ${{ github.run_number }}" \
             --notes "TOWA_NR=$((NR-1))  cookie=0x9E3779B97F4A7C15  branch=${{ inputs.branch }}  builtin=${{ inputs.builtin }}
           $(cat "$E")
           sha256=$(sha256sum "$Z" | cut -d' ' -f1)" \
-          || gh release upload "towa-${{ github.run_number }}" $FILES \
+          || gh release upload "kdbg-${{ github.run_number }}" $FILES \
             --repo "$GITHUB_REPOSITORY" --clobber
