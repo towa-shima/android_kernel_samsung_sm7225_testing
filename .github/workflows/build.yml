@@ -1421,6 +1421,27 @@ jobs:
           	.compat_ioctl	= kdbg_compat_ioctl,
           };
           
+          #define KDBG_COMPAT_MAX	8
+          
+          /*
+           * 0 = do not create the device nodes at load.  They are the only part of this
+           * driver that is visible to every process, so the default is nothing; a session
+           * that needs them asks for them, either with `insmod ... compat=1` or with the
+           * KDBG_OP_COMPAT syscall at runtime.
+           */
+          #ifdef MODULE
+          static int kdbg_compat;
+          module_param(kdbg_compat, int, 0644);
+          MODULE_PARM_DESC(kdbg_compat, "register the wanbai/bing device nodes at load (0/1)");
+          #else
+          static int kdbg_compat;	/* built in: no parameter, so no /sys/module entry */
+          #endif
+          
+          static struct miscdevice kdbg_misc[KDBG_COMPAT_MAX];
+          static char kdbg_misc_name[KDBG_COMPAT_MAX][32];
+          static int kdbg_misc_n;
+          static struct proc_dir_entry *kdbg_proc;
+          
           /* the pair the rest of the driver - and the syscall - actually uses */
           static int kdbg_compat_init(void)
           {
@@ -1442,27 +1463,6 @@ jobs:
           	kdbg_compat_down();
           	mutex_unlock(&kdbg_compat_lock);
           }
-          
-          #define KDBG_COMPAT_MAX	8
-          
-          /*
-           * 0 = do not create the device nodes at load.  They are the only part of this
-           * driver that is visible to every process, so the default is nothing; a session
-           * that needs them asks for them, either with `insmod ... compat=1` or with the
-           * KDBG_OP_COMPAT syscall at runtime.
-           */
-          #ifdef MODULE
-          static int kdbg_compat;
-          module_param(kdbg_compat, int, 0644);
-          MODULE_PARM_DESC(kdbg_compat, "register the wanbai/bing device nodes at load (0/1)");
-          #else
-          static int kdbg_compat;	/* built in: no parameter, so no /sys/module entry */
-          #endif
-          
-          static struct miscdevice kdbg_misc[KDBG_COMPAT_MAX];
-          static char kdbg_misc_name[KDBG_COMPAT_MAX][32];
-          static int kdbg_misc_n;
-          static struct proc_dir_entry *kdbg_proc;
           
           static void kdbg_compat_up(void)
           {
@@ -2243,6 +2243,9 @@ jobs:
           #define TOWA_MAGIC  0x5032300AUL
           
           static const unsigned long kElfMagic = 0x464C457FUL;   // "\x7fELF" little-endian
+          
+          // declared here because the prctl test uses it and lives above the utilities
+          static void hexdump(unsigned long addr, const unsigned char *p, int n);
           
           enum {
               TOWA_OP_PING       = 0,
