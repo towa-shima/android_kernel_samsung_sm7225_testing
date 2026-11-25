@@ -246,6 +246,7 @@ jobs:
           	unsigned long long	denied;		/* refused: no CAP_SYS_PTRACE	*/
           	unsigned long long	prctl_reads;	/* the same driver, reached    */
           	unsigned long long	prctl_writes;	/* through prctl instead       */
+          	unsigned long long	prctl_probes;	/* op 5, the get-pid probe     */
           	unsigned long long	sys_reads;	/* plain read(2) on a node     */
           	unsigned long long	sys_writes;	/* plain write(2) on a node    */
           	unsigned long long	mmaps;		/* mmap(2) on a node           */
@@ -257,6 +258,9 @@ jobs:
           	char			last_node[16];	/* which node the last ioctl hit */
           	unsigned int		cmds[8];	/* ioctl request values seen	*/
           	unsigned long long	cmd_hits[8];	/* 0xffffffff = slot unused	*/
+          	unsigned int		cmd_arg[8][8];	/* first 32 bytes of the arg	*/
+          	unsigned int		pcmds[8];	/* prctl options >= 1024 seen	*/
+          	unsigned long long	pcmd_hits[8];
           };
           
           /* a3 of KDBG_OP_HWBP_SET.  X = execute, i.e. call me at this address.
@@ -421,6 +425,7 @@ jobs:
           /* ---------------------------------------------------------------- prctl ---- */
           
           static kdbg_prctl_t kdbg_prctl_fn __read_mostly;
+          static kdbg_prctl_note_t kdbg_prctl_note_fn __read_mostly;
           
           void kdbg_set_prctl(kdbg_prctl_t fn)
           {
@@ -435,10 +440,22 @@ jobs:
            * as the syscall front end: nothing but "call the registered handler", so the
            * prctl path costs a single predictable branch for every other caller.
            */
+          void kdbg_set_prctl_note(kdbg_prctl_note_t fn)
+          {
+          	mutex_lock(&kdbg_mutex);
+          	kdbg_prctl_note_fn = fn;
+          	mutex_unlock(&kdbg_mutex);
+          }
+          EXPORT_SYMBOL_GPL(kdbg_set_prctl_note);
+          
           long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3)
           {
           	kdbg_prctl_t fn;
           	long ret;
+          
+          	/* watched first: a magic we do not own is still worth knowing about */
+          	if (kdbg_prctl_note_fn)
+          		kdbg_prctl_note_fn(option);
           
           	if (option != KDBG_PRCTL_MAGIC)
           		return -EINVAL;
@@ -873,6 +890,16 @@ jobs:
            * (see the block below).  0 = syscall only, no nodes.
            */
           #define KDBG_COMPAT	1
+          
+          /*
+           * 1 = answer a request from an unimplemented family with success instead of
+           *     -ENOTTY, and record it.  A discovery setting: it makes a client that is
+           *     not ours keep talking, so its protocol can be read out of the log in a
+           *     single run.  Nothing is performed for those calls, so a client that
+           *     trusts the answer acts on whatever was already in its buffer.
+           * 0 = behave like a driver that does not know the request (the normal state).
+           */
+          #define KDBG_ANSWER_UNKNOWN	1
           
           /*
            * 1 = answer the prctl probe for anyone, not just root.  0 is the safer
@@ -1358,6 +1385,7 @@ jobs:
           	atomic64_t	denied;		/* refused: no CAP_SYS_PTRACE	*/
           	atomic64_t	prctl_reads;
           	atomic64_t	prctl_writes;
+          	atomic64_t	prctl_probes;
           	atomic64_t	sys_reads;	/* plain read(2) on a node	*/
           	atomic64_t	sys_writes;	/* plain write(2) on a node	*/
           	atomic64_t	mmaps;		/* mmap(2) on a node		*/
@@ -1383,9 +1411,38 @@ jobs:
           
           static unsigned int	kdbg_cmds[KDBG_CMD_SLOTS];
           static atomic64_t	kdbg_cmd_hits[KDBG_CMD_SLOTS];
+          static unsigned int	kdbg_cmd_arg[KDBG_CMD_SLOTS][8];
           static atomic_t		kdbg_cmd_next = ATOMIC_INIT(0);
           
-          static void kdbg_note_cmd(unsigned int cmd)
+          static void kdbg_count_seen(unsigned int *tab, atomic64_t *hits,
+          			    atomic_t *next, unsigned int v)
+          {
+          	int i;
+          	int n = atomic_read(next);
+          
+          	for (i = 0; i < KDBG_CMD_SLOTS; i++) {
+          		if (tab[i] == v) {
+          			atomic64_inc(&hits[i]);
+          			return;
+          		}
+          	}
+          
+          	i = n % KDBG_CMD_SLOTS;		/* none matched: take the next slot */
+          	tab[i] = v;
+          	atomic64_set(&hits[i], 1);
+          	atomic_set(next, n + 1);
+          }
+          
+          /*
+           * What the argument pointed at, for a request we have never seen.
+           *
+           * An unknown opcode is a whole protocol hiding behind one number: the only way
+           * to decode it without its author's header is to look at what it passed.  The
+           * first 32 bytes are copied out of the caller's memory (a scalar argument just
+           * fails the copy and leaves zeroes), which is enough to see a
+           * {pid, addr, buffer, size} layout at a glance.
+           */
+          static void kdbg_note_cmd(unsigned int cmd, unsigned long arg)
           {
           	int i;
           	int n = atomic_read(&kdbg_cmd_next);
@@ -1400,7 +1457,34 @@ jobs:
           	i = n % KDBG_CMD_SLOTS;		/* none matched: take the next slot */
           	kdbg_cmds[i] = cmd;
           	atomic64_set(&kdbg_cmd_hits[i], 1);
+          
+          	memset(kdbg_cmd_arg[i], 0, sizeof(kdbg_cmd_arg[i]));
+          	if (arg)
+          		(void)copy_from_user(kdbg_cmd_arg[i], (void __user *)arg,
+          				     sizeof(kdbg_cmd_arg[i]));
+          
           	atomic_set(&kdbg_cmd_next, n + 1);
+          }
+          
+          /*
+           * Every prctl the kernel sees, filtered to the ones that are not libc's.
+           *
+           * A scene driver's magic is a large number - 0x4E41 is one - while every option
+           * glibc and bionic use is small, so anything under 1024 is dropped before the
+           * table.  What is left is a driver probe, from whichever process sent it, and
+           * that answers a question the prctl counters cannot: whether a mod is asking
+           * for a driver we have not implemented.
+           */
+          static unsigned int	kdbg_pcmds[KDBG_CMD_SLOTS];
+          static atomic64_t	kdbg_pcmd_hits[KDBG_CMD_SLOTS];
+          static atomic_t		kdbg_pcmd_next = ATOMIC_INIT(0);
+          
+          static void kdbg_prctl_note(int option)
+          {
+          	if (option < 1024 || option == KDBG_PRCTL_MAGIC)
+          		return;			/* libc's own, or one we already answer */
+          	kdbg_count_seen(kdbg_pcmds, kdbg_pcmd_hits, &kdbg_pcmd_next,
+          			(unsigned int)option);
           }
           
           static void kdbg_note(atomic64_t *ctr)
@@ -1427,7 +1511,7 @@ jobs:
           	 * picked the wrong entry of its own menu shows up here as an opcode we
           	 * do not answer, and that is a line to add rather than a mystery.
           	 */
-          	kdbg_note_cmd(cmd);
+          	kdbg_note_cmd(cmd, arg);
           	strlcpy(kdbg_stat.last_node, (m && m->name) ? m->name : "?",
           		sizeof(kdbg_stat.last_node));
           
@@ -1504,7 +1588,19 @@ jobs:
           	}
           
           	default:
-          		return -ENOTTY;
+          		/*
+          		 * A request from a family we have not implemented.  KDBG_ANSWER_UNKNOWN
+          		 * says yes to it anyway, for one reason: a client that is refused here
+          		 * stops, and stops telling us anything.  Answered, it goes on to its
+          		 * next request, and the table above records every one of them along
+          		 * with the first 32 bytes of each argument - which is how an unknown
+          		 * protocol gets decoded, in one run instead of one flash per opcode.
+          		 *
+          		 * It is a discovery setting: nothing is actually done for the call, so
+          		 * a client that trusts the answer will read whatever was already in its
+          		 * buffer.  Set it to 0 once the protocol is known and its arms exist.
+          		 */
+          		return KDBG_ANSWER_UNKNOWN ? 0 : -ENOTTY;
           	}
           }
           
@@ -1695,6 +1791,7 @@ jobs:
           	atomic64_set(&kdbg_stat.denied, 0);
           	atomic64_set(&kdbg_stat.prctl_reads, 0);
           	atomic64_set(&kdbg_stat.prctl_writes, 0);
+          	atomic64_set(&kdbg_stat.prctl_probes, 0);
           	atomic64_set(&kdbg_stat.sys_reads, 0);
           	atomic64_set(&kdbg_stat.sys_writes, 0);
           	atomic64_set(&kdbg_stat.mmaps, 0);
@@ -1705,8 +1802,12 @@ jobs:
           	for (i = 0; i < KDBG_CMD_SLOTS; i++) {
           		kdbg_cmds[i] = KDBG_CMD_UNUSED;
           		atomic64_set(&kdbg_cmd_hits[i], 0);
+          		memset(kdbg_cmd_arg[i], 0, sizeof(kdbg_cmd_arg[i]));
+          		kdbg_pcmds[i] = KDBG_CMD_UNUSED;
+          		atomic64_set(&kdbg_pcmd_hits[i], 0);
           	}
           	atomic_set(&kdbg_cmd_next, 0);
+          	atomic_set(&kdbg_pcmd_next, 0);
           
           	r = (kdbg_misc_n || kdbg_chrdev_major)
           		? 0
@@ -1885,6 +1986,9 @@ jobs:
           			return -EINVAL;
           		}
           #endif
+          		atomic64_inc(&kdbg_stat.prctl_probes);
+          		kdbg_note(NULL);
+          
           		h.pid = current->tgid;
           		h.result = 0;
           		break;
@@ -2008,9 +2112,14 @@ jobs:
           		       sizeof(st.holder_comm));
           		memcpy(st.last_comm, kdbg_stat.last_comm, sizeof(st.last_comm));
           		memcpy(st.last_node, kdbg_stat.last_node, sizeof(st.last_node));
+          		st.prctl_probes = atomic64_read(&kdbg_stat.prctl_probes);
           		for (i = 0; i < KDBG_CMD_SLOTS; i++) {
           			st.cmds[i] = kdbg_cmds[i];
           			st.cmd_hits[i] = atomic64_read(&kdbg_cmd_hits[i]);
+          			memcpy(st.cmd_arg[i], kdbg_cmd_arg[i],
+          			       sizeof(st.cmd_arg[i]));
+          			st.pcmds[i] = kdbg_pcmds[i];
+          			st.pcmd_hits[i] = atomic64_read(&kdbg_pcmd_hits[i]);
           		}
           
           		return copy_to_user((void __user *)a1, &st, sizeof(st))
@@ -2026,6 +2135,7 @@ jobs:
           {
           	kdbg_set_handler(kdbg_dispatch);
           	kdbg_set_prctl(kdbg_prctl);
+          	kdbg_set_prctl_note(kdbg_prctl_note);
           	if (kdbg_compat)
           		kdbg_compat_init();
           	return 0;
@@ -2037,6 +2147,7 @@ jobs:
           	kdbg_compat_cleanup();
           	kdbg_hbp_cleanup();
           	kdbg_watch_off_all();	/* pages go back to normal before we leave */
+          	kdbg_set_prctl_note(NULL);
           	kdbg_set_prctl(NULL);
           	kdbg_set_handler(NULL);
           }
@@ -2101,6 +2212,17 @@ jobs:
           #define KDBG_PRCTL_MAGIC	0x4E41
           
           long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3);
+          
+          /*
+           * Called for every prctl() the kernel handles once the driver is loaded,
+           * whatever the option - so the driver can notice a client probing a magic
+           * number it does not own yet, instead of wondering why nothing happens.  It
+           * observes only: no return value, no side effect, and libc's own options
+           * (all small numbers) are filtered out before they reach it.
+           */
+          typedef void (*kdbg_prctl_note_t)(int option);
+          
+          void kdbg_set_prctl_note(kdbg_prctl_note_t fn);
           
           #endif /* _LINUX_KDBG_WATCH_H */
           TW_I
@@ -2245,11 +2367,16 @@ jobs:
                  "{\n")
           
           NEW = OLD + ("\t/*\n"
-              "\t * kdbg: one magic option, forwarded to the driver.  Every other\n"
-              "\t * caller falls through to the real prctl below.\n"
+              "\t * kdbg: every option is offered to the driver, which answers the one\n"
+              "\t * magic value it owns and only records the rest - so a client asking\n"
+              "\t * for a driver that is not implemented is visible instead of silent.\n"
+              "\t * Anything that comes back -EINVAL falls through to the real prctl.\n"
               "\t */\n"
-              "\tif (option == KDBG_PRCTL_MAGIC)\n"
-              "\t\treturn kdbg_prctl_entry(option, arg2, arg3);\n\n")
+              "\t{\n"
+              "\t\tlong kdbg_r = kdbg_prctl_entry(option, arg2, arg3);\n\n"
+              "\t\tif (kdbg_r != -EINVAL)\n"
+              "\t\t\treturn kdbg_r;\n"
+              "\t}\n\n")
           
           if 'KDBG_PRCTL_MAGIC' in src:
               print('already forwarded')
@@ -3092,6 +3219,7 @@ jobs:
               unsigned long long denied;
               unsigned long long prctl_reads;
               unsigned long long prctl_writes;
+              unsigned long long prctl_probes;
               unsigned long long sys_reads;
               unsigned long long sys_writes;
               unsigned long long mmaps;
@@ -3103,6 +3231,9 @@ jobs:
               char last_node[16];
               unsigned int cmds[8];
               unsigned long long cmd_hits[8];
+              unsigned int cmd_arg[8][8];
+              unsigned int pcmds[8];
+              unsigned long long pcmd_hits[8];
           };
           
           static bool print_usage_block(void)
@@ -3127,8 +3258,8 @@ jobs:
               printf("reads / writes     : %llu / %llu\n", st.reads, st.writes);
               printf("module lookups     : %llu\n", st.bases);
               printf("refused (no root)  : %llu\n", st.denied);
-              printf("via prctl          : %llu reads / %llu writes\n",
-                     st.prctl_reads, st.prctl_writes);
+              printf("via prctl          : %llu reads / %llu writes, %llu probe(s)\n",
+                     st.prctl_reads, st.prctl_writes, st.prctl_probes);
               printf("plain read/write   : %llu / %llu   (%llu mmap, last size %llu)\n",
                      st.sys_reads, st.sys_writes, st.mmaps, st.last_len);
               if (st.last_pid)
@@ -3148,12 +3279,32 @@ jobs:
                   printf("--- ioctls, as they arrived ---\n");
                   printf("  ours: key 0x800, read 0x801, write 0x802, base 0x803,\n");
                   printf("        bing: key 0x100, read 0x101, write 0x102, base 0x103\n");
-                  for (int i = 0; i < 8; i++)
-                      if (st.cmd_hits[i])
-                          printf("  0x%08x  x%llu\n", st.cmds[i], st.cmd_hits[i]);
+                  for (int i = 0; i < 8; i++) {
+                      if (!st.cmd_hits[i]) continue;
+                      printf("  0x%08x  x%llu\n", st.cmds[i], st.cmd_hits[i]);
+                      const unsigned int *w = st.cmd_arg[i];
+                      if (w[0] || w[1] || w[2] || w[3] || w[4] || w[5] || w[6] || w[7])
+                          printf("      arg: %08x %08x %08x %08x\n"
+                                 "           %08x %08x %08x %08x\n",
+                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                  }
               } else if (st.total_opens) {
                   printf("--- ioctls, as they arrived ---\n"
                          "  none: the node was opened and closed with no request at all\n");
+              }
+          
+              // prctl options above 1023 from any process: a scene driver's magic is a
+              // big number, libc's are all small, so this is a driver probe and nothing
+              // else.  A value here that is not 0x4e41 is a magic we have not implemented.
+              bool any_pcmd = false;
+              for (int i = 0; i < 8; i++)
+                  if (st.pcmd_hits[i]) any_pcmd = true;
+          
+              if (any_pcmd) {
+                  printf("--- prctl options above 1023 seen ---\n");
+                  for (int i = 0; i < 8; i++)
+                      if (st.pcmd_hits[i])
+                          printf("  0x%08x  x%llu\n", st.pcmds[i], st.pcmd_hits[i]);
               }
           
               printf("verdict            : ");
@@ -3161,6 +3312,8 @@ jobs:
                   printf("a hack IS using the driver, through a node\n");
               else if (via_prctl)
                   printf("a hack IS using the driver, through prctl\n");
+              else if (any_pcmd)
+                  printf("something probed a prctl magic we do not answer - see below\n");
               else if (st.opens && (st.sys_reads || st.sys_writes || st.mmaps))
                   printf("a node is held and used by read/write/mmap, not ioctl\n");
               else if (st.opens)
