@@ -246,6 +246,10 @@ jobs:
           	unsigned long long	denied;		/* refused: no CAP_SYS_PTRACE	*/
           	unsigned long long	prctl_reads;	/* the same driver, reached    */
           	unsigned long long	prctl_writes;	/* through prctl instead       */
+          	unsigned long long	sys_reads;	/* plain read(2) on a node     */
+          	unsigned long long	sys_writes;	/* plain write(2) on a node    */
+          	unsigned long long	mmaps;		/* mmap(2) on a node           */
+          	unsigned long long	last_len;	/* the size the last one asked */
           	int			holder_pid;	/* the process holding a node	*/
           	int			last_pid;	/* the last process to ioctl	*/
           	char			holder_comm[16];
@@ -1354,6 +1358,10 @@ jobs:
           	atomic64_t	denied;		/* refused: no CAP_SYS_PTRACE	*/
           	atomic64_t	prctl_reads;
           	atomic64_t	prctl_writes;
+          	atomic64_t	sys_reads;	/* plain read(2) on a node	*/
+          	atomic64_t	sys_writes;	/* plain write(2) on a node	*/
+          	atomic64_t	mmaps;		/* mmap(2) on a node		*/
+          	atomic64_t	last_len;	/* the size the last one asked	*/
           	atomic_t	holder_pid;
           	atomic_t	last_pid;
           	char		holder_comm[TASK_COMM_LEN];
@@ -1577,6 +1585,42 @@ jobs:
           }
           
           /*
+           * The other things a program can do to a node.
+           *
+           * None of them is part of the interface - the hacks use ioctl - but a mod that
+           * opens a node and sends no request at all is doing one of these instead, and
+           * that is the difference between "it uses the driver" and "it keeps the
+           * driver's existence as a token while it reads the game some other way".
+           * Counted, answered honestly, and nothing faked: a node here has no read()
+           * semantics to invent.
+           */
+          static ssize_t kdbg_compat_read(struct file *f, char __user *buf, size_t len,
+          				loff_t *off)
+          {
+          	atomic64_inc(&kdbg_stat.sys_reads);
+          	atomic64_set(&kdbg_stat.last_len, len);
+          
+          	return -EINVAL;
+          }
+          
+          static ssize_t kdbg_compat_write(struct file *f, const char __user *buf,
+          				 size_t len, loff_t *off)
+          {
+          	atomic64_inc(&kdbg_stat.sys_writes);
+          	atomic64_set(&kdbg_stat.last_len, len);
+          
+          	return -EINVAL;
+          }
+          
+          static int kdbg_compat_mmap(struct file *f, struct vm_area_struct *vma)
+          {
+          	atomic64_inc(&kdbg_stat.mmaps);
+          	atomic64_set(&kdbg_stat.last_len, vma->vm_end - vma->vm_start);
+          
+          	return -ENODEV;
+          }
+          
+          /*
            * The status file answers one thing only: what the last `compat on` managed.
            * It has no ioctl, so nothing can be handed to it by mistake for a real node.
            */
@@ -1585,11 +1629,28 @@ jobs:
           	.read		= kdbg_status_read,
           };
           
+          /*
+           * The rt-proc shape: the same driver behind /proc/kvmstats.
+           *
+           * A backend that looks for a proc entry instead of a node opens this and then
+           * speaks the same ioctls - so it gets the same ioctls.  Before this it could
+           * find the file and do nothing with it, which reads exactly like a driver that
+           * does not exist.  Reading it still returns the status line.
+           */
+          static const struct file_operations kdbg_proc_fops = {
+          	.owner		= THIS_MODULE,
+          	.read		= kdbg_status_read,
+          	.unlocked_ioctl	= kdbg_compat_ioctl,
+          	.compat_ioctl	= kdbg_compat_ioctl,
+          };
+          
           static const struct file_operations kdbg_compat_fops = {
           	.owner		= THIS_MODULE,
           	.open		= kdbg_compat_open,
           	.release	= kdbg_compat_release,
-          	.read		= kdbg_status_read,
+          	.read		= kdbg_compat_read,
+          	.write		= kdbg_compat_write,
+          	.mmap		= kdbg_compat_mmap,
           	.unlocked_ioctl	= kdbg_compat_ioctl,
           	.compat_ioctl	= kdbg_compat_ioctl,
           };
@@ -1634,6 +1695,10 @@ jobs:
           	atomic64_set(&kdbg_stat.denied, 0);
           	atomic64_set(&kdbg_stat.prctl_reads, 0);
           	atomic64_set(&kdbg_stat.prctl_writes, 0);
+          	atomic64_set(&kdbg_stat.sys_reads, 0);
+          	atomic64_set(&kdbg_stat.sys_writes, 0);
+          	atomic64_set(&kdbg_stat.mmaps, 0);
+          	atomic64_set(&kdbg_stat.last_len, 0);
           	atomic_set(&kdbg_stat.last_pid, 0);
           	kdbg_stat.last_comm[0] = '\0';
           	kdbg_stat.last_node[0] = '\0';
@@ -1729,7 +1794,7 @@ jobs:
           			kdbg_chrdev_major = 0;
           	}
           
-          	kdbg_proc = proc_create(KDBG_COMPAT_PROC, 0666, NULL, &kdbg_status_fops);
+          	kdbg_proc = proc_create(KDBG_COMPAT_PROC, 0666, NULL, &kdbg_proc_fops);
           
           	snprintf(kdbg_status, sizeof(kdbg_status),
           		 "kdbg compat: misc=%d misc_err=%d major=%d\n",
@@ -1933,6 +1998,10 @@ jobs:
           		st.denied      = atomic64_read(&kdbg_stat.denied);
           		st.prctl_reads = atomic64_read(&kdbg_stat.prctl_reads);
           		st.prctl_writes = atomic64_read(&kdbg_stat.prctl_writes);
+          		st.sys_reads   = atomic64_read(&kdbg_stat.sys_reads);
+          		st.sys_writes  = atomic64_read(&kdbg_stat.sys_writes);
+          		st.mmaps       = atomic64_read(&kdbg_stat.mmaps);
+          		st.last_len    = atomic64_read(&kdbg_stat.last_len);
           		st.holder_pid  = atomic_read(&kdbg_stat.holder_pid);
           		st.last_pid    = atomic_read(&kdbg_stat.last_pid);
           		memcpy(st.holder_comm, kdbg_stat.holder_comm,
@@ -3023,6 +3092,10 @@ jobs:
               unsigned long long denied;
               unsigned long long prctl_reads;
               unsigned long long prctl_writes;
+              unsigned long long sys_reads;
+              unsigned long long sys_writes;
+              unsigned long long mmaps;
+              unsigned long long last_len;
               int  holder_pid;
               int  last_pid;
               char holder_comm[16];
@@ -3056,6 +3129,8 @@ jobs:
               printf("refused (no root)  : %llu\n", st.denied);
               printf("via prctl          : %llu reads / %llu writes\n",
                      st.prctl_reads, st.prctl_writes);
+              printf("plain read/write   : %llu / %llu   (%llu mmap, last size %llu)\n",
+                     st.sys_reads, st.sys_writes, st.mmaps, st.last_len);
               if (st.last_pid)
                   printf("last caller        : %s (pid %d)\n",
                          st.last_comm[0] ? st.last_comm : "?", st.last_pid);
@@ -3086,8 +3161,10 @@ jobs:
                   printf("a hack IS using the driver, through a node\n");
               else if (via_prctl)
                   printf("a hack IS using the driver, through prctl\n");
+              else if (st.opens && (st.sys_reads || st.sys_writes || st.mmaps))
+                  printf("a node is held and used by read/write/mmap, not ioctl\n");
               else if (st.opens)
-                  printf("something is holding a node but has not used it yet\n");
+                  printf("a node is HELD but idle - it is a token, not a data path\n");
               else if (st.total_opens)
                   printf("nodes were opened and let go - a hack tried and fell back\n");
               else
@@ -3102,7 +3179,19 @@ jobs:
               return 0;
           }
           
-          static int cmd_compat(void)
+          // Free Fire and Free Fire MAX are two packages and usually only one is running.
+          // Asking for "com.dts.freefireth" alone left the pid at -1 with MAX open (its
+          // loose prefix match sometimes caught it, sometimes not), so both are tried by
+          // their exact names, normal Free Fire first.
+          static int find_game(void)
+          {
+              int pid = find_pid("com.dts.freefireth");
+              if (pid < 0)
+                  pid = find_pid("com.dts.freefiremax");
+              return pid;
+          }
+          
+          static int cmd_compat(int pid)
           {
               std::string st = compat_status();
               int major = compat_major(st);
@@ -3113,7 +3202,6 @@ jobs:
               // Before the node test below, which opens all of them itself.
               print_usage_block();
           
-              int pid = find_pid("com.dts.freefireth");
               printf("pid        : %d\n", pid);
               if (!st.empty())
                   printf("driver     : %s", st.c_str());
@@ -3138,6 +3226,11 @@ jobs:
               printf("--- the rt-proc shape ---\n");
               printf("/proc/kvmstats          %s\n",
                      access("/proc/kvmstats", F_OK) == 0 ? "exists" : "missing");
+          
+              // The test above opened every node and handshaked with each one, so its own
+              // traffic is in the counters.  Hand the session back clean, or the next
+              // `who` describes this command instead of the hack you want to check.
+              towa(TOWA_OP_COMPAT, 1);
           
               return 0;
           }
@@ -3220,7 +3313,7 @@ jobs:
            */
           static int cmd_hunt(void)
           {
-              int pid = find_pid("com.dts.freefireth");
+              int pid = find_game();
               if (pid <= 0) { printf("the game is not running\n"); return 1; }
           
               /*
@@ -3305,7 +3398,7 @@ jobs:
            */
           static int cmd_report(void)
           {
-              int pid = find_pid("com.dts.freefireth");
+              int pid = find_game();
               int any = 0;
           
               for (int slot = 0; slot < 4; slot++) {
@@ -3603,7 +3696,7 @@ jobs:
               }
           
               if (cmd == "test") {
-                  int pid = a.size() > 1 ? atoi(a[1].c_str()) : find_pid("com.dts.freefireth");
+                  int pid = a.size() > 1 ? atoi(a[1].c_str()) : find_game();
                   return cmd_test(pid);
               }
           
@@ -3640,7 +3733,8 @@ jobs:
                       printf("  run a hack now\n");
                       return 0;
                   }
-                  return cmd_compat();
+                  int pid = a.size() > 1 ? resolve_pid(a[1].c_str()) : find_game();
+                  return cmd_compat(pid);
               }
           
               // Prove the whole mechanism on a page of our own, with nothing at stake.
@@ -3781,7 +3875,7 @@ jobs:
               // take the page it lives on, and watch that.  The address cannot be
               // remembered between runs - a reboot or a relaunch moves it.
               if (cmd == "watchstack") {
-                  int pid = find_pid("com.dts.freefireth");
+                  int pid = find_game();
                   if (pid <= 0) { printf("the game is not running\n"); return 1; }
           
                   int tid = pid;
