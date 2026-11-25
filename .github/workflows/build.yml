@@ -291,7 +291,8 @@ jobs:
           	unsigned long long	sys_writes;	/* plain write(2) on a node    */
           	unsigned long long	mmaps;		/* mmap(2) on a node           */
           	unsigned long long	last_len;	/* the size the last one asked */
-          	unsigned long long	xfer_fails;	/* reads/writes that came up short */
+          	unsigned long long	xfer_fails;	/* the client was told "no"	*/
+          	unsigned long long	xfer_holes;	/* pages not mapped, skipped	*/
           	unsigned long long	max_xfer;	/* the largest single transfer	*/
           	int			holder_pid;	/* the process holding a node	*/
           	int			last_pid;	/* the last process to ioctl	*/
@@ -1027,23 +1028,36 @@ jobs:
           	if (write)
           		gup_flags |= FOLL_WRITE;
           
+          	/*
+          	 * A read is best-effort; a write is not.
+          	 *
+          	 * get_user_pages_remote stops at the first page it cannot pin, so one
+          	 * dead page in the middle of a range used to cost the caller the whole
+          	 * range - it was told "no" and skipped data that was perfectly readable
+          	 * a page later.  That is what a flickering ESP is made of.  So when a
+          	 * batch hits a hole the copy drops to one page at a time and carries on
+          	 * past it: the caller gets everything that exists, the pages that do not
+          	 * are counted in xfer_holes, and the call still succeeds.
+          	 *
+          	 * A write keeps the strict behaviour.  Writing to a page that is not
+          	 * there cannot be quietly skipped - it would be a write that did not
+          	 * happen, reported as one that did.
+          	 */
+          	bool single = false;
+          
           	while (done < len) {
           		/*
           		 * The batch starts at the page that HOLDS addr + done, and that
           		 * first page is only partly usable - so the page count has to
           		 * include its offset.  Asking for ceil(chunk/PAGE_SIZE) there is
-          		 * one page short whenever the range crosses a page boundary, the
-          		 * copy then stops at the boundary, and the caller gets -EFAULT
-          		 * for memory that was perfectly readable.  That is what made a
-          		 * 3072-byte ESP read come back short and the overlay flicker:
-          		 * 71,800 short transfers in 5.45M reads.
-          		 *
-          		 * The chunk is shrunk by the same offset, so the batch still fits
-          		 * in pages[].
+          		 * one page short whenever the range crosses a page boundary, and
+          		 * the copy then stops at the boundary.
           		 */
           		unsigned long off0 = (addr + done) & ~PAGE_MASK;
-          		unsigned long chunk = min_t(unsigned long, len - done,
-          					    (unsigned long)KDBG_BATCH * PAGE_SIZE - off0);
+          		unsigned long chunk = single
+          			? PAGE_SIZE - off0
+          			: min_t(unsigned long, len - done,
+          				(unsigned long)KDBG_BATCH * PAGE_SIZE - off0);
           		int npages, i;
           		unsigned long off = 0;
           
@@ -1051,8 +1065,14 @@ jobs:
           					       DIV_ROUND_UP(off0 + chunk, PAGE_SIZE),
           					       gup_flags, pages, NULL, NULL);
           		if (npages <= 0) {
-          			ret = npages ? npages : -EFAULT;
-          			break;
+          			if (write) {
+          				ret = npages ? npages : -EFAULT;
+          				break;
+          			}
+          			atomic64_inc(&kdbg_stat.xfer_holes);
+          			single = true;
+          			done += chunk;
+          			continue;
           		}
           
           		for (i = 0; i < npages && off < chunk; i++) {
@@ -1090,8 +1110,18 @@ jobs:
           			break;
           
           		done += off;
-          		if (off < chunk)
-          			break;		/* short mapping - nothing more to reach */
+          		if (off < chunk) {
+          			/*
+          			 * The batch ran into a hole and stopped early.  A write
+          			 * cannot pretend, a read carries on page by page.
+          			 */
+          			if (write) {
+          				ret = -EFAULT;
+          				break;
+          			}
+          			atomic64_inc(&kdbg_stat.xfer_holes);
+          			single = true;
+          		}
           	}
           
           	mmput(mm);
@@ -1461,7 +1491,8 @@ jobs:
           	atomic64_t	sys_writes;	/* plain write(2) on a node	*/
           	atomic64_t	mmaps;		/* mmap(2) on a node		*/
           	atomic64_t	last_len;	/* the size the last one asked	*/
-          	atomic64_t	xfer_fails;	/* a read/write that came up short */
+          	atomic64_t	xfer_fails;	/* the client was told "no"	*/
+          	atomic64_t	xfer_holes;	/* pages not mapped, skipped	*/
           	atomic64_t	max_xfer;	/* the largest single transfer	*/
           	atomic_t	holder_pid;
           	atomic_t	last_pid;
@@ -1888,6 +1919,7 @@ jobs:
           	atomic64_set(&kdbg_stat.mmaps, 0);
           	atomic64_set(&kdbg_stat.last_len, 0);
           	atomic64_set(&kdbg_stat.xfer_fails, 0);
+          	atomic64_set(&kdbg_stat.xfer_holes, 0);
           	atomic64_set(&kdbg_stat.max_xfer, 0);
           	atomic_set(&kdbg_stat.last_pid, 0);
           	kdbg_stat.last_comm[0] = '\0';
@@ -2208,6 +2240,7 @@ jobs:
           		st.mmaps       = atomic64_read(&kdbg_stat.mmaps);
           		st.last_len    = atomic64_read(&kdbg_stat.last_len);
           		st.xfer_fails  = atomic64_read(&kdbg_stat.xfer_fails);
+          		st.xfer_holes  = atomic64_read(&kdbg_stat.xfer_holes);
           		st.max_xfer    = atomic64_read(&kdbg_stat.max_xfer);
           		st.holder_pid  = atomic_read(&kdbg_stat.holder_pid);
           		st.last_pid    = atomic_read(&kdbg_stat.last_pid);
@@ -3326,6 +3359,7 @@ jobs:
               unsigned long long mmaps;
               unsigned long long last_len;
               unsigned long long xfer_fails;
+              unsigned long long xfer_holes;
               unsigned long long max_xfer;
               int  holder_pid;
               int  last_pid;
@@ -3367,6 +3401,8 @@ jobs:
                      st.sys_reads, st.sys_writes, st.mmaps, st.last_len);
               printf("short transfers    : %llu   (biggest single %llu bytes)\n",
                      st.xfer_fails, st.max_xfer);
+              printf("unmapped pages hit : %llu   (skipped, the read still succeeded)\n",
+                     st.xfer_holes);
               if (st.last_pid)
                   printf("last caller        : %s (pid %d)\n",
                          st.last_comm[0] ? st.last_comm : "?", st.last_pid);
