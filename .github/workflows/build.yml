@@ -3311,6 +3311,80 @@ jobs:
            * it is in the foreground - so the watching has to happen while the terminal is
            * not on screen.  Arm now, play, then `towacli report`.
            */
+          // ------------------------------------------------- find a string in a process
+          //
+          // Hacks ship packed: the one on the phone has 300 readable strings in the file
+          // and not one of them is its driver protocol.  Packing is undone in memory, so
+          // the moment it runs its own "/dev/..." names, ioctl numbers and error messages
+          // are sitting in its data and its heap - and the driver can read them.  This
+          // walks the readable mappings, reads them and prints where the string lives.
+          static void print_window(const unsigned char *p, long from, long to,
+                                   unsigned long base)
+          {
+              printf("  0x%016lx  ", base + (unsigned long)from);
+              for (long i = from; i < to; i++) {
+                  unsigned char c = p[i];
+                  putchar((c >= 32 && c < 127) ? c : '.');
+              }
+              putchar('\n');
+          }
+          
+          static int cmd_scan(int pid, const char *needle)
+          {
+              if (pid <= 0) { printf("no pid - is that process running?\n"); return 1; }
+          
+              size_t nlen = strlen(needle);
+              if (!nlen) { printf("empty string\n"); return 1; }
+          
+              char path[64];
+              snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+              FILE *f = fopen(path, "r");
+              if (!f) { perror(path); return 1; }
+          
+              const long chunk = 256 * 1024;
+              std::vector<unsigned char> buf((size_t)chunk);
+              unsigned long long scanned = 0;
+              int hits = 0;
+              char line[512];
+          
+              printf("scanning pid %d for \"%s\" ...\n", pid, needle);
+          
+              while (hits < 40 && fgets(line, sizeof(line), f)) {
+                  unsigned long start = 0, end = 0;
+                  char perms[8] = {0};
+          
+                  if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
+                  if (perms[0] != 'r' || end <= start) continue;
+          
+                  for (unsigned long a = start; a < end && hits < 40; a += chunk) {
+                      unsigned long want = end - a;
+                      if (want > (unsigned long)chunk) want = (unsigned long)chunk;
+          
+                      long got = towa(TOWA_OP_READ, (unsigned long)pid, a,
+                                      (unsigned long)buf.data(), want);
+                      if (got <= 0) break;
+          
+                      scanned += (unsigned long long)got;
+          
+                      for (long i = 0; i + (long)nlen <= got; i++) {
+                          if (memcmp(&buf[(size_t)i], needle, nlen)) continue;
+          
+                          long from = (i - 48 < 0) ? 0 : i - 48;
+                          long to   = i + (long)nlen + 48;
+                          if (to > got) to = got;
+                          print_window(buf.data(), from, to, a);
+                          if (++hits >= 40) break;
+                      }
+          
+                      if ((unsigned long)got < want) break;
+                  }
+              }
+          
+              fclose(f);
+              printf("scan done: %llu bytes read, %d hit(s)\n", scanned, hits);
+              return hits ? 0 : 1;
+          }
+          
           static int cmd_hunt(void)
           {
               int pid = find_game();
@@ -3612,6 +3686,8 @@ jobs:
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
                   "  who                           IS a hack using the driver?  opens,\n"
                   "                                reads, writes, lookups, and who\n"
+                  "  scan <pid|name> <string>      find one of a packed hack's own strings\n"
+                  "                                in its memory, e.g. scan XuiModz /dev/\n"
                   "  pid <name>                    find a pid by process name\n"
                   "  kpm <pid> <hexaddr> <len>     read through the prctl family instead of a\n"
                   "                                node - needs root, and needs no /dev entry\n"
@@ -3706,6 +3782,17 @@ jobs:
               // One command, one answer: is anything actually driving the kernel side?
               if (cmd == "who")
                   return cmd_who();
+          
+              // For a packed hack: find one of its own strings in its own memory.
+              if (cmd == "scan") {
+                  if (a.size() < 3) {
+                      printf("usage: scan <pid|name> <string>\n"
+                             "  e.g. scan TelegramXuiModz DIT\n"
+                             "       scan TelegramXuiModz /dev/\n");
+                      return 2;
+                  }
+                  return cmd_scan(resolve_pid(a[1].c_str()), a[2].c_str());
+              }
           
               if (cmd == "compat") {
                   if (a.size() > 1 && (a[1] == "on" || a[1] == "off")) {
