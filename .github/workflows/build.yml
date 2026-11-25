@@ -250,6 +250,9 @@ jobs:
           	int			last_pid;	/* the last process to ioctl	*/
           	char			holder_comm[16];
           	char			last_comm[16];
+          	char			last_node[16];	/* which node the last ioctl hit */
+          	unsigned int		cmds[8];	/* ioctl request values seen	*/
+          	unsigned long long	cmd_hits[8];	/* 0xffffffff = slot unused	*/
           };
           
           /* a3 of KDBG_OP_HWBP_SET.  X = execute, i.e. call me at this address.
@@ -1355,7 +1358,42 @@ jobs:
           	atomic_t	last_pid;
           	char		holder_comm[TASK_COMM_LEN];
           	char		last_comm[TASK_COMM_LEN];
+          	char		last_node[TASK_COMM_LEN];
           } kdbg_stat;
+          
+          /*
+           * The ioctl request values themselves, whatever they are.
+           *
+           * A backend that finds a node, opens it and then walks away has told us the
+           * name is right and the next step is not: it sent a request we did not answer,
+           * or it sent nothing at all.  Those two look identical from the counters, and
+           * they are different problems - so the request values are recorded too, up to
+           * eight distinct ones, and an empty table means the mod never asked us anything.
+           */
+          #define KDBG_CMD_SLOTS	8
+          #define KDBG_CMD_UNUSED	0xffffffffU
+          
+          static unsigned int	kdbg_cmds[KDBG_CMD_SLOTS];
+          static atomic64_t	kdbg_cmd_hits[KDBG_CMD_SLOTS];
+          static atomic_t		kdbg_cmd_next = ATOMIC_INIT(0);
+          
+          static void kdbg_note_cmd(unsigned int cmd)
+          {
+          	int i;
+          	int n = atomic_read(&kdbg_cmd_next);
+          
+          	for (i = 0; i < KDBG_CMD_SLOTS; i++) {
+          		if (kdbg_cmds[i] == cmd) {
+          			atomic64_inc(&kdbg_cmd_hits[i]);
+          			return;
+          		}
+          	}
+          
+          	i = n % KDBG_CMD_SLOTS;		/* none matched: take the next slot */
+          	kdbg_cmds[i] = cmd;
+          	atomic64_set(&kdbg_cmd_hits[i], 1);
+          	atomic_set(&kdbg_cmd_next, n + 1);
+          }
           
           static void kdbg_note(atomic64_t *ctr)
           {
@@ -1374,6 +1412,16 @@ jobs:
           static long kdbg_compat_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
           {
           	void __user *uarg = (void __user *)arg;
+          	struct miscdevice *m = f ? f->private_data : NULL;
+          
+          	/*
+          	 * Every request, recognised or not, and the node it came to.  A mod that
+          	 * picked the wrong entry of its own menu shows up here as an opcode we
+          	 * do not answer, and that is a line to add rather than a mystery.
+          	 */
+          	kdbg_note_cmd(cmd);
+          	strlcpy(kdbg_stat.last_node, (m && m->name) ? m->name : "?",
+          		sizeof(kdbg_stat.last_node));
           
           	switch (cmd) {
           	case KDBG_IOCTL_INIT_KEY:
@@ -1469,6 +1517,15 @@ jobs:
           /* Counting only - nothing here ever takes a node away. */
           static int kdbg_compat_open(struct inode *ino, struct file *f)
           {
+          	/*
+          	 * The node's name comes from the file, not from private_data: which of
+          	 * them a mod picks is the whole question when it opens and then says
+          	 * nothing, and private_data is not guaranteed to be set this early.
+          	 */
+          	strlcpy(kdbg_stat.last_node,
+          		(const char *)f->f_path.dentry->d_name.name,
+          		sizeof(kdbg_stat.last_node));
+          
           	atomic64_inc(&kdbg_stat.opens);
           	atomic64_inc(&kdbg_stat.total_opens);
           	atomic_set(&kdbg_stat.holder_pid, task_tgid_vnr(current));
@@ -1563,7 +1620,7 @@ jobs:
           /* the pair the rest of the driver - and the syscall - actually uses */
           static int kdbg_compat_init(void)
           {
-          	int r;
+          	int r, i;
           
           	mutex_lock(&kdbg_compat_lock);
           	kdbg_compat_up();
@@ -1579,6 +1636,12 @@ jobs:
           	atomic64_set(&kdbg_stat.prctl_writes, 0);
           	atomic_set(&kdbg_stat.last_pid, 0);
           	kdbg_stat.last_comm[0] = '\0';
+          	kdbg_stat.last_node[0] = '\0';
+          	for (i = 0; i < KDBG_CMD_SLOTS; i++) {
+          		kdbg_cmds[i] = KDBG_CMD_UNUSED;
+          		atomic64_set(&kdbg_cmd_hits[i], 0);
+          	}
+          	atomic_set(&kdbg_cmd_next, 0);
           
           	r = (kdbg_misc_n || kdbg_chrdev_major)
           		? 0
@@ -1858,6 +1921,7 @@ jobs:
           
           	case KDBG_OP_COMPAT_STAT: {
           		struct kdbg_compat_stat st;
+          		int i;
           
           		memset(&st, 0, sizeof(st));
           		st.opens       = atomic64_read(&kdbg_stat.opens);
@@ -1874,6 +1938,11 @@ jobs:
           		memcpy(st.holder_comm, kdbg_stat.holder_comm,
           		       sizeof(st.holder_comm));
           		memcpy(st.last_comm, kdbg_stat.last_comm, sizeof(st.last_comm));
+          		memcpy(st.last_node, kdbg_stat.last_node, sizeof(st.last_node));
+          		for (i = 0; i < KDBG_CMD_SLOTS; i++) {
+          			st.cmds[i] = kdbg_cmds[i];
+          			st.cmd_hits[i] = atomic64_read(&kdbg_cmd_hits[i]);
+          		}
           
           		return copy_to_user((void __user *)a1, &st, sizeof(st))
           			? -EFAULT : 0;
@@ -2958,6 +3027,9 @@ jobs:
               int  last_pid;
               char holder_comm[16];
               char last_comm[16];
+              char last_node[16];
+              unsigned int cmds[8];
+              unsigned long long cmd_hits[8];
           };
           
           static bool print_usage_block(void)
@@ -2987,6 +3059,27 @@ jobs:
               if (st.last_pid)
                   printf("last caller        : %s (pid %d)\n",
                          st.last_comm[0] ? st.last_comm : "?", st.last_pid);
+              if (st.last_node[0])
+                  printf("last node touched  : /dev/%s\n", st.last_node);
+          
+              // The raw requests.  A mod that opened a node and then used an opcode we do
+              // not answer shows up here as a value that is not 0x800..0x803 or
+              // 0x100..0x103 - and that is a line to add to the driver, not a mystery.
+              bool any_cmd = false;
+              for (int i = 0; i < 8; i++)
+                  if (st.cmd_hits[i]) any_cmd = true;
+          
+              if (any_cmd) {
+                  printf("--- ioctls, as they arrived ---\n");
+                  printf("  ours: key 0x800, read 0x801, write 0x802, base 0x803,\n");
+                  printf("        bing: key 0x100, read 0x101, write 0x102, base 0x103\n");
+                  for (int i = 0; i < 8; i++)
+                      if (st.cmd_hits[i])
+                          printf("  0x%08x  x%llu\n", st.cmds[i], st.cmd_hits[i]);
+              } else if (st.total_opens) {
+                  printf("--- ioctls, as they arrived ---\n"
+                         "  none: the node was opened and closed with no request at all\n");
+              }
           
               printf("verdict            : ");
               if (via_node)
