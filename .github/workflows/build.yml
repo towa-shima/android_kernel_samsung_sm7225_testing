@@ -1379,13 +1379,13 @@ jobs:
            */
           #define KDBG_LINGER_S		30
           
-          static atomic_t kdbg_open_count = ATOMIC_INIT(0);
-          static DECLARE_DELAYED_WORK(kdbg_linger_work, kdbg_linger);
-          static DEFINE_MUTEX(kdbg_compat_lock);
-          
           static void kdbg_compat_up(void);
           static void kdbg_compat_down(void);
           static void kdbg_linger(struct work_struct *work);
+          
+          static atomic_t kdbg_open_count = ATOMIC_INIT(0);
+          static DECLARE_DELAYED_WORK(kdbg_linger_work, kdbg_linger);
+          static DEFINE_MUTEX(kdbg_compat_lock);
           
           static void kdbg_linger(struct work_struct *work)
           {
@@ -1522,9 +1522,9 @@ jobs:
            * The KPM/Neo family carries the same two operations in a struct through
            * prctl() instead of an ioctl on a node:
            *
-           *	prctl(0x4E41, 1 /* READ_MEM  *\/, &cmd, 0, 0);
-           *	prctl(0x4E41, 2 /* WRITE_MEM *\/, &cmd, 0, 0);
-           *	prctl(0x4E41, 5 /* GET_PID   *\/, &cmd, 0, 0);
+           *	prctl(0x4E41, 1, &cmd, 0, 0);	-- read
+           *	prctl(0x4E41, 2, &cmd, 0, 0);	-- write
+           *	prctl(0x4E41, 5, &cmd, 0, 0);	-- get pid, the probe
            *
            * Layout must match struct na_cmd in the client header byte for byte.
            *
