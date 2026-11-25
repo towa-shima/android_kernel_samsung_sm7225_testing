@@ -291,6 +291,8 @@ jobs:
           	unsigned long long	sys_writes;	/* plain write(2) on a node    */
           	unsigned long long	mmaps;		/* mmap(2) on a node           */
           	unsigned long long	last_len;	/* the size the last one asked */
+          	unsigned long long	xfer_fails;	/* reads/writes that came up short */
+          	unsigned long long	max_xfer;	/* the largest single transfer	*/
           	int			holder_pid;	/* the process holding a node	*/
           	int			last_pid;	/* the last process to ioctl	*/
           	char			holder_comm[16];
@@ -350,7 +352,15 @@ jobs:
           
           #define KDBG_WATCH_SLOTS	4
           
-          #define KDBG_MAX_XFER		(1024 * 1024)
+          /*
+           * The largest single transfer, in bytes.
+           *
+           * It used to be 1 MB, which is fine for a client that reads a field at a time
+           * and wrong for one that pulls a whole table in one call: that got -EINVAL and
+           * the client had no way to tell a refused size from a bad address.  The copy
+           * loops internally, so raising it costs nothing but the caller's own buffer.
+           */
+          #define KDBG_MAX_XFER		(32 * 1024 * 1024)
           
           /* kdbg_watch_info.flags */
           #define KDBG_WF_ARMED	0x0001
@@ -1437,6 +1447,8 @@ jobs:
           	atomic64_t	sys_writes;	/* plain write(2) on a node	*/
           	atomic64_t	mmaps;		/* mmap(2) on a node		*/
           	atomic64_t	last_len;	/* the size the last one asked	*/
+          	atomic64_t	xfer_fails;	/* a read/write that came up short */
+          	atomic64_t	max_xfer;	/* the largest single transfer	*/
           	atomic_t	holder_pid;
           	atomic_t	last_pid;
           	char		holder_comm[TASK_COMM_LEN];
@@ -1548,6 +1560,22 @@ jobs:
           	kdbg_note(NULL);
           }
           
+          /*
+           * A transfer that did not come back whole.
+           *
+           * A hack that reads eight bytes at a time and gets -EFAULT on some of them
+           * shows it as stutter, not as an error - which is why it is counted here and
+           * not left to be guessed at.  `max_xfer` is there to catch the other failure
+           * mode: a client asking for one big block and being refused for size.
+           */
+          static void kdbg_xfer_note(unsigned long len, bool ok)
+          {
+          	if (!ok)
+          		atomic64_inc(&kdbg_stat.xfer_fails);
+          	if (len > atomic64_read(&kdbg_stat.max_xfer))
+          		atomic64_set(&kdbg_stat.max_xfer, len);
+          }
+          
           static long kdbg_compat_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
           {
           	void __user *uarg = (void __user *)arg;
@@ -1586,6 +1614,7 @@ jobs:
           			return -EINVAL;
           
           		r = kdbg_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, false);
+          		kdbg_xfer_note(cm.size, r == (long)cm.size);
           		return r == (long)cm.size ? 0 : (r < 0 ? r : -EFAULT);
           	}
           
@@ -1606,6 +1635,7 @@ jobs:
           			return -EINVAL;
           
           		r = kdbg_rw(cm.pid, cm.addr, (void __user *)cm.buffer, cm.size, true);
+          		kdbg_xfer_note(cm.size, r == (long)cm.size);
           		return r == (long)cm.size ? 0 : (r < 0 ? r : -EFAULT);
           	}
           
@@ -1843,6 +1873,8 @@ jobs:
           	atomic64_set(&kdbg_stat.sys_writes, 0);
           	atomic64_set(&kdbg_stat.mmaps, 0);
           	atomic64_set(&kdbg_stat.last_len, 0);
+          	atomic64_set(&kdbg_stat.xfer_fails, 0);
+          	atomic64_set(&kdbg_stat.max_xfer, 0);
           	atomic_set(&kdbg_stat.last_pid, 0);
           	kdbg_stat.last_comm[0] = '\0';
           	kdbg_stat.last_node[0] = '\0';
@@ -2076,10 +2108,18 @@ jobs:
           	case KDBG_OP_PING:
           		return KDBG_MAGIC;
           
-          	case KDBG_OP_READ:
-          		return kdbg_rw((pid_t)a1, a2, (void __user *)a3, a4, false);
-          	case KDBG_OP_WRITE:
-          		return kdbg_rw((pid_t)a1, a2, (void __user *)a3, a4, true);
+          	case KDBG_OP_READ: {
+          		long r = kdbg_rw((pid_t)a1, a2, (void __user *)a3, a4, false);
+          
+          		kdbg_xfer_note(a4, r == (long)a4);
+          		return r;
+          	}
+          	case KDBG_OP_WRITE: {
+          		long r = kdbg_rw((pid_t)a1, a2, (void __user *)a3, a4, true);
+          
+          		kdbg_xfer_note(a4, r == (long)a4);
+          		return r;
+          	}
           
           	case KDBG_OP_BASE: {
           		unsigned long b = 0;
@@ -2153,6 +2193,8 @@ jobs:
           		st.sys_writes  = atomic64_read(&kdbg_stat.sys_writes);
           		st.mmaps       = atomic64_read(&kdbg_stat.mmaps);
           		st.last_len    = atomic64_read(&kdbg_stat.last_len);
+          		st.xfer_fails  = atomic64_read(&kdbg_stat.xfer_fails);
+          		st.max_xfer    = atomic64_read(&kdbg_stat.max_xfer);
           		st.holder_pid  = atomic_read(&kdbg_stat.holder_pid);
           		st.last_pid    = atomic_read(&kdbg_stat.last_pid);
           		memcpy(st.holder_comm, kdbg_stat.holder_comm,
@@ -3269,6 +3311,8 @@ jobs:
               unsigned long long sys_writes;
               unsigned long long mmaps;
               unsigned long long last_len;
+              unsigned long long xfer_fails;
+              unsigned long long max_xfer;
               int  holder_pid;
               int  last_pid;
               char holder_comm[16];
@@ -3307,6 +3351,8 @@ jobs:
                      st.prctl_reads, st.prctl_writes, st.prctl_probes);
               printf("plain read/write   : %llu / %llu   (%llu mmap, last size %llu)\n",
                      st.sys_reads, st.sys_writes, st.mmaps, st.last_len);
+              printf("short transfers    : %llu   (biggest single %llu bytes)\n",
+                     st.xfer_fails, st.max_xfer);
               if (st.last_pid)
                   printf("last caller        : %s (pid %d)\n",
                          st.last_comm[0] ? st.last_comm : "?", st.last_pid);
