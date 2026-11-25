@@ -159,11 +159,51 @@ jobs:
 
       - name: Toolchain - aarch64-linux-android-4.9
         run: |
-          mkdir -p "$HOME/aarch64-linux-android-4.9"
-          curl -fsSL \
-            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android11-release.tar.gz" \
-            | tar -xz -C "$HOME/aarch64-linux-android-4.9"
-          ls "$HOME/aarch64-linux-android-4.9/bin" | head
+          set -e
+          D="$HOME/aarch64-linux-android-4.9"
+
+          # googlesource hands out 503s under load, and this step used to pipe
+          # curl straight into tar: one bad response killed the build, and the
+          # error surfaced as "gzip: unexpected end of file", which reads like
+          # a bad archive instead of a bad download.
+          #
+          # Same shape as the clang step below: download to a file, prove it is
+          # a real gzip, then try the mirrors and the strip depths - and prove
+          # success by the compiler being executable, not by tar's exit status.
+          fetch() {
+            url="$1"; shift
+            echo "=== trying: $url"
+            curl -fSL --retry 6 --retry-delay 5 --retry-all-errors \
+                 --connect-timeout 30 --no-progress-meter \
+                 -o /tmp/gcc.tar.gz "$url" || { echo "  download failed"; return 1; }
+            echo "  downloaded: $(stat -c%s /tmp/gcc.tar.gz) bytes"
+            gzip -t /tmp/gcc.tar.gz 2>/dev/null || { echo "  not a gzip - discarding"; return 1; }
+
+            for n in "$@"; do
+              rm -rf "$D" && mkdir -p "$D"
+              if ! tar -xzf /tmp/gcc.tar.gz -C "$D" --strip-components="$n"; then
+                echo "  strip=$n: extract failed, trying the next depth"
+                continue
+              fi
+              if [ -x "$D/bin/aarch64-linux-android-gcc" ]; then
+                echo "  OK with --strip-components=$n"
+                "$D/bin/aarch64-linux-android-gcc" --version | head -1 || return 1
+                rm -f /tmp/gcc.tar.gz
+                return 0
+              fi
+              echo "  strip=$n: no aarch64-linux-android-gcc; what came out was:"
+              ls "$D" | head -6
+            done
+            return 1
+          }
+
+          fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android11-release.tar.gz" 0 1 \
+          || fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/master.tar.gz" 0 1 \
+          || fetch "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/lineage-19.1.tar.gz" 1 0 \
+          || fetch "https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9/archive/refs/heads/lineage-18.1.tar.gz" 1 0 \
+          || { echo "ALL GCC SOURCES FAILED - no mirror yielded aarch64-linux-android-gcc"; df -h /; exit 1; }
+
+          ls "$D/bin" | head
 
       # ------------------------------------------------------- the kdbg source
       # The four files are written here so this workflow stays a single upload.
