@@ -2423,7 +2423,7 @@ jobs:
               "\t\t\treturn kdbg_r;\n"
               "\t}\n\n")
           
-          if 'KDBG_PRCTL_MAGIC' in src:
+          if 'kdbg_prctl_entry' in src:
               print('already forwarded')
           elif OLD in src:
               src = src.replace(OLD, NEW, 1)
@@ -2434,7 +2434,7 @@ jobs:
           PYPRCTL
           
           echo "--- what the prctl entry now does ---"
-          grep -n -B2 -A6 'KDBG_PRCTL_MAGIC' "$F"
+          grep -n -B2 -A6 'kdbg_prctl_entry' "$F" || echo "(the call is not there - check the patch above)"
       - name: Add the kdbg syscall number
         working-directory: ${{ github.workspace }}/kernel
         run: |
