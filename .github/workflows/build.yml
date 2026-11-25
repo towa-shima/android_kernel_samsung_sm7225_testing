@@ -224,6 +224,32 @@ jobs:
           	 * unless asked for.  Nothing else here is visible at rest.
           	 */
           	KDBG_OP_COMPAT     = 11,/* a1=0 off / 1 on -> nodes registered	*/
+          
+          	/*
+          	 * Is anything actually using the nodes?  Answers the only question that
+          	 * matters once a hack is running: it opened one, yes or no, and did it
+          	 * then read, write and look up a module through us - or did it open,
+          	 * shrug and fall back to process_vm_readv?  The counters start again at
+          	 * every `compat on`; `opens` is live and never reset, so a handle nobody
+          	 * closed stays visible.
+          	 */
+          	KDBG_OP_COMPAT_STAT = 12,/* a1=&struct kdbg_compat_stat -> 0		*/
+          };
+          
+          struct kdbg_compat_stat {
+          	unsigned long long	opens;		/* nodes open right now		*/
+          	unsigned long long	total_opens;	/* opens since `compat on`	*/
+          	unsigned long long	keys;		/* initKey handshakes		*/
+          	unsigned long long	reads;
+          	unsigned long long	writes;
+          	unsigned long long	bases;		/* module-base lookups		*/
+          	unsigned long long	denied;		/* refused: no CAP_SYS_PTRACE	*/
+          	unsigned long long	prctl_reads;	/* the same driver, reached    */
+          	unsigned long long	prctl_writes;	/* through prctl instead       */
+          	int			holder_pid;	/* the process holding a node	*/
+          	int			last_pid;	/* the last process to ioctl	*/
+          	char			holder_comm[16];
+          	char			last_comm[16];
           };
           
           /* a3 of KDBG_OP_HWBP_SET.  X = execute, i.e. call me at this address.
@@ -1305,6 +1331,46 @@ jobs:
           	uintptr_t	base;
           };
           
+          /*
+           * Who is using it.
+           *
+           * From the outside, a hack that drives this driver and a hack that opened a
+           * node, gave up and fell back to process_vm_readv look exactly the same: both
+           * leave a node open for a moment and both read the game either way.  The
+           * difference only exists in here, so it is counted in here - opens, the key
+           * handshake, and then the reads, writes and module lookups that follow.
+           * Nothing is inferred: if the counters are zero, nothing used us.
+           */
+          static struct {
+          	atomic64_t	opens;		/* nodes open right now		*/
+          	atomic64_t	total_opens;
+          	atomic64_t	keys;
+          	atomic64_t	reads;
+          	atomic64_t	writes;
+          	atomic64_t	bases;
+          	atomic64_t	denied;		/* refused: no CAP_SYS_PTRACE	*/
+          	atomic64_t	prctl_reads;
+          	atomic64_t	prctl_writes;
+          	atomic_t	holder_pid;
+          	atomic_t	last_pid;
+          	char		holder_comm[TASK_COMM_LEN];
+          	char		last_comm[TASK_COMM_LEN];
+          } kdbg_stat;
+          
+          static void kdbg_note(atomic64_t *ctr)
+          {
+          	if (ctr)
+          		atomic64_inc(ctr);
+          	atomic_set(&kdbg_stat.last_pid, task_tgid_vnr(current));
+          	strlcpy(kdbg_stat.last_comm, current->comm, TASK_COMM_LEN);
+          }
+          
+          static void kdbg_note_denied(void)
+          {
+          	atomic64_inc(&kdbg_stat.denied);
+          	kdbg_note(NULL);
+          }
+          
           static long kdbg_compat_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
           {
           	void __user *uarg = (void __user *)arg;
@@ -1313,12 +1379,16 @@ jobs:
           	case KDBG_IOCTL_INIT_KEY:
           	case KDBG_IOCTL_BING_KEY:
           		/* any key, any length, even none */
+          		kdbg_note(&kdbg_stat.keys);
           		return 0;
           
           	case KDBG_IOCTL_READ_MEM:
           	case KDBG_IOCTL_BING_READ: {
-          		if (!kdbg_allowed())
+          		if (!kdbg_allowed()) {
+          			kdbg_note_denied();
           			return -EPERM;
+          		}
+          		kdbg_note(&kdbg_stat.reads);
           
           		struct kdbg_copy_memory cm;
           		long r;
@@ -1334,8 +1404,11 @@ jobs:
           
           	case KDBG_IOCTL_WRITE_MEM:
           	case KDBG_IOCTL_BING_WRITE: {
-          		if (!kdbg_allowed())
+          		if (!kdbg_allowed()) {
+          			kdbg_note_denied();
           			return -EPERM;
+          		}
+          		kdbg_note(&kdbg_stat.writes);
           
           		struct kdbg_copy_memory cm;
           		long r;
@@ -1351,8 +1424,11 @@ jobs:
           
           	case KDBG_IOCTL_MODULE_BASE:
           	case KDBG_IOCTL_BING_BASE: {
-          		if (!kdbg_allowed())
+          		if (!kdbg_allowed()) {
+          			kdbg_note_denied();
           			return -EPERM;
+          		}
+          		kdbg_note(&kdbg_stat.bases);
           
           		struct kdbg_module_base mb;
           		unsigned long base = 0;
@@ -1377,47 +1453,34 @@ jobs:
           }
           
           /*
-           * The nodes tidy themselves up.
+           * The nodes stay until they are taken away.
            *
-           * Nothing in the driver knows whether a hack is still running, so instead of
-           * waiting for someone to remember `compat off`, every open and close is
-           * counted: when the last client lets go, a timer starts, and if nothing opens
-           * a node again before it expires the whole set is taken away.  The linger
-           * matters - clients often open, validate, close and reopen while the game
-           * loads, and tearing the nodes down in one of those gaps would break them.
+           * They used to tidy themselves up: every open and close was counted, and a
+           * timer removed the whole set once nothing had held it for 30 seconds.  That
+           * was wrong for how these hacks behave - a client opens a node, validates,
+           * closes it, and comes back later - so the set vanished underneath a mod that
+           * was still working, and "driver not found" was all it could say.  Now they
+           * live from `compat on` to `compat off`, and nothing between.
            */
-          #define KDBG_LINGER_S		30
-          
           static void kdbg_compat_up(void);
           static void kdbg_compat_down(void);
-          static void kdbg_linger(struct work_struct *work);
-          
-          static atomic_t kdbg_open_count = ATOMIC_INIT(0);
-          static DECLARE_DELAYED_WORK(kdbg_linger_work, kdbg_linger);
           static DEFINE_MUTEX(kdbg_compat_lock);
           
-          static void kdbg_linger(struct work_struct *work)
-          {
-          	mutex_lock(&kdbg_compat_lock);
-          	if (atomic_read(&kdbg_open_count) == 0)
-          		kdbg_compat_down();
-          	mutex_unlock(&kdbg_compat_lock);
-          }
-          
+          /* Counting only - nothing here ever takes a node away. */
           static int kdbg_compat_open(struct inode *ino, struct file *f)
           {
-          	mutex_lock(&kdbg_compat_lock);
-          	atomic_inc(&kdbg_open_count);
-          	cancel_delayed_work(&kdbg_linger_work);
-          	mutex_unlock(&kdbg_compat_lock);
+          	atomic64_inc(&kdbg_stat.opens);
+          	atomic64_inc(&kdbg_stat.total_opens);
+          	atomic_set(&kdbg_stat.holder_pid, task_tgid_vnr(current));
+          	strlcpy(kdbg_stat.holder_comm, current->comm, TASK_COMM_LEN);
+          	kdbg_note(NULL);
           
           	return 0;
           }
           
           static int kdbg_compat_release(struct inode *ino, struct file *f)
           {
-          	if (atomic_dec_and_test(&kdbg_open_count))
-          		schedule_delayed_work(&kdbg_linger_work, KDBG_LINGER_S * HZ);
+          	atomic64_dec(&kdbg_stat.opens);
           
           	return 0;
           }
@@ -1457,11 +1520,8 @@ jobs:
           }
           
           /*
-           * The status file has no open/release of its own on purpose.  Those two drive
-           * the linger, and the linger is about a hack holding a node: if reading the
-           * status counted as a client, then `towacli compat on` - which reads it to find
-           * out what happened - would start the 30-second countdown against itself, and
-           * the nodes would go away while the game was still loading.
+           * The status file answers one thing only: what the last `compat on` managed.
+           * It has no ioctl, so nothing can be handed to it by mistake for a real node.
            */
           static const struct file_operations kdbg_status_fops = {
           	.owner		= THIS_MODULE,
@@ -1506,8 +1566,20 @@ jobs:
           	int r;
           
           	mutex_lock(&kdbg_compat_lock);
-          	cancel_delayed_work(&kdbg_linger_work);
           	kdbg_compat_up();
+          
+          	/* a new session, a new count - but never `opens`, which is live */
+          	atomic64_set(&kdbg_stat.total_opens, 0);
+          	atomic64_set(&kdbg_stat.keys, 0);
+          	atomic64_set(&kdbg_stat.reads, 0);
+          	atomic64_set(&kdbg_stat.writes, 0);
+          	atomic64_set(&kdbg_stat.bases, 0);
+          	atomic64_set(&kdbg_stat.denied, 0);
+          	atomic64_set(&kdbg_stat.prctl_reads, 0);
+          	atomic64_set(&kdbg_stat.prctl_writes, 0);
+          	atomic_set(&kdbg_stat.last_pid, 0);
+          	kdbg_stat.last_comm[0] = '\0';
+          
           	r = (kdbg_misc_n || kdbg_chrdev_major)
           		? 0
           		: (kdbg_misc_err ? kdbg_misc_err : -ENODEV);
@@ -1519,7 +1591,6 @@ jobs:
           static void kdbg_compat_cleanup(void)
           {
           	mutex_lock(&kdbg_compat_lock);
-          	cancel_delayed_work_sync(&kdbg_linger_work);
           	kdbg_compat_down();
           	mutex_unlock(&kdbg_compat_lock);
           }
@@ -1681,8 +1752,10 @@ jobs:
           		 * before it takes root and its DIT option stops being found.
           		 */
           #if !KDBG_PROBE_ANYONE
-          		if (!kdbg_allowed())
+          		if (!kdbg_allowed()) {
+          			kdbg_note_denied();
           			return -EINVAL;
+          		}
           #endif
           		h.pid = current->tgid;
           		h.result = 0;
@@ -1690,8 +1763,12 @@ jobs:
           
           	case KDBG_NA_CMD_READ:
           	case KDBG_NA_CMD_WRITE:
-          		if (!kdbg_allowed())
+          		if (!kdbg_allowed()) {
+          			kdbg_note_denied();
           			return -EPERM;
+          		}
+          		kdbg_note(cmd == KDBG_NA_CMD_WRITE ? &kdbg_stat.prctl_writes
+          						  : &kdbg_stat.prctl_reads);
           		if (!h.size || h.size > KDBG_NA_MAX_RW) {
           			h.result = -EINVAL;
           			break;
@@ -1778,6 +1855,29 @@ jobs:
           			return kdbg_compat_init();
           		kdbg_compat_cleanup();
           		return 0;
+          
+          	case KDBG_OP_COMPAT_STAT: {
+          		struct kdbg_compat_stat st;
+          
+          		memset(&st, 0, sizeof(st));
+          		st.opens       = atomic64_read(&kdbg_stat.opens);
+          		st.total_opens = atomic64_read(&kdbg_stat.total_opens);
+          		st.keys        = atomic64_read(&kdbg_stat.keys);
+          		st.reads       = atomic64_read(&kdbg_stat.reads);
+          		st.writes      = atomic64_read(&kdbg_stat.writes);
+          		st.bases       = atomic64_read(&kdbg_stat.bases);
+          		st.denied      = atomic64_read(&kdbg_stat.denied);
+          		st.prctl_reads = atomic64_read(&kdbg_stat.prctl_reads);
+          		st.prctl_writes = atomic64_read(&kdbg_stat.prctl_writes);
+          		st.holder_pid  = atomic_read(&kdbg_stat.holder_pid);
+          		st.last_pid    = atomic_read(&kdbg_stat.last_pid);
+          		memcpy(st.holder_comm, kdbg_stat.holder_comm,
+          		       sizeof(st.holder_comm));
+          		memcpy(st.last_comm, kdbg_stat.last_comm, sizeof(st.last_comm));
+          
+          		return copy_to_user((void __user *)a1, &st, sizeof(st))
+          			? -EFAULT : 0;
+          	}
           
           	default:
           		return -EINVAL;
@@ -2368,6 +2468,7 @@ jobs:
               TOWA_OP_WATCH_STAT = 9,
               TOWA_OP_WATCH_OFF  = 10,
               TOWA_OP_COMPAT     = 11,
+              TOWA_OP_COMPAT_STAT = 12,
           };
           
           #define TOWA_BP_X 0
@@ -2835,6 +2936,79 @@ jobs:
               }
           }
           
+          // ------------------------------------------------------- is anything using it
+          //
+          // The one question the outside world cannot answer.  A hack that drives the
+          // driver and a hack that opened a node, gave up and fell back to
+          // process_vm_readv look identical from /proc: both hold a node for a moment,
+          // both read the game either way.  Only the driver's own counters tell them
+          // apart, so it counts, and this prints what it counted.
+          
+          struct towa_compat_stat {
+              unsigned long long opens;
+              unsigned long long total_opens;
+              unsigned long long keys;
+              unsigned long long reads;
+              unsigned long long writes;
+              unsigned long long bases;
+              unsigned long long denied;
+              unsigned long long prctl_reads;
+              unsigned long long prctl_writes;
+              int  holder_pid;
+              int  last_pid;
+              char holder_comm[16];
+              char last_comm[16];
+          };
+          
+          static bool print_usage_block(void)
+          {
+              struct towa_compat_stat st;
+              memset(&st, 0, sizeof(st));
+          
+              long r = towa(TOWA_OP_COMPAT_STAT, (unsigned long)&st);
+              if (r < 0) { perr("usage", r); return false; }
+          
+              bool via_node  = st.reads || st.writes || st.bases;
+              bool via_prctl = st.prctl_reads || st.prctl_writes;
+          
+              printf("--- is anything using it? ---\n");
+              printf("open right now     : %llu", st.opens);
+              if (st.opens)
+                  printf("   by %s (pid %d)",
+                         st.holder_comm[0] ? st.holder_comm : "?", st.holder_pid);
+              printf("\n");
+              printf("opened since on    : %llu\n", st.total_opens);
+              printf("key handshakes     : %llu\n", st.keys);
+              printf("reads / writes     : %llu / %llu\n", st.reads, st.writes);
+              printf("module lookups     : %llu\n", st.bases);
+              printf("refused (no root)  : %llu\n", st.denied);
+              printf("via prctl          : %llu reads / %llu writes\n",
+                     st.prctl_reads, st.prctl_writes);
+              if (st.last_pid)
+                  printf("last caller        : %s (pid %d)\n",
+                         st.last_comm[0] ? st.last_comm : "?", st.last_pid);
+          
+              printf("verdict            : ");
+              if (via_node)
+                  printf("a hack IS using the driver, through a node\n");
+              else if (via_prctl)
+                  printf("a hack IS using the driver, through prctl\n");
+              else if (st.opens)
+                  printf("something is holding a node but has not used it yet\n");
+              else if (st.total_opens)
+                  printf("nodes were opened and let go - a hack tried and fell back\n");
+              else
+                  printf("nothing has used the driver since compat on\n");
+          
+              return via_node || via_prctl;
+          }
+          
+          static int cmd_who(void)
+          {
+              print_usage_block();
+              return 0;
+          }
+          
           static int cmd_compat(void)
           {
               std::string st = compat_status();
@@ -2842,6 +3016,9 @@ jobs:
           
               if (major > 0)
                   compat_nodes(major, false);         // ours to make, so make them
+          
+              // Before the node test below, which opens all of them itself.
+              print_usage_block();
           
               int pid = find_pid("com.dts.freefireth");
               printf("pid        : %d\n", pid);
@@ -3247,6 +3424,8 @@ jobs:
                   "                                are the only visible part of this driver\n"
                   "  compat                        the same thing a scene hack does, through\n"
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
+                  "  who                           IS a hack using the driver?  opens,\n"
+                  "                                reads, writes, lookups, and who\n"
                   "  pid <name>                    find a pid by process name\n"
                   "  kpm <pid> <hexaddr> <len>     read through the prctl family instead of a\n"
                   "                                node - needs root, and needs no /dev entry\n"
@@ -3338,6 +3517,10 @@ jobs:
               // The device nodes are the only thing this driver leaves lying around, so
               // they are off unless asked for.  On when a hack is about to run, off again
               // after: nothing in /dev, /sys or /proc while they are not needed.
+              // One command, one answer: is anything actually driving the kernel side?
+              if (cmd == "who")
+                  return cmd_who();
+          
               if (cmd == "compat") {
                   if (a.size() > 1 && (a[1] == "on" || a[1] == "off")) {
                       bool on = (a[1] == "on");
