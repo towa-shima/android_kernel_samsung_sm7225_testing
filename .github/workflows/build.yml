@@ -346,6 +346,11 @@ jobs:
           typedef long (*kdbg_prctl_t)(unsigned long cmd, void __user *arg);
           void kdbg_set_prctl(kdbg_prctl_t fn);
           
+          /* The prctl watcher, see include/linux/kdbg.h.  Spelled out rather than named
+           * through a typedef, because kdbg_syscall.c sees this header and that one, and
+           * a typedef defined in both is a redefinition error under gnu89. */
+          void kdbg_set_prctl_note(void (*fn)(int option));
+          
           /* What kdbg_syscall.c holds and calls. */
           typedef long (*kdbg_handler_t)(unsigned long op, unsigned long a1,
           			       unsigned long a2, unsigned long a3,
@@ -425,7 +430,7 @@ jobs:
           /* ---------------------------------------------------------------- prctl ---- */
           
           static kdbg_prctl_t kdbg_prctl_fn __read_mostly;
-          static kdbg_prctl_note_t kdbg_prctl_note_fn __read_mostly;
+          static void (*kdbg_prctl_note_fn)(int option) __read_mostly;
           
           void kdbg_set_prctl(kdbg_prctl_t fn)
           {
@@ -440,7 +445,7 @@ jobs:
            * as the syscall front end: nothing but "call the registered handler", so the
            * prctl path costs a single predictable branch for every other caller.
            */
-          void kdbg_set_prctl_note(kdbg_prctl_note_t fn)
+          void kdbg_set_prctl_note(void (*fn)(int option))
           {
           	mutex_lock(&kdbg_mutex);
           	kdbg_prctl_note_fn = fn;
@@ -882,6 +887,8 @@ jobs:
           #include <linux/highmem.h>
           #include <linux/capability.h>
           #include <linux/workqueue.h>
+          
+          #include <linux/kdbg.h>	/* KDBG_PRCTL_MAGIC, and the fault-path hook */
           
           #include "kdbg.h"
           
@@ -2220,9 +2227,7 @@ jobs:
            * observes only: no return value, no side effect, and libc's own options
            * (all small numbers) are filtered out before they reach it.
            */
-          typedef void (*kdbg_prctl_note_t)(int option);
-          
-          void kdbg_set_prctl_note(kdbg_prctl_note_t fn);
+          void kdbg_set_prctl_note(void (*fn)(int option));
           
           #endif /* _LINUX_KDBG_WATCH_H */
           TW_I
