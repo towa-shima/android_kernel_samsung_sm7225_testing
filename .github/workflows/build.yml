@@ -1265,8 +1265,17 @@ jobs:
            *
            * Set KDBG_COMPAT to 0 when you want no device nodes at all.
            */
-          #define KDBG_COMPAT_DEVS "wanbai,CheckMe,Ckanri,lanran,video188,bing"
+          /*
+           * The names the scene hacks hunt for.  Two families: wanbai.h scans /dev for
+           * its five, and the Bing backend tries its six in order.  One node per name
+           * costs a /dev entry and nothing else, and any of them lands on this driver -
+           * which is what makes an unmodified hack work by picking its own menu entry.
+           */
+          #define KDBG_COMPAT_DEVS \
+          	"wanbai,CheckMe,Ckanri,lanran,video188,bing,"      \
+          	"ft_driver,bing_rw,Bing_rw,Bing,w1a3n3a7n"
           #define KDBG_COMPAT_PROC "kvmstats"
+          #define KDBG_COMPAT_CHRDEV "kdbg"
           
           #define KDBG_IOCTL_INIT_KEY	0x800
           #define KDBG_IOCTL_READ_MEM	0x801
@@ -1413,15 +1422,62 @@ jobs:
           	return 0;
           }
           
+          /*
+           * What the last `compat on` actually managed, on the proc entry and readable
+           * from the nodes.  It exists because the outside world had no way to tell a
+           * registration that worked from one that quietly did not: the syscall used to
+           * answer 0 either way, and so did the client.
+           *
+           *	misc=<n>       how many nodes the kernel made itself
+           *	misc_err=<e>   what misc_register() said when it would not
+           *	major=<m>      the fallback's major, 0 when the fallback was not needed
+           *
+           * When major is not 0 the kernel could not create the nodes at all - that is
+           * device_create() refusing, not the minor pool - and the client makes them with
+           * mknod, the way the scene hacks that ship one already do.
+           */
+          static char kdbg_status[128];
+          
+          static ssize_t kdbg_status_read(struct file *f, char __user *buf, size_t len,
+          				loff_t *off)
+          {
+          	size_t n;
+          
+          	if (*off)
+          		return 0;
+          
+          	n = strlen(kdbg_status);
+          	if (n > len)
+          		n = len;
+          	if (n && copy_to_user(buf, kdbg_status, n))
+          		return -EFAULT;
+          	*off += n;
+          
+          	return n;
+          }
+          
+          /*
+           * The status file has no open/release of its own on purpose.  Those two drive
+           * the linger, and the linger is about a hack holding a node: if reading the
+           * status counted as a client, then `towacli compat on` - which reads it to find
+           * out what happened - would start the 30-second countdown against itself, and
+           * the nodes would go away while the game was still loading.
+           */
+          static const struct file_operations kdbg_status_fops = {
+          	.owner		= THIS_MODULE,
+          	.read		= kdbg_status_read,
+          };
+          
           static const struct file_operations kdbg_compat_fops = {
           	.owner		= THIS_MODULE,
           	.open		= kdbg_compat_open,
           	.release	= kdbg_compat_release,
+          	.read		= kdbg_status_read,
           	.unlocked_ioctl	= kdbg_compat_ioctl,
           	.compat_ioctl	= kdbg_compat_ioctl,
           };
           
-          #define KDBG_COMPAT_MAX	8
+          #define KDBG_COMPAT_MAX	12
           
           /*
            * 0 = do not create the device nodes at load.  They are the only part of this
@@ -1441,19 +1497,23 @@ jobs:
           static char kdbg_misc_name[KDBG_COMPAT_MAX][32];
           static int kdbg_misc_n;
           static struct proc_dir_entry *kdbg_proc;
+          static int kdbg_misc_err;	/* the last refusal from misc_register()	*/
+          static int kdbg_chrdev_major;	/* the fallback's major, 0 when unused		*/
           
           /* the pair the rest of the driver - and the syscall - actually uses */
           static int kdbg_compat_init(void)
           {
-          	int n;
+          	int r;
           
           	mutex_lock(&kdbg_compat_lock);
           	cancel_delayed_work(&kdbg_linger_work);
           	kdbg_compat_up();
-          	n = kdbg_misc_n;
+          	r = (kdbg_misc_n || kdbg_chrdev_major)
+          		? 0
+          		: (kdbg_misc_err ? kdbg_misc_err : -ENODEV);
           	mutex_unlock(&kdbg_compat_lock);
           
-          	return n;
+          	return r;
           }
           
           static void kdbg_compat_cleanup(void)
@@ -1471,13 +1531,17 @@ jobs:
           	char *tok;
           	int i;
           
-          	if (kdbg_misc_n || kdbg_proc)
+          	if (kdbg_misc_n || kdbg_proc || kdbg_chrdev_major)
           		return;			/* already up */
           
           	/* miscdevice.name has to outlive this call, hence the static copies */
           	strlcpy(list, KDBG_COMPAT_DEVS, sizeof(list));
+          	kdbg_misc_err = 0;
           
           	while (p && *p && kdbg_misc_n < KDBG_COMPAT_MAX) {
+          		int err;
+          		int m;
+          
           		tok = strsep(&p, ",");
           		if (!tok || !*tok)
           			continue;
@@ -1490,17 +1554,52 @@ jobs:
           
           		strlcpy(kdbg_misc_name[kdbg_misc_n], tok, 32);
           		kdbg_misc[kdbg_misc_n].name  = kdbg_misc_name[kdbg_misc_n];
-          		kdbg_misc[kdbg_misc_n].minor = MISC_DYNAMIC_MINOR;
           		kdbg_misc[kdbg_misc_n].fops  = &kdbg_compat_fops;
           		kdbg_misc[kdbg_misc_n].mode  = 0666;
+          		kdbg_misc[kdbg_misc_n].minor = MISC_DYNAMIC_MINOR;
           
-          		if (misc_register(&kdbg_misc[kdbg_misc_n]))
+          		err = misc_register(&kdbg_misc[kdbg_misc_n]);
+          
+          		/*
+          		 * The pool of dynamic minor numbers is 96 wide (DYNAMIC_MINORS in
+          		 * drivers/char/misc.c) and every driver in the tree draws from it -
+          		 * on a phone the msm audio, usb, ion and ashmem devices alone take
+          		 * the whole top half.  A refusal there says nothing about the
+          		 * device we are asking for, so ask again with minors of our own
+          		 * choosing: the high end, which only the fixed assignments in
+          		 * miscdevice.h reach and which nothing on this device uses.
+          		 */
+          		for (m = 254; err && m >= 240; m--) {
+          			kdbg_misc[kdbg_misc_n].minor = m;
+          			err = misc_register(&kdbg_misc[kdbg_misc_n]);
+          		}
+          
+          		if (err) {
+          			kdbg_misc_err = err;	/* keep what it said */
           			continue;
+          		}
           
           		kdbg_misc_n++;
           	}
           
-          	kdbg_proc = proc_create(KDBG_COMPAT_PROC, 0666, NULL, &kdbg_compat_fops);
+          	/*
+          	 * Not one of them registered, so the minor number was never the problem
+          	 * and device_create() is refusing outright.  There is still a way to
+          	 * have the nodes: a character device under a major of our own, with the
+          	 * nodes made by the client.  Nothing in that path goes near udev.
+          	 */
+          	if (!kdbg_misc_n) {
+          		kdbg_chrdev_major = register_chrdev(0, KDBG_COMPAT_CHRDEV,
+          						    &kdbg_compat_fops);
+          		if (kdbg_chrdev_major < 0)
+          			kdbg_chrdev_major = 0;
+          	}
+          
+          	kdbg_proc = proc_create(KDBG_COMPAT_PROC, 0666, NULL, &kdbg_status_fops);
+          
+          	snprintf(kdbg_status, sizeof(kdbg_status),
+          		 "kdbg compat: misc=%d misc_err=%d major=%d\n",
+          		 kdbg_misc_n, kdbg_misc_err, kdbg_chrdev_major);
           }
           
           static void kdbg_compat_down(void)
@@ -1512,9 +1611,16 @@ jobs:
           		kdbg_proc = NULL;
           	}
           
+          	if (kdbg_chrdev_major) {
+          		unregister_chrdev(kdbg_chrdev_major, KDBG_COMPAT_CHRDEV);
+          		kdbg_chrdev_major = 0;
+          	}
+          
           	for (i = 0; i < kdbg_misc_n; i++)
           		misc_deregister(&kdbg_misc[i]);
           	kdbg_misc_n = 0;
+          
+          	kdbg_status[0] = '\0';
           }
           
           /* ------------------------------------------------------------- prctl family */
@@ -2238,6 +2344,8 @@ jobs:
           #include <sys/ioctl.h>
           #include <sys/mman.h>
           #include <sys/prctl.h>
+          #include <sys/stat.h>
+          #include <sys/sysmacros.h>
           
           #define TOWA_COOKIE 0x9E3779B97F4A7C15ULL
           #define TOWA_MAGIC  0x5032300AUL
@@ -2672,28 +2780,87 @@ jobs:
               return true;
           }
           
+          // Must stay the same list the kernel registers - it is what the fallback path
+          // creates nodes for when the kernel could not.
+          static const char *kCompatNames[] = {
+              "wanbai", "CheckMe", "Ckanri", "lanran", "video188", "bing",
+              "ft_driver", "bing_rw", "Bing_rw", "Bing", "w1a3n3a7n",
+          };
+          
+          // The driver publishes what the last `compat on` managed on its proc entry:
+          //
+          //     kdbg compat: misc=6 misc_err=0 major=0
+          //
+          // misc is how many nodes the kernel made itself.  When it could not make any -
+          // device_create() refusing, not the minor pool being full - it falls back to a
+          // character device under a major of its own and puts that major there, and the
+          // nodes become ours to create.  That is what every scene hack that ships an
+          // mknod already does; nothing here needs udev.
+          static std::string compat_status(void)
+          {
+              char st[192] = {0};
+              int fd = open("/proc/kvmstats", O_RDONLY);
+              if (fd >= 0) {
+                  ssize_t n = read(fd, st, sizeof(st) - 1);
+                  (void)n;
+                  close(fd);
+              }
+              return std::string(st);
+          }
+          
+          static int compat_major(const std::string &st)
+          {
+              size_t p = st.find("major=");
+              return p == std::string::npos ? -1 : atoi(st.c_str() + p + 6);
+          }
+          
+          static void compat_nodes(int major, bool remove)
+          {
+              for (unsigned i = 0; i < sizeof(kCompatNames) / sizeof(kCompatNames[0]); i++) {
+                  char path[64];
+                  snprintf(path, sizeof(path), "/dev/%s", kCompatNames[i]);
+          
+                  if (remove) {
+                      unlink(path);
+                      continue;
+                  }
+          
+                  unlink(path);                       // a stale node of another major
+                  if (mknod(path, S_IFCHR | 0666, makedev(major, 0)) != 0)
+                      printf("    %-20s mknod failed: %s\n", path, strerror(errno));
+                  else {
+                      chmod(path, 0666);
+                      printf("    %-20s made, char %d:0\n", path, major);
+                  }
+              }
+          }
+          
           static int cmd_compat(void)
           {
-              static const char *names[] = {
-                  "wanbai", "CheckMe", "Ckanri", "lanran", "video188", "bing",
-              };
+              std::string st = compat_status();
+              int major = compat_major(st);
+          
+              if (major > 0)
+                  compat_nodes(major, false);         // ours to make, so make them
           
               int pid = find_pid("com.dts.freefireth");
               printf("pid        : %d\n", pid);
+              if (!st.empty())
+                  printf("driver     : %s", st.c_str());
               printf("--- looking for the nodes our module registers ---\n");
           
               bool any = false;
-              for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+              for (unsigned i = 0; i < sizeof(kCompatNames) / sizeof(kCompatNames[0]); i++) {
                   char path[64];
-                  snprintf(path, sizeof(path), "/dev/%s", names[i]);
+                  snprintf(path, sizeof(path), "/dev/%s", kCompatNames[i]);
                   if (access(path, F_OK) != 0 && access(path, R_OK) != 0)
                       continue;
                   any = true;
                   try_node(path, pid, kElfMagic);
               }
               if (!any) {
-                  printf("none of them exist.  Either towa_core.ko is not loaded, or the\n"
-                         "nodes have not been asked for - they are off by default:\n"
+                  printf("none of them exist.  Either the kernel half is not in this build,\n"
+                         "or the nodes have not been asked for - they are off by default:\n"
                          "    towacli compat on\n");
                   return 1;
               }
@@ -3173,11 +3340,28 @@ jobs:
               // after: nothing in /dev, /sys or /proc while they are not needed.
               if (cmd == "compat") {
                   if (a.size() > 1 && (a[1] == "on" || a[1] == "off")) {
-                      long r = towa(TOWA_OP_COMPAT, (a[1] == "on") ? 1 : 0);
+                      bool on = (a[1] == "on");
+                      int was = compat_major(compat_status());   // the state before this call
+          
+                      long r = towa(TOWA_OP_COMPAT, on ? 1 : 0);
                       if (r < 0) { perr("compat", r); return 1; }
-                      printf("compat %s%s\n", a[1].c_str(),
-                             (a[1] == "on") ? " - device nodes registered; run a hack now"
-                                            : " - nodes removed; nothing left in /dev or /sys");
+          
+                      if (!on) {
+                          if (was > 0)
+                              compat_nodes(was, true);
+                          printf("compat off - nodes removed; nothing left in /dev or /sys\n");
+                          return 0;
+                      }
+          
+                      std::string st = compat_status();
+                      printf("compat on  - %s", st.empty() ? "registered\n" : st.c_str());
+          
+                      int major = compat_major(st);
+                      if (major > 0) {
+                          printf("  the kernel could not create the nodes itself, so:\n");
+                          compat_nodes(major, false);
+                      }
+                      printf("  run a hack now\n");
                       return 0;
                   }
                   return cmd_compat();
