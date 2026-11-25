@@ -1028,13 +1028,27 @@ jobs:
           		gup_flags |= FOLL_WRITE;
           
           	while (done < len) {
+          		/*
+          		 * The batch starts at the page that HOLDS addr + done, and that
+          		 * first page is only partly usable - so the page count has to
+          		 * include its offset.  Asking for ceil(chunk/PAGE_SIZE) there is
+          		 * one page short whenever the range crosses a page boundary, the
+          		 * copy then stops at the boundary, and the caller gets -EFAULT
+          		 * for memory that was perfectly readable.  That is what made a
+          		 * 3072-byte ESP read come back short and the overlay flicker:
+          		 * 71,800 short transfers in 5.45M reads.
+          		 *
+          		 * The chunk is shrunk by the same offset, so the batch still fits
+          		 * in pages[].
+          		 */
+          		unsigned long off0 = (addr + done) & ~PAGE_MASK;
           		unsigned long chunk = min_t(unsigned long, len - done,
-          					    (unsigned long)KDBG_BATCH * PAGE_SIZE);
+          					    (unsigned long)KDBG_BATCH * PAGE_SIZE - off0);
           		int npages, i;
           		unsigned long off = 0;
           
           		npages = get_user_pages_remote(t, mm, addr + done,
-          					       DIV_ROUND_UP(chunk, PAGE_SIZE),
+          					       DIV_ROUND_UP(off0 + chunk, PAGE_SIZE),
           					       gup_flags, pages, NULL, NULL);
           		if (npages <= 0) {
           			ret = npages ? npages : -EFAULT;
