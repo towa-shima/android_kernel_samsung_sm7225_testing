@@ -921,6 +921,7 @@ jobs:
           #include <linux/sched.h>
           #include <linux/sched/mm.h>
           #include <linux/mm.h>
+          #include <asm/pgtable.h>
           #include <linux/pid.h>
           #include <linux/uaccess.h>
           #include <linux/slab.h>
@@ -993,24 +994,189 @@ jobs:
           /* ------------------------------------------------------- bulk memory, no buffer */
           
           /*
-           * Pages are mapped in batches and copied straight to and from the caller, so a
-           * transfer costs one copy rather than the two a staging buffer would.
-           *
-           * get_user_pages_remote() is the same primitive a driver uses to pin a user
-           * buffer; pointed at another process's mm it pins that process's pages.
-           * FOLL_FORCE is what makes a write into a read-only mapping work: it breaks
-           * copy-on-write rather than refusing.
+           * The session counters, defined up here because the transfer path below counts
+           * what it could not read.  Everything else that touches them lives further
+           * down with the compatibility layer.
            */
-          #define KDBG_BATCH	32
+          static struct {
+          	atomic64_t	opens;		/* nodes open right now		*/
+          	atomic64_t	total_opens;
+          	atomic64_t	keys;
+          	atomic64_t	reads;
+          	atomic64_t	writes;
+          	atomic64_t	bases;
+          	atomic64_t	denied;		/* refused: no CAP_SYS_PTRACE	*/
+          	atomic64_t	prctl_reads;
+          	atomic64_t	prctl_writes;
+          	atomic64_t	prctl_probes;
+          	atomic64_t	sys_reads;	/* plain read(2) on a node	*/
+          	atomic64_t	sys_writes;	/* plain write(2) on a node	*/
+          	atomic64_t	mmaps;		/* mmap(2) on a node		*/
+          	atomic64_t	last_len;	/* the size the last one asked	*/
+          	atomic64_t	xfer_fails;	/* the client was told "no"	*/
+          	atomic64_t	xfer_holes;	/* pages not mapped, skipped	*/
+          	atomic64_t	max_xfer;	/* the largest single transfer	*/
+          	atomic_t	holder_pid;
+          	atomic_t	last_pid;
+          	char		holder_comm[TASK_COMM_LEN];
+          	char		last_comm[TASK_COMM_LEN];
+          	char		last_node[TASK_COMM_LEN];
+          } kdbg_stat;
+          
+          /* --------------------------------------------------------- direct map access */
+          /*
+           * Reaching the target's memory through its own page tables and the kernel's
+           * linear map, instead of only by pinning pages.
+           *
+           * get_user_pages is honest but narrow: it refuses mappings it will not fault
+           * in (device and VM_IO pages among them) and charges a page reference and a
+           * kmap per page.  Over a 5.6-million-read session that showed up as 19,460
+           * unreadable pages, and in the cost of every single read.  Translating the
+           * address here and copying through the direct map reaches those pages, and
+           * costs one page-table walk instead.
+           *
+           * It is the first try, not the only one: a page that is not present (swapped
+           * out, or not faulted in yet) and a huge mapping fall through to
+           * get_user_pages, which faults pages in and handles THP properly.  Nothing
+           * that worked before stops working.
+           *
+           * The guard that matters: a page-table page that has been recycled can
+           * translate to a physical address outside the linear map, and phys_to_virt()
+           * then returns an unmapped kernel address that faults on the first load - a
+           * kernel oops caused by a userspace read.  virt_addr_valid() is what stops
+           * that, and it has to stay.
+           */
+          static int kdbg_va_to_kaddr(struct mm_struct *mm, unsigned long va,
+          			    void **kva, unsigned long *pfn_out)
+          {
+          	pgd_t *pgd;
+          	pud_t *pud;
+          	pmd_t *pmd;
+          	pte_t *ptep;
+          	pte_t pte;
+          	unsigned long pfn;
+          	void *k;
+          
+          	pgd = pgd_offset(mm, va);
+          	if (pgd_none(*pgd) || pgd_bad(*pgd))
+          		return -EFAULT;
+          
+          	pud = pud_offset(pgd, va);
+          	if (pud_none(*pud) || pud_bad(*pud))
+          		return -EFAULT;
+          
+          	pmd = pmd_offset(pud, va);
+          	if (pmd_none(*pmd) || pmd_bad(*pmd))
+          		return -EFAULT;
+          	if (pmd_trans_huge(*pmd))
+          		return -EOPNOTSUPP;	/* leave it to get_user_pages */
+          
+          	ptep = pte_offset_kernel(pmd, va);
+          	if (!ptep)
+          		return -EFAULT;
+          
+          	pte = READ_ONCE(*ptep);
+          	if (!pte_present(pte))
+          		return -EFAULT;		/* swapped, or not faulted in yet */
+          
+          	pfn = pte_pfn(pte);
+          	if (!pfn_valid(pfn))
+          		return -EFAULT;
+          
+          	k = phys_to_virt((phys_addr_t)pfn << PAGE_SHIFT) + (va & ~PAGE_MASK);
+          	if (!virt_addr_valid(k))
+          		return -EFAULT;		/* not in the linear map - do not touch */
+          
+          	*kva = k;
+          	*pfn_out = pfn;
+          
+          	return 0;
+          }
+          
+          /*
+           * One page of a transfer.  `hole` means the page could not be reached at all,
+           * which is not an error here: what to do about it is the caller's decision,
+           * and for a read it is "skip it and carry on".
+           */
+          static int kdbg_copy_page(struct task_struct *t, struct mm_struct *mm,
+          			  unsigned long va, void __user *ubuf, size_t n,
+          			  bool write, bool *hole)
+          {
+          	unsigned long pfn = 0;
+          	void *kva = NULL;
+          	struct page *pg;
+          	void *kaddr;
+          
+          	*hole = false;
+          
+          	/*
+          	 * The lock covers the walk AND the copy that follows it, for the same
+          	 * reason get_user_pages exists: between reading a PTE and reading the
+          	 * page it points at, the mapping could be zapped and the page freed.
+          	 *
+          	 * It cannot cover the fallback below, because get_user_pages_remote()
+          	 * takes mmap_sem itself and this is a rwsem: a recursive read lock deadlocks
+          	 * against a writer that is already waiting.  So it is taken per page,
+          	 * released, and only then do we fall back.
+          	 */
+          	mmap_read_lock(mm);
+          	if (!kdbg_va_to_kaddr(mm, va, &kva, &pfn)) {
+          		int err = 0;
+          
+          		if (write) {
+          			if (copy_from_user(kva, ubuf, n))
+          				err = -EFAULT;
+          			else
+          				set_page_dirty_lock(pfn_to_page(pfn));
+          		} else if (copy_to_user(ubuf, kva, n)) {
+          			err = -EFAULT;
+          		}
+          
+          		mmap_read_unlock(mm);
+          		return err;
+          	}
+          	mmap_read_unlock(mm);
+          
+          	/* Second try: pin it, which also faults it in. */
+          	if (get_user_pages_remote(t, mm, va, 1,
+          				  write ? (FOLL_FORCE | FOLL_WRITE) : FOLL_FORCE,
+          				  &pg, NULL, NULL) != 1) {
+          		*hole = true;
+          		return 0;
+          	}
+          
+          	kaddr = kmap(pg);
+          	if (!kaddr) {
+          		put_page(pg);
+          		*hole = true;
+          		return 0;
+          	}
+          
+          	if (write) {
+          		if (copy_from_user(kaddr + (va & ~PAGE_MASK), ubuf, n)) {
+          			kunmap(pg);
+          			put_page(pg);
+          			return -EFAULT;
+          		}
+          		set_page_dirty_lock(pg);
+          	} else if (copy_to_user(ubuf, kaddr + (va & ~PAGE_MASK), n)) {
+          		kunmap(pg);
+          		put_page(pg);
+          		return -EFAULT;
+          	}
+          
+          	kunmap(pg);
+          	put_page(pg);
+          
+          	return 0;
+          }
           
           static long kdbg_rw(pid_t pid, unsigned long addr, void __user *ubuf,
           		    unsigned long len, bool write)
           {
-          	struct page *pages[KDBG_BATCH];
           	struct task_struct *t;
           	struct mm_struct *mm;
           	unsigned long done = 0;
-          	unsigned int gup_flags = FOLL_FORCE;
           	int ret = 0;
           
           	if (!len || len > KDBG_MAX_XFER || !ubuf)
@@ -1025,103 +1191,41 @@ jobs:
           		return -EINVAL;
           	}
           
-          	if (write)
-          		gup_flags |= FOLL_WRITE;
-          
           	/*
           	 * A read is best-effort; a write is not.
           	 *
-          	 * get_user_pages_remote stops at the first page it cannot pin, so one
-          	 * dead page in the middle of a range used to cost the caller the whole
-          	 * range - it was told "no" and skipped data that was perfectly readable
-          	 * a page later.  That is what a flickering ESP is made of.  So when a
-          	 * batch hits a hole the copy drops to one page at a time and carries on
-          	 * past it: the caller gets everything that exists, the pages that do not
-          	 * are counted in xfer_holes, and the call still succeeds.
+          	 * One unreachable page in the middle of a range used to cost the caller
+          	 * the whole range - it was told "no" and lost everything readable a page
+          	 * later.  That is what a flickering ESP is made of.  A read now skips
+          	 * the holes and still succeeds: a blob is zero-filled where the memory
+          	 * is gone (a stale value is worse than a zero one, because it is
+          	 * plausible), while a small read keeps the caller's own value (0.0 has a
+          	 * meaning in a field somebody is testing).
           	 *
-          	 * A write keeps the strict behaviour.  Writing to a page that is not
-          	 * there cannot be quietly skipped - it would be a write that did not
-          	 * happen, reported as one that did.
+          	 * A write keeps the strict behaviour - quietly skipping it would be a
+          	 * write that did not happen, reported as one that did.
           	 */
-          	bool single = false;
-          
           	while (done < len) {
-          		/*
-          		 * The batch starts at the page that HOLDS addr + done, and that
-          		 * first page is only partly usable - so the page count has to
-          		 * include its offset.  Asking for ceil(chunk/PAGE_SIZE) there is
-          		 * one page short whenever the range crosses a page boundary, and
-          		 * the copy then stops at the boundary.
-          		 */
-          		unsigned long off0 = (addr + done) & ~PAGE_MASK;
-          		unsigned long chunk = single
-          			? PAGE_SIZE - off0
-          			: min_t(unsigned long, len - done,
-          				(unsigned long)KDBG_BATCH * PAGE_SIZE - off0);
-          		int npages, i;
-          		unsigned long off = 0;
+          		unsigned long va = addr + done;
+          		size_t n = min_t(size_t, len - done,
+          				 PAGE_SIZE - (va & ~PAGE_MASK));
+          		bool hole = false;
           
-          		npages = get_user_pages_remote(t, mm, addr + done,
-          					       DIV_ROUND_UP(off0 + chunk, PAGE_SIZE),
-          					       gup_flags, pages, NULL, NULL);
-          		if (npages <= 0) {
-          			if (write) {
-          				ret = npages ? npages : -EFAULT;
-          				break;
-          			}
-          			atomic64_inc(&kdbg_stat.xfer_holes);
-          			single = true;
-          			done += chunk;
-          			continue;
-          		}
-          
-          		for (i = 0; i < npages && off < chunk; i++) {
-          			unsigned long poff = (addr + done + off) & ~PAGE_MASK;
-          			unsigned long n = min_t(unsigned long, PAGE_SIZE - poff,
-          						chunk - off);
-          			void *kaddr = kmap(pages[i]);
-          
-          			if (!kaddr) {
-          				ret = -EFAULT;
-          				break;
-          			}
-          
-          			if (write) {
-          				if (copy_from_user(kaddr + poff, ubuf + done + off, n)) {
-          					kunmap(pages[i]);
-          					ret = -EFAULT;
-          					break;
-          				}
-          				set_page_dirty_lock(pages[i]);
-          			} else if (copy_to_user(ubuf + done + off, kaddr + poff, n)) {
-          				kunmap(pages[i]);
-          				ret = -EFAULT;
-          				break;
-          			}
-          
-          			kunmap(pages[i]);
-          			off += n;
-          		}
-          
-          		for (i = 0; i < npages; i++)
-          			put_page(pages[i]);
-          
+          		ret = kdbg_copy_page(t, mm, va, ubuf + done, n, write, &hole);
           		if (ret)
           			break;
           
-          		done += off;
-          		if (off < chunk) {
-          			/*
-          			 * The batch ran into a hole and stopped early.  A write
-          			 * cannot pretend, a read carries on page by page.
-          			 */
+          		if (hole) {
           			if (write) {
           				ret = -EFAULT;
           				break;
           			}
+          			if (len > 8)
+          				(void)clear_user(ubuf + done, n);
           			atomic64_inc(&kdbg_stat.xfer_holes);
-          			single = true;
           		}
+          
+          		done += n;
           	}
           
           	mmput(mm);
@@ -1131,6 +1235,7 @@ jobs:
           		return ret;
           	return done;
           }
+          
           
           /* ------------------------------------------------------------ module base */
           
@@ -1476,30 +1581,6 @@ jobs:
            * handshake, and then the reads, writes and module lookups that follow.
            * Nothing is inferred: if the counters are zero, nothing used us.
            */
-          static struct {
-          	atomic64_t	opens;		/* nodes open right now		*/
-          	atomic64_t	total_opens;
-          	atomic64_t	keys;
-          	atomic64_t	reads;
-          	atomic64_t	writes;
-          	atomic64_t	bases;
-          	atomic64_t	denied;		/* refused: no CAP_SYS_PTRACE	*/
-          	atomic64_t	prctl_reads;
-          	atomic64_t	prctl_writes;
-          	atomic64_t	prctl_probes;
-          	atomic64_t	sys_reads;	/* plain read(2) on a node	*/
-          	atomic64_t	sys_writes;	/* plain write(2) on a node	*/
-          	atomic64_t	mmaps;		/* mmap(2) on a node		*/
-          	atomic64_t	last_len;	/* the size the last one asked	*/
-          	atomic64_t	xfer_fails;	/* the client was told "no"	*/
-          	atomic64_t	xfer_holes;	/* pages not mapped, skipped	*/
-          	atomic64_t	max_xfer;	/* the largest single transfer	*/
-          	atomic_t	holder_pid;
-          	atomic_t	last_pid;
-          	char		holder_comm[TASK_COMM_LEN];
-          	char		last_comm[TASK_COMM_LEN];
-          	char		last_node[TASK_COMM_LEN];
-          } kdbg_stat;
           
           /*
            * The ioctl request values themselves, whatever they are.
