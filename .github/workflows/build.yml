@@ -292,6 +292,27 @@ jobs:
           	 * rest of the batch.
           	 */
           	KDBG_OP_XFER       = 14,/* a1=&struct kdbg_xfer[] a2=count a3=write? -> 0 */
+          
+          	/*
+          	 * The memory syscalls, forwarded at build time (see
+          	 * include/linux/kdbg.h).  0 = off, 1 = count only, 2 = serve.
+          	 */
+          	KDBG_OP_HIJACK     = 15,/* a1 = mode -> 0				*/
+          
+          	/*
+          	 * Who has been calling process_vm_readv / writev, and how much.
+          	 * a1 = &struct kdbg_pvm_stat[n], a2 = n; returns the current mode.
+          	 */
+          	KDBG_OP_PVM_STAT   = 16,
+          };
+          
+          #define KDBG_PVM_SLOTS	8
+          
+          struct kdbg_pvm_stat {
+          	int			pid;
+          	unsigned int		calls;
+          	unsigned long long	bytes;
+          	char			comm[16];
           };
           
           #define KDBG_MAP_R	0x1
@@ -400,11 +421,29 @@ jobs:
           #define KDBG_ACT_X0	4	/* x0 = value, then skip that instruction  */
           #define KDBG_ACT_REG	5	/* regs[reg] = value, then skip it         */
           
+          /*
+           * A whole set of registers at once, and the same for the floating point ones.
+           *
+           * The register-write actions are how an aim is built: breakpoint an instruction
+           * that computes a direction, replace the values it would have used, and let the
+           * rest of the function carry on with them.  GP takes general registers, FP
+           * takes SIMD ones by index (3,4,5 are s3/s4/s5).
+           *
+           * FP writes the low 32 bits of the 128-bit vector, which is what a scalar
+           * "s" register is, and sets TIF_FOREIGN_FPSTATE so the kernel reloads the
+           * registers from memory on the way back to userspace.  The instruction is
+           * skipped in both cases: leaving pc alone would trap on the same instruction
+           * forever.
+           */
+          #define KDBG_ACT_GP	6	/* for i<nregs: regs[regs[i]] = vals[i]    */
+          #define KDBG_ACT_FP	7	/* for i<nregs: vregs[regs[i]] = vals[i]   */
+          
           /* KDBG_OP_WATCH_ARM modes. */
           #define KDBG_WATCH_WRITE	0	/* next write to the page			*/
           #define KDBG_WATCH_ACCESS	1	/* next read, write or execute		*/
           
           #define KDBG_WATCH_SLOTS	4
+          #define KDBG_WATCH_MAX_PAGES	64	/* per slot, one arm		*/
           
           /*
            * The largest single transfer, in bytes.
@@ -422,6 +461,11 @@ jobs:
           #define KDBG_WF_WRITE	0x0004	/* the access that fired was a write	*/
           #define KDBG_WF_ACCESS	0x0008	/* armed in ACCESS mode			*/
           
+          #define KDBG_HBP_REGS	8
+          
+          /* arm for every task on every CPU, not just the target's threads */
+          #define KDBG_HBPF_WIDE	0x1
+          
           struct kdbg_hbp_cfg {
           	int		pid;
           	unsigned long	type;
@@ -430,12 +474,17 @@ jobs:
           	unsigned long	action;
           	unsigned long	value;
           	unsigned long	reg;
+          	unsigned long	flags;
+          	unsigned long	nregs;
+          	unsigned long	regs[KDBG_HBP_REGS];
+          	unsigned long	vals[KDBG_HBP_REGS];
           };
           
           struct kdbg_watch_cfg {
           	int		pid;
           	unsigned long	addr;
           	unsigned long	mode;
+          	unsigned long	len;	/* bytes; 0 = one page			*/
           };
           
           struct kdbg_watch_info {
@@ -444,6 +493,8 @@ jobs:
           	unsigned long long	last_task;
           	unsigned long		addr;
           	unsigned long		flags;
+          	unsigned long long	regs[8];	/* x0..x7 at the fault	*/
+          	unsigned long long	sp;
           };
           
           /* The prctl pass-through, registered in kdbg.c. */
@@ -467,7 +518,8 @@ jobs:
           
           /* Implemented in kdbg_watch.c, which is built into the kernel, not the module:
            * it needs the page-fault path and the core mm helpers. */
-          int kdbg_watch_arm(pid_t pid, unsigned long addr, unsigned long mode);
+          int kdbg_watch_arm(pid_t pid, unsigned long addr, unsigned long mode,
+          		   unsigned long len);
           int kdbg_watch_off(unsigned long slot);
           int kdbg_watch_stat(unsigned long slot, struct kdbg_watch_info *out);
           void kdbg_watch_off_all(void);
@@ -491,6 +543,7 @@ jobs:
           #include <linux/syscalls.h>
           #include <linux/mutex.h>
           #include <linux/export.h>
+          #include <linux/uio.h>
           
           #include <linux/kdbg.h>
           
@@ -557,6 +610,41 @@ jobs:
           }
           EXPORT_SYMBOL_GPL(kdbg_set_prctl_note);
           
+          /* ------------------------------------------------------- memory syscalls ---- */
+          
+          static kdbg_pvm_t kdbg_pvm_fn __read_mostly;
+          
+          void kdbg_set_pvm(kdbg_pvm_t fn)
+          {
+          	mutex_lock(&kdbg_mutex);
+          	kdbg_pvm_fn = fn;
+          	mutex_unlock(&kdbg_mutex);
+          }
+          EXPORT_SYMBOL_GPL(kdbg_set_pvm);
+          
+          /*
+           * Called from mm/process_vm_access.c for every process_vm_readv() and
+           * process_vm_writev() in the system.
+           *
+           * No lock: this is on the path of a syscall other software uses, and the
+           * pointer is either NULL or a function that lives as long as the module does -
+           * module_exit clears it under the mutex before anything is freed.  A call that
+           * races an unload is harmless either way, because whoever wins gets either
+           * KDBG_NOT_HANDLED or a working answer.
+           */
+          ssize_t kdbg_pvm_try(pid_t pid, const struct iovec __user *lvec,
+          		     unsigned long liovcnt, const struct iovec __user *rvec,
+          		     unsigned long riovcnt, int vm_write)
+          {
+          	kdbg_pvm_t fn = READ_ONCE(kdbg_pvm_fn);
+          
+          	if (!fn)
+          		return KDBG_NOT_HANDLED;
+          
+          	return fn(pid, lvec, liovcnt, rvec, riovcnt, vm_write);
+          }
+          EXPORT_SYMBOL_GPL(kdbg_pvm_try);
+          
           long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3)
           {
           	kdbg_prctl_t fn;
@@ -616,6 +704,7 @@ jobs:
           #include <linux/sched/mm.h>
           #include <linux/pid.h>
           #include <linux/export.h>
+          #include <linux/string.h>
           #include <linux/spinlock.h>
           #include <linux/jump_label.h>
           #include <linux/rmap.h>
@@ -640,6 +729,7 @@ jobs:
           
           struct kdbg_watch_slot {
           	struct mm_struct	*mm;		/* NULL = free */
+          	unsigned long		end;		/* one past the last page */
           	unsigned long		addr;		/* page aligned */
           	unsigned long		mode;
           	unsigned long long	hits;
@@ -647,6 +737,8 @@ jobs:
           	unsigned long		last_task;
           	unsigned long		last_addr;
           	unsigned long		flags;
+          	unsigned long		regs[8];	/* x0..x7 at the fault	*/
+          	unsigned long		sp;
           };
           
           static struct kdbg_watch_slot kdbg_watch[KDBG_WATCH_SLOTS];
@@ -705,19 +797,26 @@ jobs:
           
           /* ---------------------------------------------------------------- arming */
           
-          int kdbg_watch_arm(pid_t pid, unsigned long addr, unsigned long mode)
+          int kdbg_watch_arm(pid_t pid, unsigned long addr, unsigned long mode,
+          		   unsigned long len)
           {
           	struct kdbg_watch_slot *w = NULL;
           	struct task_struct *t;
           	struct mm_struct *mm;
-          	struct vm_area_struct *vma;
-          	struct kdbg_pte p = { NULL, NULL, NULL };
-          	unsigned long pgaddr = addr & PAGE_MASK;
-          	pte_t pte, new;
-          	int slot, ret;
+          	unsigned long start, end, a;
+          	unsigned long armed = 0;
+          	int slot, ret = 0;
           
           	if (mode != KDBG_WATCH_WRITE && mode != KDBG_WATCH_ACCESS)
           		return -EINVAL;
+          
+          	if (!len)
+          		len = PAGE_SIZE;
+          	if (len > (unsigned long)KDBG_WATCH_MAX_PAGES * PAGE_SIZE)
+          		len = (unsigned long)KDBG_WATCH_MAX_PAGES * PAGE_SIZE;
+          
+          	start = addr & PAGE_MASK;
+          	end   = (addr + len + ~PAGE_MASK) & PAGE_MASK;
           
           	for (slot = 0; slot < KDBG_WATCH_SLOTS; slot++)
           		if (!kdbg_watch[slot].mm) {
@@ -743,65 +842,79 @@ jobs:
           
           	mmap_read_lock(mm);
           
-          	vma = find_vma(mm, addr);
-          	if (!vma || vma->vm_start > addr) {
-          		ret = -ENOENT;
-          		goto out_unlock;
-          	}
+          	/*
+          	 * A range is armed page by page, and a page that cannot be armed is
+          	 * skipped rather than failing the whole range: a structure can easily
+          	 * straddle the end of one mapping, and the pages that exist are worth
+          	 * watching even when the next one does not.
+          	 */
+          	for (a = start; a < end; a += PAGE_SIZE) {
+          		struct kdbg_pte p = { NULL, NULL, NULL };
+          		struct vm_area_struct *vma;
+          		pte_t pte, new;
           
-          	ret = kdbg_pte_lock(mm, addr, &p);
-          	if (ret)
-          		goto out_unlock;
+          		vma = find_vma(mm, a);
+          		if (!vma || vma->vm_start > a)
+          			continue;		/* nothing mapped here */
           
-          	pte = *p.ptep;
-          	if (!pte_present(pte)) {
-          		/* Not faulted in yet - there is no access to take away. */
-          		ret = -EFAULT;
-          		goto out_pte;
-          	}
+          		if (kdbg_pte_lock(mm, a, &p))
+          			continue;
           
-          	new = pte;
-          	if (mode == KDBG_WATCH_WRITE) {
-          		/*
-          		 * Safe on anything: clearing the write bit is exactly what
-          		 * copy-on-write does, and the page is not lost, only made
-          		 * read-only until the next write faults.
-          		 */
-          		new = pte_wrprotect(pte);
-          	} else {
-          		/*
-          		 * Clearing the PTE means the normal fault path has to rebuild it
-          		 * from the VMA, so it must be a clean file page.  On a writable
-          		 * pte that rebuild would throw away a private copy, and on an
-          		 * anonymous page there is nothing to rebuild from at all.
-          		 */
-          		if (!vma->vm_file || pte_write(pte)) {
-          			ret = -EOPNOTSUPP;
-          			goto out_pte;
+          		pte = *p.ptep;
+          		if (!pte_present(pte)) {
+          			kdbg_pte_unlock(&p);
+          			continue;		/* not faulted in yet */
           		}
+          
+          		new = pte;
+          		if (mode == KDBG_WATCH_WRITE) {
+          			/*
+          			 * Safe on anything: clearing the write bit is what
+          			 * copy-on-write does, and the page is not lost, only
+          			 * made read-only until the next write faults.
+          			 */
+          			new = pte_wrprotect(pte);
+          		} else if (!vma->vm_file || pte_write(pte)) {
+          			/*
+          			 * Clearing the PTE makes the normal fault path rebuild
+          			 * it from the VMA, which needs a clean file page.
+          			 */
+          			kdbg_pte_unlock(&p);
+          			continue;
+          		}
+          
+          		if (mode == KDBG_WATCH_WRITE)
+          			set_pte_at(mm, a, p.ptep, new);
+          		else
+          			ptep_get_and_clear(mm, a, p.ptep);
+          
+          		kdbg_pte_unlock(&p);
+          		armed++;
           	}
           
-          	w->addr = pgaddr;
+          	mmap_read_unlock(mm);
+          
+          	if (!armed) {
+          		mmput(mm);
+          		return -EFAULT;
+          	}
+          
+          	w->addr = start;
+          	w->end  = end;
           	w->mode = mode;
           	w->hits = 0;
           	w->last_pc = 0;
           	w->last_task = 0;
           	w->last_addr = 0;
+          	w->sp = 0;
+          	memset(w->regs, 0, sizeof(w->regs));
           	w->flags = KDBG_WF_ARMED;
           	if (mode == KDBG_WATCH_ACCESS)
           		w->flags |= KDBG_WF_ACCESS;
           
-          	if (mode == KDBG_WATCH_WRITE)
-          		set_pte_at(mm, addr, p.ptep, new);
-          	else
-          		ptep_get_and_clear(mm, addr, p.ptep);
-          
-          	kdbg_pte_unlock(&p);
-          	mmap_read_unlock(mm);
-          
           	/*
-          	 * The PTE changed, so every CPU that might have it cached has to be
-          	 * told.  Safe here - process context, no spinlock held.
+          	 * The page tables changed, so every CPU that might have them cached has
+          	 * to be told.  Safe here - process context, no spinlock held.
           	 */
           	flush_tlb_mm(mm);
           
@@ -812,14 +925,9 @@ jobs:
           	smp_wmb();
           	w->mm = mm;
           
-          	return slot;
+          	(void)ret;
           
-          out_pte:
-          	kdbg_pte_unlock(&p);
-          out_unlock:
-          	mmap_read_unlock(mm);
-          	mmput(mm);
-          	return ret;
+          	return slot;
           }
           EXPORT_SYMBOL_GPL(kdbg_watch_arm);
           
@@ -852,7 +960,7 @@ jobs:
           		flags = READ_ONCE(w->flags);
           		if (!(flags & KDBG_WF_ARMED))
           			continue;
-          		if ((addr & PAGE_MASK) != w->addr)
+          		if (addr < w->addr || addr >= w->end)
           			continue;
           
           		/*
@@ -865,6 +973,14 @@ jobs:
           		w->last_pc = regs ? regs->pc : 0;
           		w->last_task = current->tgid;
           		w->last_addr = addr;
+          		w->sp = regs ? regs->sp : 0;
+          
+          		if (regs) {
+          			int r;
+          
+          			for (r = 0; r < 8; r++)
+          				w->regs[r] = regs->regs[r];
+          		}
           		if (esr & ESR_ELx_WNR)
           			WRITE_ONCE(w->flags, READ_ONCE(w->flags) | KDBG_WF_WRITE);
           
@@ -937,6 +1053,7 @@ jobs:
           int kdbg_watch_stat(unsigned long slot, struct kdbg_watch_info *out)
           {
           	struct kdbg_watch_slot *w;
+          	int i;
           
           	if (slot >= KDBG_WATCH_SLOTS)
           		return -EINVAL;
@@ -950,6 +1067,10 @@ jobs:
           	out->last_task = w->last_task;
           	out->addr      = w->addr;
           	out->flags     = READ_ONCE(w->flags);
+          	out->sp        = w->sp;
+          
+          	for (i = 0; i < 8; i++)
+          		out->regs[i] = w->regs[i];
           
           	return 0;
           }
@@ -991,6 +1112,7 @@ jobs:
           #include <linux/mmap_lock.h>
           #include <linux/highmem.h>
           #include <linux/capability.h>
+          #include <linux/uio.h>
           #include <linux/workqueue.h>
           
           #include <linux/kdbg.h>	/* KDBG_PRCTL_MAGIC, and the fault-path hook */
@@ -1369,7 +1491,9 @@ jobs:
            * to do.
            */
           struct kdbg_hbp {
-          	struct perf_event	*bp;
+          	struct perf_event	*bp;		/* per task		*/
+          	struct perf_event * __percpu *wbp;	/* per cpu, wide	*/
+          	unsigned long		tgid;
           	unsigned long		addr;
           	unsigned long long	hits;
           	unsigned long		last_pc;
@@ -1377,6 +1501,9 @@ jobs:
           	unsigned long		action;
           	unsigned long		value;
           	unsigned long		reg;
+          	unsigned long		nregs;
+          	unsigned long		regs[KDBG_HBP_REGS];
+          	unsigned long		vals[KDBG_HBP_REGS];
           };
           
           static struct kdbg_hbp kdbg_hbp[KDBG_HBP_SLOTS];
@@ -1388,6 +1515,15 @@ jobs:
           	struct kdbg_hbp *h = bp->overflow_handler_context;
           
           	if (!h)
+          		return;
+          
+          	/*
+          	 * A wide breakpoint is armed on the address, not on a task, so it fires
+          	 * for whichever process happens to execute there - including ones that
+          	 * merely share the address.  The guard is what keeps the actioned
+          	 * registers belonging to the process that asked for it.
+          	 */
+          	if (h->tgid && task_tgid_vnr(current) != (pid_t)h->tgid)
           		return;
           
           	h->hits++;
@@ -1438,84 +1574,146 @@ jobs:
           			regs->regs[h->reg] = h->value;
           		regs->pc += 4;
           		break;
+          	case KDBG_ACT_GP: {
+          		unsigned long i;
+          
+          		for (i = 0; i < h->nregs && i < KDBG_HBP_REGS; i++)
+          			if (h->regs[i] < 31)
+          				regs->regs[h->regs[i]] = h->vals[i];
+          
+          		regs->pc += 4;		/* the instruction does not run */
+          		break;
+          	}
+          	case KDBG_ACT_FP: {
+          		struct user_fpsimd_state *st = &current->thread.uw.fpsimd_state;
+          		unsigned long i;
+          
+          		for (i = 0; i < h->nregs && i < KDBG_HBP_REGS; i++) {
+          			unsigned long idx = h->regs[i];
+          
+          			if (idx >= 32)
+          				continue;
+          
+          			/*
+          			 * An "s" register is the low 32 bits of the 128-bit
+          			 * vector, so only those bits are replaced and the rest
+          			 * of the vector is left alone.
+          			 */
+          			st->vregs[idx] = (st->vregs[idx] & ~(__uint128_t)0xffffffffULL)
+          				       | (__uint128_t)(u32)h->vals[i];
+          		}
+          
+          		/*
+          		 * Mark the task's FP state as not in the registers, so the
+          		 * kernel loads what we just wrote on the way back to
+          		 * userspace.  Doing it this way avoids touching the FP/SIMD
+          		 * hardware from a debug exception.
+          		 */
+          		set_thread_flag(TIF_FOREIGN_FPSTATE);
+          
+          		regs->pc += 4;
+          		break;
+          	}
           	}
           }
           
-          static long kdbg_hbp_set(pid_t pid, unsigned long addr, unsigned long type,
-          			 unsigned long len, unsigned long action,
-          			 unsigned long value, unsigned long reg)
+          static long kdbg_hbp_set(const struct kdbg_hbp_cfg *cfg)
           {
           	struct perf_event_attr attr;
           	struct task_struct *t;
-          	struct perf_event *bp;
+          	struct perf_event *bp = NULL;
+          	struct perf_event * __percpu *wbp = NULL;
           	int slot;
           
+          	if (!cfg->addr)
+          		return -EINVAL;
+          
           	/*
-          	 * A data watchpoint is refused outright, and so is counting mode.
-          	 *
-          	 * A debug exception is taken BEFORE the access or the instruction
-          	 * completes.  This kernel does not single-step it for us on the way out,
-          	 * so the CPU retries the same access, traps again, and never gets
-          	 * anywhere - a trap storm on that thread that freezes the process.  The
-          	 * earlier version "solved" that by skipping the instruction after 64
-          	 * hits, which for a store means the store never happens and the target's
-          	 * frame is corrupted.  Both outcomes are worse than not arming.
-          	 *
-          	 * Only the actions survive, because every one of them moves pc: the
-          	 * instruction is not retried, so nothing storms.  KDBG_ACT_RET is the
-          	 * useful one - the function returns immediately with a chosen value, and
-          	 * not one byte of it is ever written.
-          	 *
-          	 * To find out who touches what, use a page watch: the page table is
-          	 * written, the page's contents are not, nothing traps on the retry path,
-          	 * and it reports the pc and the task.
+          	 * A data watchpoint is refused outright, and so is counting mode - a
+          	 * debug exception is taken before the access completes, this kernel
+          	 * does not single-step it, and the access therefore re-executes and
+          	 * traps forever.  Every action below moves pc, so none of them storms.
           	 */
-          	if (type == KDBG_BP_W)
+          	if (cfg->type == KDBG_BP_W)
           		return -EOPNOTSUPP;
-          	if (action == KDBG_ACT_NONE)
+          	if (cfg->action == KDBG_ACT_NONE)
           		return -EOPNOTSUPP;
           
           	for (slot = 0; slot < KDBG_HBP_SLOTS; slot++)
-          		if (!kdbg_hbp[slot].bp)
+          		if (!kdbg_hbp[slot].bp && !kdbg_hbp[slot].wbp)
           			break;
           	if (slot == KDBG_HBP_SLOTS)
           		return -ENOSPC;
           
-          	t = kdbg_get_task(pid);
+          	t = kdbg_get_task((pid_t)cfg->pid);
           	if (!t)
           		return -ESRCH;
           
           	hw_breakpoint_init(&attr);
-          	attr.bp_addr = addr;
-          	attr.bp_len  = len ? len : HW_BREAKPOINT_LEN_4;
-          	attr.bp_type = type ? HW_BREAKPOINT_W : HW_BREAKPOINT_X;
+          	attr.bp_addr = cfg->addr;
+          	attr.bp_len  = cfg->len ? cfg->len : HW_BREAKPOINT_LEN_4;
+          	attr.bp_type = cfg->type ? HW_BREAKPOINT_W : HW_BREAKPOINT_X;
           
-          	bp = register_user_hw_breakpoint(&attr, kdbg_hbp_triggered,
-          					 &kdbg_hbp[slot], t);
-          	put_task_struct(t);
-          
-          	if (IS_ERR(bp))
-          		return PTR_ERR(bp);
+          	/*
+          	 * Wide arms the address itself on every CPU, so one slot covers every
+          	 * thread of the game rather than the single thread it was armed on.  It
+          	 * also fires for any other process that reaches that address, which is
+          	 * what the tgid guard in the handler is for.
+          	 */
+          	if (cfg->flags & KDBG_HBPF_WIDE) {
+          		wbp = register_wide_hw_breakpoint(&attr, kdbg_hbp_triggered,
+          						  &kdbg_hbp[slot]);
+          		if (IS_ERR(wbp)) {
+          			put_task_struct(t);
+          			return PTR_ERR(wbp);
+          		}
+          	} else {
+          		bp = register_user_hw_breakpoint(&attr, kdbg_hbp_triggered,
+          						 &kdbg_hbp[slot], t);
+          		if (IS_ERR(bp)) {
+          			put_task_struct(t);
+          			return PTR_ERR(bp);
+          		}
+          	}
           
           	kdbg_hbp[slot].bp      = bp;
-          	kdbg_hbp[slot].addr    = addr;
+          	kdbg_hbp[slot].wbp     = wbp;
+          	kdbg_hbp[slot].tgid    = (unsigned long)task_tgid_vnr(t);
+          	kdbg_hbp[slot].addr    = cfg->addr;
           	kdbg_hbp[slot].hits    = 0;
           	kdbg_hbp[slot].last_pc = 0;
           	kdbg_hbp[slot].spent   = 0;
-          	kdbg_hbp[slot].action  = action;
-          	kdbg_hbp[slot].value   = value;
-          	kdbg_hbp[slot].reg     = reg;
+          	kdbg_hbp[slot].action  = cfg->action;
+          	kdbg_hbp[slot].value   = cfg->value;
+          	kdbg_hbp[slot].reg     = cfg->reg;
+          	kdbg_hbp[slot].nregs   = cfg->nregs > KDBG_HBP_REGS
+          			       ? KDBG_HBP_REGS : cfg->nregs;
+          	memcpy(kdbg_hbp[slot].regs, cfg->regs, sizeof(kdbg_hbp[slot].regs));
+          	memcpy(kdbg_hbp[slot].vals, cfg->vals, sizeof(kdbg_hbp[slot].vals));
+          
+          	put_task_struct(t);
           
           	return slot;
           }
           
           static long kdbg_hbp_del(unsigned long slot)
           {
-          	if (slot >= KDBG_HBP_SLOTS || !kdbg_hbp[slot].bp)
+          	if (slot >= KDBG_HBP_SLOTS)
+          		return -EINVAL;
+          	if (!kdbg_hbp[slot].bp && !kdbg_hbp[slot].wbp)
           		return -EINVAL;
           
-          	unregister_hw_breakpoint(kdbg_hbp[slot].bp);
-          	kdbg_hbp[slot].bp = NULL;
+          	if (kdbg_hbp[slot].wbp) {
+          		unregister_wide_hw_breakpoint(kdbg_hbp[slot].wbp);
+          		kdbg_hbp[slot].wbp = NULL;
+          	}
+          
+          	if (kdbg_hbp[slot].bp) {
+          		unregister_hw_breakpoint(kdbg_hbp[slot].bp);
+          		kdbg_hbp[slot].bp = NULL;
+          	}
+          
+          	kdbg_hbp[slot].tgid = 0;
           
           	return 0;
           }
@@ -1524,7 +1722,8 @@ jobs:
           {
           	u64 v[4];
           
-          	if (slot >= KDBG_HBP_SLOTS || !kdbg_hbp[slot].bp)
+          	if (slot >= KDBG_HBP_SLOTS ||
+          	    (!kdbg_hbp[slot].bp && !kdbg_hbp[slot].wbp))
           		return -EINVAL;
           
           	v[0] = kdbg_hbp[slot].hits;
@@ -1540,9 +1739,15 @@ jobs:
           	int slot;
           
           	for (slot = 0; slot < KDBG_HBP_SLOTS; slot++)
-          		if (kdbg_hbp[slot].bp) {
-          			unregister_hw_breakpoint(kdbg_hbp[slot].bp);
-          			kdbg_hbp[slot].bp = NULL;
+          		if (kdbg_hbp[slot].bp || kdbg_hbp[slot].wbp) {
+          			if (kdbg_hbp[slot].wbp) {
+          				unregister_wide_hw_breakpoint(kdbg_hbp[slot].wbp);
+          				kdbg_hbp[slot].wbp = NULL;
+          			}
+          			if (kdbg_hbp[slot].bp) {
+          				unregister_hw_breakpoint(kdbg_hbp[slot].bp);
+          				kdbg_hbp[slot].bp = NULL;
+          			}
           		}
           }
           #else /* !CONFIG_HAVE_HW_BREAKPOINT */
@@ -2282,6 +2487,115 @@ jobs:
           	return 0;
           }
           
+          /* ------------------------------------------------------- the syscall forward */
+          /*
+           * process_vm_readv() and process_vm_writev() end up in process_vm_rw(), and
+           * that function now calls kdbg_pvm_try() first (mm/process_vm_access.c, patched
+           * at build time - a compiled-in call, not a hook).
+           *
+           * This is the answer to a mod that opens no device and speaks no protocol: it
+           * reads memory one syscall at a time, and the syscall can be answered by us.
+           *
+           * Mode 1 records the caller and lets the kernel do the work exactly as before,
+           * which is how a packed binary's mechanism gets identified at all.  Mode 2
+           * performs the copy itself and the kernel's own path never runs.
+           */
+          static int kdbg_pvm_mode;
+          static struct kdbg_pvm_stat kdbg_pvm_tab[KDBG_PVM_SLOTS];
+          
+          static void kdbg_pvm_note(pid_t pid, unsigned long long bytes)
+          {
+          	int i, free = -1;
+          
+          	for (i = 0; i < KDBG_PVM_SLOTS; i++) {
+          		if (kdbg_pvm_tab[i].pid == pid) {
+          			kdbg_pvm_tab[i].calls++;
+          			kdbg_pvm_tab[i].bytes += bytes;
+          			return;
+          		}
+          		if (free < 0 && !kdbg_pvm_tab[i].pid)
+          			free = i;
+          	}
+          
+          	if (free < 0)
+          		return;			/* table full: the busiest callers stay */
+          
+          	kdbg_pvm_tab[free].pid   = pid;
+          	kdbg_pvm_tab[free].calls = 1;
+          	kdbg_pvm_tab[free].bytes = bytes;
+          	strlcpy(kdbg_pvm_tab[free].comm, current->comm, TASK_COMM_LEN);
+          }
+          
+          #define KDBG_PVM_IOV	16
+          
+          static ssize_t kdbg_pvm(pid_t pid, const struct iovec __user *lvec,
+          			unsigned long liovcnt, const struct iovec __user *rvec,
+          			unsigned long riovcnt, int vm_write)
+          {
+          	struct iovec li[KDBG_PVM_IOV], ri[KDBG_PVM_IOV];
+          	unsigned long long bytes = 0;
+          	unsigned long n, i;
+          	ssize_t done = 0;
+          
+          	if (!kdbg_pvm_mode || !pid || !lvec || !rvec)
+          		return KDBG_NOT_HANDLED;
+          	if (!liovcnt || !riovcnt)
+          		return KDBG_NOT_HANDLED;
+          
+          	/*
+          	 * Anything with more vectors than we have room for is left to the
+          	 * kernel untouched - we are a shortcut, not a reimplementation, and a
+          	 * shortcut that half-answers would be worse than no shortcut.
+          	 */
+          	if (liovcnt > KDBG_PVM_IOV || riovcnt > KDBG_PVM_IOV)
+          		return KDBG_NOT_HANDLED;
+          
+          	n = min(liovcnt, riovcnt);
+          
+          	if (copy_from_user(li, lvec, n * sizeof(struct iovec)) ||
+          	    copy_from_user(ri, rvec, n * sizeof(struct iovec)))
+          		return KDBG_NOT_HANDLED;
+          
+          	for (i = 0; i < n; i++)
+          		bytes += ri[i].iov_len;
+          
+          	kdbg_pvm_note(pid, bytes);
+          
+          	if (kdbg_pvm_mode < 2)
+          		return KDBG_NOT_HANDLED;	/* counting only */
+          
+          	/*
+          	 * The caller's own iovec is the destination for a read and the source
+          	 * for a write, and copy_to_user/copy_from_user work here because we
+          	 * are running in the caller's context, in its syscall.
+          	 */
+          	for (i = 0; i < n; i++) {
+          		unsigned long len = min_t(unsigned long,
+          					  li[i].iov_len, ri[i].iov_len);
+          		long r;
+          
+          		if (!len)
+          			break;
+          
+          		r = kdbg_rw(pid, (unsigned long)ri[i].iov_base,
+          			    (void __user *)li[i].iov_base, len, vm_write != 0);
+          		kdbg_xfer_note(len, r == (long)len);
+          
+          		if (r < 0) {
+          			if (!done)
+          				return r;
+          			break;
+          		}
+          
+          		done += r;
+          
+          		if ((unsigned long)r < len)
+          			break;
+          	}
+          
+          	return done;
+          }
+          
           /* ------------------------------------------------------------ memory layout */
           /*
            * Every mapping of a process, with permissions and the file behind it.
@@ -2490,16 +2804,23 @@ jobs:
           	case KDBG_OP_HWBP_STAT:
           	case KDBG_OP_HWBP_ARM:
           #ifdef CONFIG_HAVE_HW_BREAKPOINT
-          		if (op == KDBG_OP_HWBP_SET)
-          			return kdbg_hbp_set((pid_t)a1, a2, a3, a4,
-          					    KDBG_ACT_NONE, 0, 0);
+          		if (op == KDBG_OP_HWBP_SET) {
+          			struct kdbg_hbp_cfg cfg;
+          
+          			memset(&cfg, 0, sizeof(cfg));
+          			cfg.pid  = (int)a1;
+          			cfg.addr = a2;
+          			cfg.type = a3;
+          			cfg.len  = a4;
+          
+          			return kdbg_hbp_set(&cfg);
+          		}
           		if (op == KDBG_OP_HWBP_ARM) {
           			struct kdbg_hbp_cfg cfg;
           
           			if (copy_from_user(&cfg, (void __user *)a1, sizeof(cfg)))
           				return -EFAULT;
-          			return kdbg_hbp_set(cfg.pid, cfg.addr, cfg.type, cfg.len,
-          					    cfg.action, cfg.value, cfg.reg);
+          			return kdbg_hbp_set(&cfg);
           		}
           		if (op == KDBG_OP_HWBP_DEL)
           			return kdbg_hbp_del(a1);
@@ -2509,7 +2830,7 @@ jobs:
           #endif
           
           	case KDBG_OP_WATCH_ARM:
-          		return kdbg_watch_arm((pid_t)a1, a2, a3);
+          		return kdbg_watch_arm((pid_t)a1, a2, a3, a4);
           
           	case KDBG_OP_WATCH_STAT: {
           		struct kdbg_watch_info info;
@@ -2523,6 +2844,29 @@ jobs:
           
           	case KDBG_OP_WATCH_OFF:
           		return kdbg_watch_off(a1);
+          
+          	case KDBG_OP_HIJACK:
+          		if (a1 > 2)
+          			return -EINVAL;
+          		kdbg_pvm_mode = (int)a1;
+          		if (!kdbg_pvm_mode)
+          			memset(kdbg_pvm_tab, 0, sizeof(kdbg_pvm_tab));
+          		return 0;
+          
+          	case KDBG_OP_PVM_STAT: {
+          		struct kdbg_pvm_stat __user *u = (struct kdbg_pvm_stat __user *)a1;
+          		unsigned long n = a2;
+          
+          		if (u && n) {
+          			if (n > KDBG_PVM_SLOTS)
+          				n = KDBG_PVM_SLOTS;
+          			if (copy_to_user(u, kdbg_pvm_tab,
+          					 n * sizeof(struct kdbg_pvm_stat)))
+          				return -EFAULT;
+          		}
+          
+          		return kdbg_pvm_mode;
+          	}
           
           	case KDBG_OP_MAPS:
           		return kdbg_maps((pid_t)a1,
@@ -2589,6 +2933,7 @@ jobs:
           	kdbg_set_handler(kdbg_dispatch);
           	kdbg_set_prctl(kdbg_prctl);
           	kdbg_set_prctl_note(kdbg_prctl_note);
+          	kdbg_set_pvm(kdbg_pvm);
           	if (kdbg_compat)
           		kdbg_compat_init();
           	return 0;
@@ -2600,6 +2945,7 @@ jobs:
           	kdbg_compat_cleanup();
           	kdbg_hbp_cleanup();
           	kdbg_watch_off_all();	/* pages go back to normal before we leave */
+          	kdbg_set_pvm(NULL);
           	kdbg_set_prctl_note(NULL);
           	kdbg_set_prctl(NULL);
           	kdbg_set_handler(NULL);
@@ -2643,6 +2989,9 @@ jobs:
           #ifndef _LINUX_KDBG_WATCH_H
           #define _LINUX_KDBG_WATCH_H
           
+          #include <linux/limits.h>
+          #include <linux/types.h>
+          
           struct pt_regs;
           
           /*
@@ -2674,6 +3023,45 @@ jobs:
            * (all small numbers) are filtered out before they reach it.
            */
           void kdbg_set_prctl_note(void (*fn)(int option));
+          
+          /* ------------------------------------------------------------------------ */
+          /*
+           * The memory syscalls.
+           *
+           * The same trick as the prctl forward, one level up: mm/process_vm_access.c
+           * calls kdbg_pvm_try() at the top of process_vm_rw(), which is the single
+           * funnel both process_vm_readv and process_vm_writev go through.  A hack that
+           * opens no device and speaks no driver protocol reads memory with exactly that
+           * syscall - this is how it ends up using us without knowing.
+           *
+           * Three modes, set from userspace:
+           *     0  off     nothing at all happens
+           *     1  count   the call is recorded and the kernel does its normal work
+           *     2  serve   the copy happens through the driver and the normal work is
+           *                skipped
+           *
+           * Count mode exists so the question "does this hack use process_vm_readv?"
+           * can be answered from the kernel side, for a binary that is packed and cannot
+           * be read at all.  It changes no behaviour.
+           *
+           * The call site links against this file, which is always built in, and reaches
+           * the driver through a pointer; with no driver loaded the pointer is NULL and
+           * every caller gets KDBG_NOT_HANDLED and the kernel's own path.
+           */
+          struct iovec;
+          
+          #define KDBG_NOT_HANDLED	((ssize_t)LONG_MAX)
+          
+          typedef ssize_t (*kdbg_pvm_t)(pid_t pid, const struct iovec __user *lvec,
+          			      unsigned long liovcnt,
+          			      const struct iovec __user *rvec,
+          			      unsigned long riovcnt, int vm_write);
+          
+          void kdbg_set_pvm(kdbg_pvm_t fn);
+          
+          ssize_t kdbg_pvm_try(pid_t pid, const struct iovec __user *lvec,
+          		     unsigned long liovcnt, const struct iovec __user *rvec,
+          		     unsigned long riovcnt, int vm_write);
           
           #endif /* _LINUX_KDBG_WATCH_H */
           TW_I
@@ -2841,6 +3229,62 @@ jobs:
           
           echo "--- what the prctl entry now does ---"
           grep -n -B2 -A6 'kdbg_prctl_entry' "$F" || echo "(the call is not there - check the patch above)"
+      - name: Forward the memory syscalls
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          F=mm/process_vm_access.c
+          test -f "$F" || { echo "no $F"; exit 1; }
+          
+          python3 - "$F" <<'PYPVM'
+          import sys
+          
+          path = sys.argv[1]
+          src = open(path).read()
+          
+          if 'kdbg.h' not in src:
+              anchor = '#include <linux/uio.h>'
+              if anchor in src:
+                  src = src.replace(anchor, anchor + '\n#include <linux/kdbg.h>', 1)
+              else:
+                  lines = src.split('\n')
+                  last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
+                  lines.insert(last + 1, '#include <linux/kdbg.h>')
+                  src = '\n'.join(lines)
+              print('added the include')
+          
+          OLD = ("\tint dir = vm_write ? WRITE : READ;\n"
+                 "\n"
+                 "\tif (flags != 0)\n"
+                 "\t\treturn -EINVAL;\n")
+          
+          NEW = OLD + ("\n"
+              "\t{\n"
+              "\t\t/*\n"
+              "\t\t * kdbg: offered to the driver first, before the kernel's own\n"
+              "\t\t * walk.  The driver answers KDBG_NOT_HANDLED unless userspace\n"
+              "\t\t * has switched this on, so an unmodified kernel behaves exactly\n"
+              "\t\t * as it always did.\n"
+              "\t\t */\n"
+              "\t\tssize_t kdbg_rc = kdbg_pvm_try(pid, lvec, liovcnt, rvec,\n"
+              "\t\t\t\t\t       riovcnt, vm_write);\n"
+              "\n"
+              "\t\tif (kdbg_rc != KDBG_NOT_HANDLED)\n"
+              "\t\t\treturn kdbg_rc;\n"
+              "\t}\n")
+          
+          if 'kdbg_pvm_try' in src:
+              print('already forwarded')
+          elif OLD in src:
+              src = src.replace(OLD, NEW, 1)
+              open(path, 'w').write(src)
+              print('added the forwarding')
+          else:
+              sys.exit('process_vm_rw does not look as expected in %s' % path)
+          PYPVM
+          
+          echo "--- what process_vm_rw now does first ---"
+          grep -n -A9 'kdbg: offered to the driver first' "$F" || echo "(the call is not there - check the patch above)"
       - name: Add the kdbg syscall number
         working-directory: ${{ github.workspace }}/kernel
         run: |
@@ -3187,6 +3631,17 @@ jobs:
               TOWA_OP_COMPAT_STAT = 12,
               TOWA_OP_MAPS        = 13,
               TOWA_OP_XFER        = 14,
+              TOWA_OP_HIJACK      = 15,
+              TOWA_OP_PVM_STAT    = 16,
+          };
+          
+          #define TOWA_PVM_SLOTS 8
+          
+          struct towa_pvm_stat {
+              int pid;
+              unsigned int calls;
+              unsigned long long bytes;
+              char comm[16];
           };
           
           #define TOWA_MAP_R 0x1
@@ -3223,6 +3678,11 @@ jobs:
           #define TOWA_ACT_PC   3
           #define TOWA_ACT_X0   4
           #define TOWA_ACT_REG  5
+          #define TOWA_ACT_GP   6
+          #define TOWA_ACT_FP   7
+          
+          #define TOWA_HBP_REGS 8
+          #define TOWA_HBPF_WIDE 0x1
           
           #define TOWA_WATCH_WRITE  0
           #define TOWA_WATCH_ACCESS 1
@@ -3241,6 +3701,10 @@ jobs:
               unsigned long action;
               unsigned long value;
               unsigned long reg;
+              unsigned long flags;                 /* TOWA_HBPF_WIDE */
+              unsigned long nregs;
+              unsigned long regs[TOWA_HBP_REGS];
+              unsigned long vals[TOWA_HBP_REGS];
           };
           
           struct towa_watch_info {
@@ -3249,6 +3713,8 @@ jobs:
               unsigned long long last_task;
               unsigned long addr;
               unsigned long flags;
+              unsigned long long regs[8];          /* x0..x7 at the fault */
+              unsigned long long sp;
           };
           
           // The syscall number is NOT fixed: it is whatever was free in the tree the
@@ -3516,11 +3982,60 @@ jobs:
           // records who, from where, and whether it was a write, then puts the page back
           // and lets the access through. Nothing in the game's memory is modified.
           
-          static long towa_watch_arm(int pid, unsigned long addr, unsigned long mode)
+          static long towa_watch_arm(int pid, unsigned long addr, unsigned long mode,
+                                     unsigned long len)
           {
-              long r = towa(TOWA_OP_WATCH_ARM, (unsigned long)pid, addr, mode);
+              long r = towa(TOWA_OP_WATCH_ARM, (unsigned long)pid, addr, mode, len);
               if (r < 0) perr("watch arm", r);
               return r;
+          }
+          
+          // A set of registers at one instruction: the GP form writes general registers,
+          // the FP form writes SIMD ones by index (3,4,5 are s3/s4/s5, which is where a
+          // bullet's direction lives).  Either way the instruction is skipped and the
+          // function carries on with the values we put there.
+          //
+          //   towacli hbp gp <pid> <hexaddr> <reg:val[,reg:val...]> [wide]
+          //   towacli hbp fp <pid> <hexaddr> <idx:val[,idx:val...]> [wide]
+          //
+          // Values are hex, and for fp they are the raw 32-bit float bits.
+          static int cmd_hbp_set(int pid, unsigned long addr, bool fp, const char *list,
+                                 bool wide)
+          {
+              towa_hbp_cfg cfg;
+              memset(&cfg, 0, sizeof(cfg));
+          
+              cfg.pid    = pid;
+              cfg.type   = TOWA_BP_X;
+              cfg.addr   = addr;
+              cfg.action = fp ? TOWA_ACT_FP : TOWA_ACT_GP;
+              if (wide)
+                  cfg.flags |= TOWA_HBPF_WIDE;
+          
+              const char *p = list;
+              while (*p && cfg.nregs < TOWA_HBP_REGS) {
+                  char *end = NULL;
+                  unsigned long idx = strtoul(p, &end, 0);
+                  if (!end || *end != ':') { printf("bad list at '%s'\n", p); return 2; }
+          
+                  unsigned long val = strtoul(end + 1, &end, 0);
+          
+                  cfg.regs[cfg.nregs] = idx;
+                  cfg.vals[cfg.nregs] = val;
+                  cfg.nregs++;
+          
+                  p = end;
+                  if (*p == ',') p++;
+              }
+          
+              if (!cfg.nregs) { printf("no registers given\n"); return 2; }
+          
+              long slot = towa(TOWA_OP_HWBP_ARM, (unsigned long)&cfg);
+              if (slot < 0) { perr("hbp set", slot); return 1; }
+          
+              printf("slot %ld armed: %s%s at 0x%lx, %lu register(s)\n",
+                     slot, wide ? "wide " : "", fp ? "fp" : "gp", addr, cfg.nregs);
+              return 0;
           }
           
           static long towa_watch_off(unsigned long slot)
@@ -3542,6 +4057,10 @@ jobs:
                      slot, w.addr, w.hits,
                      (w.flags & TOWA_WF_ACCESS) ? "access" : "write",
                      (w.flags & TOWA_WF_SPENT) ? "" : "(still armed) ");
+          
+              if (w.regs[0] || w.regs[1] || w.regs[2] || w.regs[3] || w.sp)
+                  printf("\n  at the access: x0 0x%llx  x1 0x%llx  x2 0x%llx  x3 0x%llx  sp 0x%llx",
+                         w.regs[0], w.regs[1], w.regs[2], w.regs[3], w.sp);
           
               if (w.hits) {
                   printf("pid %llu pc 0x%llx  %s",
@@ -3949,6 +4468,62 @@ jobs:
            * it is in the foreground - so the watching has to happen while the terminal is
            * not on screen.  Arm now, play, then `towacli report`.
            */
+          // -------------------------------------------------- the memory syscalls
+          //
+          // process_vm_readv / process_vm_writev are offered to the driver before the
+          // kernel handles them (a call compiled into process_vm_rw, nothing hooked).
+          // Off by default; "count" records who calls them without changing anything,
+          // "serve" answers them through the driver instead.
+          //
+          // This is how a mod that opens no device and speaks no protocol ends up using
+          // the driver - and count mode is how its mechanism gets identified at all,
+          // when its binary is packed and cannot be read.
+          
+          static int cmd_hijack(const char *arg)
+          {
+              if (arg) {
+                  int m = !strcmp(arg, "off")   ? 0
+                        : !strcmp(arg, "count") ? 1
+                        : !strcmp(arg, "serve") ? 2 : -1;
+          
+                  if (m < 0) {
+                      printf("usage: hijack [off|count|serve]\n");
+                      return 2;
+                  }
+          
+                  long r = towa(TOWA_OP_HIJACK, (unsigned long)m);
+                  if (r < 0) { perr("hijack", r); return 1; }
+              }
+          
+              towa_pvm_stat st[TOWA_PVM_SLOTS];
+              memset(st, 0, sizeof(st));
+          
+              long mode = towa(TOWA_OP_PVM_STAT,
+                               (unsigned long)(uintptr_t)st, TOWA_PVM_SLOTS);
+              if (mode < 0) { perr("pvm stat", mode); return 1; }
+          
+              printf("memory syscalls : %s\n",
+                     mode == 0 ? "off" : mode == 1 ? "count only (kernel still does the work)"
+                                                   : "served by the driver");
+          
+              bool any = false;
+              for (int i = 0; i < TOWA_PVM_SLOTS; i++)
+                  if (st[i].pid) any = true;
+          
+              if (!any) {
+                  printf("callers         : none recorded\n");
+                  return 0;
+              }
+          
+              printf("  %-8s %-18s %-12s %s\n", "pid", "comm", "calls", "bytes");
+              for (int i = 0; i < TOWA_PVM_SLOTS; i++)
+                  if (st[i].pid)
+                      printf("  %-8d %-18s %-12u %llu\n",
+                             st[i].pid, st[i].comm, st[i].calls, st[i].bytes);
+          
+              return 0;
+          }
+          
           // ------------------------------------------------------- the memory layout
           //
           // Our own answer to /proc/<pid>/maps: every mapping, its permissions, and the
@@ -4175,7 +4750,7 @@ jobs:
                   if (!sp) continue;
           
                   unsigned long page = sp & ~0xfffUL;
-                  long slot = towa_watch_arm(cand[i].tid, page, TOWA_WATCH_WRITE);
+                  long slot = towa_watch_arm(cand[i].tid, page, TOWA_WATCH_WRITE, 0);
                   if (slot < 0) continue;
           
                   printf("  slot %ld  tid %-6d %-16s page 0x%lx\n",
@@ -4407,6 +4982,9 @@ jobs:
                   "                                are the only visible part of this driver\n"
                   "  compat                        the same thing a scene hack does, through\n"
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
+                  "  hijack [off|count|serve]      offer process_vm_readv/writev to the driver\n"
+                  "                                first; count names the callers without\n"
+                  "                                changing anything, serve answers them\n"
                   "  maps <pid|name>               every mapping of a process: start, end,\n"
                   "                                perms, offset, module - our own answer\n"
                   "                                to /proc/<pid>/maps\n"
@@ -4510,6 +5088,9 @@ jobs:
               if (cmd == "who")
                   return cmd_who();
           
+              if (cmd == "hijack")
+                  return cmd_hijack(a.size() > 1 ? a[1].c_str() : nullptr);
+          
               if (cmd == "maps") {
                   int pid = a.size() > 1 ? resolve_pid(a[1].c_str()) : find_game();
                   return cmd_maps(pid);
@@ -4579,7 +5160,7 @@ jobs:
                   int me = getpid();
                   printf("selftest: pid %d, page %p\n", me, p);
           
-                  long slot = towa_watch_arm(me, (unsigned long)p, TOWA_WATCH_WRITE);
+                  long slot = towa_watch_arm(me, (unsigned long)p, TOWA_WATCH_WRITE, 0);
                   if (slot < 0) {
                       printf("selftest: arm failed - that alone is the bug\n");
                       munmap(p, 4096);
@@ -4635,6 +5216,18 @@ jobs:
               // Hardware breakpoints. Nothing is written to the target: the address just
               // goes into a debug register, so unlike a hook there is no patched byte for
               // anything to find.
+              if (cmd == "hbp" && a.size() >= 5 &&
+                  (a[1] == "gp" || a[1] == "fp")) {
+                  int pid = resolve_pid(a[2].c_str());
+                  unsigned long addr = strtoul(a[3].c_str(), NULL, 16);
+                  bool wide = false;
+          
+                  for (size_t i = 5; i < a.size(); i++)
+                      if (a[i] == "wide") wide = true;
+          
+                  return cmd_hbp_set(pid, addr, a[1] == "fp", a[4].c_str(), wide);
+              }
+          
               if (cmd == "hbp") {
                   if (a.size() < 2) { usage(argv[0]); return 2; }
           
@@ -4764,7 +5357,7 @@ jobs:
                   printf("pid %d  tid %d (%s)  sp 0x%lx  page 0x%lx\n",
                          pid, tid, comm, sp, page);
           
-                  long slot = towa_watch_arm(tid, page, TOWA_WATCH_WRITE);
+                  long slot = towa_watch_arm(tid, page, TOWA_WATCH_WRITE, 0);
                   if (slot < 0) {
                       printf("(the page under the live stack pointer should always be mapped;\n"
                              " EFAULT here means it is not faulted in yet - try again)\n");
@@ -4807,7 +5400,10 @@ jobs:
                   unsigned long mode = (a.size() > base + 2 && a[base + 2] == "a")
                                        ? TOWA_WATCH_ACCESS : TOWA_WATCH_WRITE;
           
-                  long slot = towa_watch_arm(pid, addr, mode);
+                  unsigned long wlen = a.size() > (sweep ? 4u : 3u)
+                          ? strtoul(a[sweep ? 4 : 3].c_str(), NULL, 0) : 0;
+          
+                  long slot = towa_watch_arm(pid, addr, mode, wlen);
                   if (slot < 0) {
                       printf("(ENOENT  = that address is not in any mapping of that pid -\n"
                              "          the layout changed, get the address again\n"
