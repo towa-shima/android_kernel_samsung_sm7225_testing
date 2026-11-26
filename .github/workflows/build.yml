@@ -274,7 +274,60 @@ jobs:
           	 * closed stays visible.
           	 */
           	KDBG_OP_COMPAT_STAT = 12,/* a1=&struct kdbg_compat_stat -> 0		*/
+          
+          	/*
+          	 * The process's memory layout: every mapping, with its permissions and
+          	 * the module name when it has a file behind it.  One base address is
+          	 * enough to start from a module; an ESP needs the segments, and a
+          	 * pointer scan needs to know which regions are worth touching.
+          	 */
+          	KDBG_OP_MAPS       = 13,/* a1=pid a2=&struct kdbg_maps_req -> 0	*/
+          
+          	/*
+          	 * A batch of transfers in one call.
+          	 *
+          	 * A client reading a hundred entities per frame otherwise costs a
+          	 * hundred kernel entries per frame; this costs one.  Results go back in
+          	 * the same array, per entry, so a single bad address does not lose the
+          	 * rest of the batch.
+          	 */
+          	KDBG_OP_XFER       = 14,/* a1=&struct kdbg_xfer[] a2=count a3=write? -> 0 */
           };
+          
+          #define KDBG_MAP_R	0x1
+          #define KDBG_MAP_W	0x2
+          #define KDBG_MAP_X	0x4
+          #define KDBG_MAP_P	0x8	/* shared, not private			*/
+          
+          #define KDBG_MAP_NAME	64	/* bytes kept of a mapping's file name	*/
+          
+          struct kdbg_map {
+          	unsigned long long	start;
+          	unsigned long long	end;
+          	unsigned long long	offset;
+          	unsigned int		perm;
+          	unsigned int		name_off;	/* ~0u when unnamed	*/
+          };
+          
+          struct kdbg_maps_req {
+          	unsigned int		cap;		/* entries the array holds	*/
+          	unsigned int		names_cap;	/* bytes in the names buffer	*/
+          	/* filled in by the driver */
+          	unsigned int		names_used;
+          	unsigned int		total;		/* mappings the process has	*/
+          	unsigned long long	entries;	/* &struct kdbg_map[cap]	*/
+          	unsigned long long	names;		/* char[names_cap]		*/
+          };
+          
+          struct kdbg_xfer {
+          	int			pid;
+          	unsigned int		len;
+          	unsigned long long	addr;
+          	unsigned long long	buf;
+          	long long		result;		/* bytes, or -errno		*/
+          };
+          
+          #define KDBG_XFER_MAX	128
           
           struct kdbg_compat_stat {
           	unsigned long long	opens;		/* nodes open right now		*/
@@ -2229,6 +2282,178 @@ jobs:
           	return 0;
           }
           
+          /* ------------------------------------------------------------ memory layout */
+          /*
+           * Every mapping of a process, with permissions and the file behind it.
+           *
+           * /proc/<pid>/maps would say the same thing, but it is a file the target can
+           * have closed off, it costs a parse on the caller's side, and it goes through
+           * the filesystem for something the kernel already has in memory.  Walking the
+           * VMA list is the same walk that file would do.
+           *
+           * The names are appended to a separate buffer, deduplicated against the
+           * previous entry, so a module with eight segments costs one name.
+           */
+          static long kdbg_maps(pid_t pid, struct kdbg_maps_req __user *ureq)
+          {
+          	struct kdbg_maps_req req;
+          	struct task_struct *t;
+          	struct mm_struct *mm;
+          	struct vm_area_struct *vma;
+          	char last[KDBG_MAP_NAME];
+          	unsigned int done = 0, total = 0, names_used = 0, last_off = ~0u;
+          	long ret = 0;
+          
+          	if (copy_from_user(&req, ureq, sizeof(req)))
+          		return -EFAULT;
+          	if (!req.entries && req.cap)
+          		return -EINVAL;
+          
+          	t = kdbg_get_task(pid);
+          	if (!t)
+          		return -ESRCH;
+          	mm = get_task_mm(t);
+          	put_task_struct(t);
+          	if (!mm)
+          		return -EINVAL;
+          
+          	last[0] = '\0';
+          
+          	mmap_read_lock(mm);
+          
+          	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+          		struct kdbg_map m;
+          		char name[KDBG_MAP_NAME];
+          		unsigned int noff = ~0u;
+          
+          		total++;
+          
+          		if (!ret && done >= req.cap)
+          			ret = -ENOSPC;	/* keep walking to count the rest */
+          
+          		if (!ret) {
+          			memset(name, 0, sizeof(name));
+          
+          			if (vma->vm_file) {
+          				const struct qstr *q;
+          
+          				rcu_read_lock();
+          				q = &vma->vm_file->f_path.dentry->d_name;
+          				if (q->len && q->len < sizeof(name))
+          					memcpy(name, q->name, q->len);
+          				rcu_read_unlock();
+          			}
+          
+          			if (name[0]) {
+          				if (!strcmp(name, last)) {
+          					noff = last_off;
+          				} else {
+          					size_t need = strlen(name) + 1;
+          
+          					if (names_used + need <= req.names_cap) {
+          						if (copy_to_user(
+          						    (char __user *)(unsigned long)(req.names + names_used),
+          						    name, need)) {
+          							ret = -EFAULT;
+          							goto next_vma;
+          						}
+          						noff = names_used;
+          						names_used += need;
+          					}
+          					strlcpy(last, name, sizeof(last));
+          					last_off = noff;
+          				}
+          			}
+          
+          			m.start    = vma->vm_start;
+          			m.end      = vma->vm_end;
+          			m.offset   = (unsigned long long)vma->vm_pgoff << PAGE_SHIFT;
+          			m.perm     = 0;
+          			m.name_off = noff;
+          
+          			if (vma->vm_flags & VM_READ)
+          				m.perm |= KDBG_MAP_R;
+          			if (vma->vm_flags & VM_WRITE)
+          				m.perm |= KDBG_MAP_W;
+          			if (vma->vm_flags & VM_EXEC)
+          				m.perm |= KDBG_MAP_X;
+          			if (vma->vm_flags & VM_MAYSHARE)
+          				m.perm |= KDBG_MAP_P;
+          
+          			if (copy_to_user(
+          			    (void __user *)(unsigned long)(req.entries +
+          					(unsigned long long)done * sizeof(m)),
+          			    &m, sizeof(m))) {
+          				ret = -EFAULT;
+          				goto next_vma;
+          			}
+          
+          			done++;
+          		}
+          next_vma:
+          		;
+          	}
+          
+          	mmap_read_unlock(mm);
+          	mmput(mm);
+          
+          	req.names_used = names_used;
+          	req.total      = total;
+          	if (copy_to_user(ureq, &req, sizeof(req)))
+          		return -EFAULT;
+          
+          	if (ret == -ENOSPC) {
+          		/*
+          		 * The array was too small, but everything that fit was written and
+          		 * `total` says how much there is.  That is not a failure - the
+          		 * caller can size its arrays from total and ask again.
+          		 */
+          		return 0;
+          	}
+          
+          	return ret;
+          }
+          
+          /* --------------------------------------------------------------- batch i/o */
+          /*
+           * Many transfers behind one kernel entry.
+           *
+           * An ESP reading a hundred entities a frame is a hundred syscalls a frame, and
+           * the syscall is the expensive part, not the copy.  Each entry carries its own
+           * result so one bad address costs one entry rather than the batch.
+           */
+          static long kdbg_xfer_batch(struct kdbg_xfer __user *uent, unsigned int count,
+          			    bool write)
+          {
+          	unsigned int i;
+          
+          	if (!uent || !count || count > KDBG_XFER_MAX)
+          		return -EINVAL;
+          
+          	for (i = 0; i < count; i++) {
+          		struct kdbg_xfer e;
+          
+          		if (copy_from_user(&e, &uent[i], sizeof(e)))
+          			return -EFAULT;
+          
+          		if (!e.len || e.len > KDBG_MAX_XFER || !e.buf) {
+          			e.result = -EINVAL;
+          		} else {
+          			long r = kdbg_rw(e.pid, (unsigned long)e.addr,
+          					 (void __user *)(unsigned long)e.buf,
+          					 e.len, write);
+          
+          			e.result = r;
+          			kdbg_xfer_note(e.len, r == (long)e.len);
+          		}
+          
+          		if (copy_to_user(&uent[i].result, &e.result, sizeof(e.result)))
+          			return -EFAULT;
+          	}
+          
+          	return 0;
+          }
+          
           /* ------------------------------------------------------------------ dispatch */
           
           static long kdbg_dispatch(unsigned long op, unsigned long a1, unsigned long a2,
@@ -2298,6 +2523,14 @@ jobs:
           
           	case KDBG_OP_WATCH_OFF:
           		return kdbg_watch_off(a1);
+          
+          	case KDBG_OP_MAPS:
+          		return kdbg_maps((pid_t)a1,
+          				 (struct kdbg_maps_req __user *)a2);
+          
+          	case KDBG_OP_XFER:
+          		return kdbg_xfer_batch((struct kdbg_xfer __user *)a1,
+          				       (unsigned int)a2, a3 != 0);
           
           	case KDBG_OP_COMPAT:
           		if (a1)
@@ -2892,7 +3125,7 @@ jobs:
           fi
           ls -l "$GITHUB_WORKSPACE/out/"
 
-      - name: Build the client (towacli)
+      - name: Build the clients (towacli + towamod)
         run: |
           set -e
           # The kernel build is finished and its outputs are in $GITHUB_WORKSPACE/out, so
@@ -2952,6 +3185,33 @@ jobs:
               TOWA_OP_WATCH_OFF  = 10,
               TOWA_OP_COMPAT     = 11,
               TOWA_OP_COMPAT_STAT = 12,
+              TOWA_OP_MAPS        = 13,
+              TOWA_OP_XFER        = 14,
+          };
+          
+          #define TOWA_MAP_R 0x1
+          #define TOWA_MAP_W 0x2
+          #define TOWA_MAP_X 0x4
+          #define TOWA_MAP_P 0x8
+          
+          #define TOWA_XFER_MAX 128
+          
+          struct towa_map {
+              unsigned long long start, end, offset;
+              unsigned int perm;
+              unsigned int name_off;
+          };
+          
+          struct towa_maps_req {
+              unsigned int cap, names_cap, names_used, total;
+              unsigned long long entries, names;
+          };
+          
+          struct towa_xfer {
+              int pid;
+              unsigned int len;
+              unsigned long long addr, buf;
+              long long result;
           };
           
           #define TOWA_BP_X 0
@@ -3689,6 +3949,91 @@ jobs:
            * it is in the foreground - so the watching has to happen while the terminal is
            * not on screen.  Arm now, play, then `towacli report`.
            */
+          // ------------------------------------------------------- the memory layout
+          //
+          // Our own answer to /proc/<pid>/maps: every mapping, its permissions, and the
+          // file behind it, straight out of the target's VMA list through the driver.
+          
+          static int cmd_maps(int pid)
+          {
+              if (pid <= 0) { printf("no pid\n"); return 1; }
+          
+              const unsigned int cap = 512;
+              const unsigned int names_cap = 32 * 1024;
+          
+              std::vector<towa_map> maps(cap);
+              std::vector<char>     names(names_cap);
+          
+              towa_maps_req req;
+              memset(&req, 0, sizeof(req));
+              req.cap       = cap;
+              req.names_cap = names_cap;
+              req.entries   = (unsigned long long)(uintptr_t)maps.data();
+              req.names     = (unsigned long long)(uintptr_t)names.data();
+          
+              long r = towa(TOWA_OP_MAPS, (unsigned long)pid, (unsigned long)&req);
+              if (r < 0) { perr("maps", r); return 1; }
+          
+              printf("pid %d: %u mappings (%u shown)\n", pid, req.total, req.cap);
+              printf("  %-18s %-18s %-5s %-9s %s\n", "start", "end", "perm", "offset", "name");
+          
+              for (unsigned int i = 0; i < cap; i++) {
+                  const towa_map &m = maps[i];
+                  if (!m.start)
+                      break;
+          
+                  char perm[5] = { '.', '.', '.', '.', 0 };
+                  if (m.perm & TOWA_MAP_R) perm[0] = 'r';
+                  if (m.perm & TOWA_MAP_W) perm[1] = 'w';
+                  if (m.perm & TOWA_MAP_X) perm[2] = 'x';
+                  if (m.perm & TOWA_MAP_P) perm[3] = 's';
+          
+                  const char *name = "";
+                  if (m.name_off != 0xffffffffu && m.name_off < names_cap)
+                      name = &names[m.name_off];
+          
+                  printf("  %016llx-%016llx %-5s %09llx %s\n",
+                         m.start, m.end, perm, m.offset, name);
+              }
+          
+              return 0;
+          }
+          
+          // --------------------------------------------------------------- batch read
+          //
+          // One call, one entry: proves the batch op end to end.  The same op with more
+          // entries is what the mod will use, a frame's worth of fields per syscall.
+          
+          static int cmd_xfer(int pid, unsigned long addr, unsigned long len)
+          {
+              if (pid <= 0 || !addr || !len || len > 4096) {
+                  printf("usage: xfer <pid|name> <hexaddr> <len up to 4096>\n");
+                  return 2;
+              }
+          
+              std::vector<unsigned char> buf(len);
+              towa_xfer e;
+              memset(&e, 0, sizeof(e));
+              e.pid  = pid;
+              e.len  = (unsigned int)len;
+              e.addr = addr;
+              e.buf  = (unsigned long long)(uintptr_t)buf.data();
+          
+              long r = towa(TOWA_OP_XFER, (unsigned long)&e, 1, 0);
+              if (r < 0) { perr("xfer", r); return 1; }
+          
+              if (e.result < 0) {
+                  printf("one entry, result %lld - that address did not read\n",
+                         (long long)e.result);
+                  return 1;
+              }
+          
+              printf("one entry, %lld byte(s) through the batch op\n", (long long)e.result);
+              hexdump(addr, buf.data(), (int)e.result);
+          
+              return 0;
+          }
+          
           // ------------------------------------------------- find a string in a process
           //
           // Hacks ship packed: the one on the phone has 300 readable strings in the file
@@ -4062,6 +4407,10 @@ jobs:
                   "                                are the only visible part of this driver\n"
                   "  compat                        the same thing a scene hack does, through\n"
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
+                  "  maps <pid|name>               every mapping of a process: start, end,\n"
+                  "                                perms, offset, module - our own answer\n"
+                  "                                to /proc/<pid>/maps\n"
+                  "  xfer <pid> <addr> <len>       read through the batch op, one entry\n"
                   "  who                           IS a hack using the driver?  opens,\n"
                   "                                reads, writes, lookups, and who\n"
                   "  scan <pid|name> <string>      find one of a packed hack's own strings\n"
@@ -4160,6 +4509,21 @@ jobs:
               // One command, one answer: is anything actually driving the kernel side?
               if (cmd == "who")
                   return cmd_who();
+          
+              if (cmd == "maps") {
+                  int pid = a.size() > 1 ? resolve_pid(a[1].c_str()) : find_game();
+                  return cmd_maps(pid);
+              }
+          
+              if (cmd == "xfer") {
+                  if (a.size() < 4) {
+                      printf("usage: xfer <pid|name> <hexaddr> <len>\n");
+                      return 2;
+                  }
+                  return cmd_xfer(resolve_pid(a[1].c_str()),
+                                  strtoul(a[2].c_str(), nullptr, 16),
+                                  strtoul(a[3].c_str(), nullptr, 10));
+              }
           
               // For a packed hack: find one of its own strings in its own memory.
               if (cmd == "scan") {
@@ -4528,6 +4892,278 @@ jobs:
                  -DTOWACLI_BUILD="\"$STAMP\"" \
                  -o "$GITHUB_WORKSPACE/tools/towacli" "$GITHUB_WORKSPACE/tools/towacli.cpp"
           
+          cat > "$GITHUB_WORKSPACE/tools/towamod.cpp" <<'TW_MOD'
+          // towamod.cpp - our own mod, on our own driver.
+          //
+          // Built in AIDE Pro as a plain C++ native executable, the same way towacli is.
+          // It talks to kdbg through its syscall, which means:
+          //
+          //   - no device node, so nothing appears in /dev while this runs
+          //   - `compat` never has to be switched on
+          //   - no root needed for reads and writes (only the ioctl path checks
+          //     CAP_SYS_PTRACE; the syscall path does not)
+          //   - nothing injected into the game, no zygisk, no library of anyone else's
+          //
+          // The shell wrapper (towamod.sh) does the root check, unpacking and menu; this
+          // binary is the thing that actually does the work.
+          //
+          // Layout of the work, so the file stays readable:
+          //     driver        the syscall, and the three operations that matter
+          //     target        finding the game, its module, its module base
+          //     games         per-game knowledge (Free Fire first)
+          //     menu          what to turn on
+          //     main          the loop
+          
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdint>
+          #include <cerrno>
+          #include <string>
+          #include <vector>
+          #include <dirent.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/syscall.h>
+          
+          #ifndef NR_TOWA
+          #define NR_TOWA 0        /* the build passes -DNR_TOWA=<number from the log> */
+          #endif
+          
+          #define TOWA_COOKIE 0x9E3779B97F4A7C15ULL
+          #define TOWA_MAGIC  0x5032300AUL
+          
+          enum {
+              OP_PING       = 0,
+              OP_READ       = 1,
+              OP_WRITE      = 2,
+              OP_BASE       = 3,
+          };
+          
+          static unsigned long g_nr = NR_TOWA;
+          
+          static long drv(unsigned long op, unsigned long a1 = 0, unsigned long a2 = 0,
+                          unsigned long a3 = 0, unsigned long a4 = 0)
+          {
+              return syscall((long)g_nr, (unsigned long)TOWA_COOKIE, op, a1, a2, a3, a4);
+          }
+          
+          static bool drv_read(int pid, unsigned long addr, void *buf, unsigned long len)
+          {
+              return drv(OP_READ, (unsigned long)pid, addr, (unsigned long)buf, len) == (long)len;
+          }
+          
+          static bool drv_write(int pid, unsigned long addr, const void *buf, unsigned long len)
+          {
+              return drv(OP_WRITE, (unsigned long)pid, addr,
+                         (unsigned long)buf, len) == (long)len;
+          }
+          
+          static unsigned long drv_base(int pid, const char *module)
+          {
+              unsigned long base = 0;
+          
+              if (drv(OP_BASE, (unsigned long)pid, (unsigned long)module,
+                      (unsigned long)&base) < 0)
+                  return 0;
+          
+              return base;
+          }
+          
+          /* ------------------------------------------------------------------ target */
+          
+          // A pid or a process name - the same convenience towacli has, because the game
+          // is found by its command line, not by `pidof` (which matches the 15-character
+          // kernel name and therefore never matches a package name).
+          static int find_pid(const char *name)
+          {
+              DIR *d = opendir("/proc");
+              if (!d)
+                  return -1;
+          
+              int loose = -1;
+              size_t nlen = strlen(name);
+              struct dirent *e;
+          
+              while ((e = readdir(d)) != NULL) {
+                  if (e->d_name[0] < '0' || e->d_name[0] > '9')
+                      continue;
+          
+                  char path[64], cmd[256] = {0};
+                  snprintf(path, sizeof(path), "/proc/%s/cmdline", e->d_name);
+          
+                  int fd = open(path, O_RDONLY);
+                  if (fd < 0)
+                      continue;
+                  ssize_t n = read(fd, cmd, sizeof(cmd) - 1);
+                  close(fd);
+                  if (n <= 0)
+                      continue;
+          
+                  if (!strcmp(cmd, name)) {          /* exact */
+                      int pid = atoi(e->d_name);
+                      closedir(d);
+                      return pid;
+                  }
+                  if (loose < 0 && strlen(cmd) >= nlen && !strncmp(cmd, name, nlen))
+                      loose = atoi(e->d_name);       /* same prefix */
+              }
+          
+              closedir(d);
+              return loose;
+          }
+          
+          /* ------------------------------------------------------------------- games */
+          
+          struct game {
+              const char *label;
+              const char *package;
+              const char *module;        /* the module every offset is relative to */
+          };
+          
+          static const struct game g_games[] = {
+              { "Free Fire",       "com.dts.freefireth",  "libil2cpp.so" },
+              { "Free Fire MAX",   "com.dts.freefiremax", "libil2cpp.so" },
+              { "PUBG Mobile",     "com.tencent.ig",      "libUE4.so"    },
+          };
+          
+          #define GAME_COUNT (int)(sizeof(g_games) / sizeof(g_games[0]))
+          
+          struct target {
+              int pid = -1;
+              const struct game *g = nullptr;
+              unsigned long base = 0;
+          };
+          
+          // Probes one game into its own local target and commits nothing, so a later
+          // game that is not running cannot overwrite a target that was found.
+          static bool target_acquire(target &t, const struct game &g)
+          {
+              int pid = find_pid(g.package);
+              if (pid <= 0) {
+                  printf("  %-16s not running\n", g.label);
+                  return false;
+              }
+          
+              unsigned long base = drv_base(pid, g.module);
+              if (!base) {
+                  printf("  %-16s pid %d, but no %s - is it loaded yet?\n",
+                         g.label, pid, g.module);
+                  return false;
+              }
+          
+              t.pid  = pid;
+              t.base = base;
+              t.g    = &g;
+              printf("  %-16s pid %d, %s at 0x%lx\n", g.label, pid, g.module, base);
+              return true;
+          }
+          
+          /* -------------------------------------------------------------------- menu */
+          
+          struct opts {
+              bool esp   = false;
+              bool aim   = false;
+              int  aim_fov = 120;      /* degrees; 120 is generous on purpose */
+              int  aim_key = 0;        /* 0 = always, otherwise a volume step */
+          };
+          
+          static void menu(const target &t, opts &o)
+          {
+              printf("\n  target: %s   pid %d   base 0x%lx\n\n",
+                     t.g->label, t.pid, t.base);
+              printf("  [1] ESP            %s\n", o.esp ? "ON" : "off");
+              printf("  [2] Aim            %s\n", o.aim ? "ON" : "off");
+              printf("  [3] Aim FOV        %d\n", o.aim_fov);
+              printf("  [4] Toggle aim key %s\n", o.aim_key ? "volume step" : "always on");
+              printf("  [9] Start\n");
+              printf("  [0] Quit\n");
+              printf("\n  > ");
+              fflush(stdout);
+          }
+          
+          /* -------------------------------------------------------------------- main */
+          
+          static void banner(void)
+          {
+              printf("\n  towamod - our own, on our own driver\n");
+              printf("  driver: syscall %lu\n", g_nr);
+              printf("  nothing injected, no /dev entries, no root needed for reads\n\n");
+          }
+          
+          int main(int argc, char **argv)
+          {
+              /*
+               * The syscall number, in order of preference: -n on the command line, then
+               * TOWA_NR from the environment, then whatever the build passed in.  It is
+               * not guessed and never probed - calling an unknown syscall number with six
+               * arguments is somebody else's syscall, with consequences nobody asked for.
+               * The number is printed as TOWA_NR by the kernel build log.
+               */
+              if (argc > 1 && !strcmp(argv[1], "-n") && argc > 2)
+                  g_nr = strtoul(argv[2], nullptr, 0);
+              else if (getenv("TOWA_NR"))
+                  g_nr = strtoul(getenv("TOWA_NR"), nullptr, 0);
+          
+              banner();
+          
+              if (!g_nr) {
+                  fprintf(stderr, "built without -DNR_TOWA=<number>: pass -n <number>\n");
+                  return 2;
+              }
+          
+              long r = drv(OP_PING);
+              if (r < 0 || (unsigned long)r != TOWA_MAGIC) {
+                  fprintf(stderr, "driver did not answer (0x%lx) - is the kernel flashed?\n", r);
+                  return 1;
+              }
+              printf("  driver: alive (0x%lx)\n\n", r);
+          
+              printf("  looking for a game...\n");
+              target t;
+              bool found = false;
+              for (int i = 0; i < GAME_COUNT; i++) {
+                  target probe;
+                  if (target_acquire(probe, g_games[i]) && !found) {
+                      t = probe;          /* the first game found wins */
+                      found = true;
+                  }
+              }
+          
+              if (!found) {
+                  fprintf(stderr, "\n  none of the supported games is running (or no module yet)\n");
+                  return 1;
+              }
+          
+              opts o;
+          
+              for (;;) {
+                  menu(t, o);
+                  char line[32];
+                  if (!fgets(line, sizeof(line), stdin))
+                      break;
+          
+                  switch (atoi(line)) {
+                  case 1: o.esp = !o.esp; break;
+                  case 2: o.aim = !o.aim; break;
+                  case 3: o.aim_fov = o.aim_fov >= 180 ? 20 : o.aim_fov + 20; break;
+                  case 4: o.aim_key = !o.aim_key; break;
+                  case 9:
+                      printf("\n  the read/link stage is what this build proves.\n"
+                             "  ESP drawing and the aim come next, on top of it.\n");
+                      return 0;
+                  case 0:
+                  default:
+                      return 0;
+                  }
+              }
+          
+              return 0;
+          }
+          TW_MOD
+          
+          "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -DNR_TOWA=$NR        -o "$GITHUB_WORKSPACE/tools/towamod" "$GITHUB_WORKSPACE/tools/towamod.cpp"
+          
           echo "--- what we built ---"
           ls -l "$GITHUB_WORKSPACE/tools/towacli"
           file "$GITHUB_WORKSPACE/tools/towacli" || true
@@ -4601,11 +5237,13 @@ jobs:
           path: ${{ github.workspace }}/out/kdbg.ko
           if-no-files-found: error
 
-      - name: Upload towacli
+      - name: Upload the clients
         uses: actions/upload-artifact@v4
         with:
-          name: towacli-${{ github.run_number }}
-          path: ${{ github.workspace }}/tools/towacli
+          name: clients-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/tools/towacli
+            ${{ github.workspace }}/tools/towamod
           if-no-files-found: error
 
       - name: Attach to a release
