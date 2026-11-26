@@ -1110,34 +1110,37 @@ jobs:
           	*hole = false;
           
           	/*
-          	 * The lock covers the walk AND the copy that follows it, for the same
-          	 * reason get_user_pages exists: between reading a PTE and reading the
-          	 * page it points at, the mapping could be zapped and the page freed.
+          	 * A WRITE never takes the direct map shortcut.
           	 *
-          	 * It cannot cover the fallback below, because get_user_pages_remote()
-          	 * takes mmap_sem itself and this is a rwsem: a recursive read lock deadlocks
-          	 * against a writer that is already waiting.  So it is taken per page,
-          	 * released, and only then do we fall back.
+          	 * FOLL_FORCE|FOLL_WRITE is what breaks copy-on-write: it hands back the
+          	 * process's OWN page, which is the page its next read will see.  Writing
+          	 * through the direct map instead writes whichever page the PTE points at
+          	 * at that instant - and for a clean copy-on-write page that is the shared
+          	 * original, which the process then copies for itself on its own first
+          	 * write, so the value we wrote is never the one it reads back.  A read
+          	 * has no such problem, so the walk is kept for reads.
+          	 *
+          	 * A write is also rare - 285 against 17.6 million reads in the session
+          	 * that prompted this - so nothing is lost by paying for the pin.
+          	 *
+          	 * The lock covers the walk AND the copy after it, for the same reason
+          	 * get_user_pages takes one: between reading a PTE and reading the page it
+          	 * points at, the mapping could be zapped.  It cannot cover the pin below,
+          	 * because get_user_pages_remote() takes mmap_sem itself and a recursive
+          	 * read lock on a rwsem deadlocks against a writer that is already waiting.
           	 */
-          	mmap_read_lock(mm);
-          	if (!kdbg_va_to_kaddr(mm, va, &kva, &pfn)) {
-          		int err = 0;
+          	if (!write) {
+          		mmap_read_lock(mm);
+          		if (!kdbg_va_to_kaddr(mm, va, &kva, &pfn)) {
+          			int err = copy_to_user(ubuf, kva, n) ? -EFAULT : 0;
           
-          		if (write) {
-          			if (copy_from_user(kva, ubuf, n))
-          				err = -EFAULT;
-          			else
-          				set_page_dirty_lock(pfn_to_page(pfn));
-          		} else if (copy_to_user(ubuf, kva, n)) {
-          			err = -EFAULT;
+          			mmap_read_unlock(mm);
+          			return err;
           		}
-          
           		mmap_read_unlock(mm);
-          		return err;
           	}
-          	mmap_read_unlock(mm);
           
-          	/* Second try: pin it, which also faults it in. */
+          	/* Pin the page: correct copy-on-write for a write, and it faults a read in. */
           	if (get_user_pages_remote(t, mm, va, 1,
           				  write ? (FOLL_FORCE | FOLL_WRITE) : FOLL_FORCE,
           				  &pg, NULL, NULL) != 1) {
