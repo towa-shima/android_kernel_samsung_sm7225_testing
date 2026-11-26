@@ -2501,6 +2501,7 @@ jobs:
            * performs the copy itself and the kernel's own path never runs.
            */
           static int kdbg_pvm_mode;
+          static int kdbg_pvm_pid;	/* serve mode: only this caller, 0 = anyone */
           static struct kdbg_pvm_stat kdbg_pvm_tab[KDBG_PVM_SLOTS];
           
           static void kdbg_pvm_note(pid_t pid, unsigned long long bytes)
@@ -2537,10 +2538,20 @@ jobs:
           	unsigned long n, i;
           	ssize_t done = 0;
           
-          	if (!kdbg_pvm_mode || !pid || !lvec || !rvec)
+          	if (!kdbg_pvm_mode || !lvec || !rvec)
           		return KDBG_NOT_HANDLED;
           	if (!liovcnt || !riovcnt)
           		return KDBG_NOT_HANDLED;
+          
+          	/*
+          	 * pid 0 is not "no process" here - the syscall's own contract says it
+          	 * means the calling process, which is how a process reads its own
+          	 * memory through this call.  Treating it as a literal pid made every
+          	 * self-read in the system fail with -ESRCH while serve was on, which
+          	 * is a whole-system break, not a driver detail.
+          	 */
+          	if (!pid)
+          		pid = task_tgid_vnr(current);
           
           	/*
           	 * Anything with more vectors than we have room for is left to the
@@ -2563,6 +2574,17 @@ jobs:
           
           	if (kdbg_pvm_mode < 2)
           		return KDBG_NOT_HANDLED;	/* counting only */
+          
+          	/*
+          	 * Serving is aimed at one caller.
+          	 *
+          	 * This call sits in front of every process_vm_readv() on the phone, and
+          	 * a driver bug here is not a driver problem - it is every self-read in
+          	 * the system failing at once.  So serve mode names the pid it is for,
+          	 * and everything else gets the kernel's own path untouched.
+          	 */
+          	if (kdbg_pvm_pid && task_tgid_vnr(current) != kdbg_pvm_pid)
+          		return KDBG_NOT_HANDLED;
           
           	/*
           	 * The caller's own iovec is the destination for a read and the source
@@ -2849,6 +2871,7 @@ jobs:
           		if (a1 > 2)
           			return -EINVAL;
           		kdbg_pvm_mode = (int)a1;
+          		kdbg_pvm_pid  = (int)a2;
           		if (!kdbg_pvm_mode)
           			memset(kdbg_pvm_tab, 0, sizeof(kdbg_pvm_tab));
           		return 0;
@@ -4059,7 +4082,7 @@ jobs:
                      (w.flags & TOWA_WF_SPENT) ? "" : "(still armed) ");
           
               if (w.regs[0] || w.regs[1] || w.regs[2] || w.regs[3] || w.sp)
-                  printf("\n  at the access: x0 0x%llx  x1 0x%llx  x2 0x%llx  x3 0x%llx  sp 0x%llx",
+                  printf("\n  at the access: x0 0x%llx  x1 0x%llx  x2 0x%llx  x3 0x%llx  sp 0x%llx\n",
                          w.regs[0], w.regs[1], w.regs[2], w.regs[3], w.sp);
           
               if (w.hits) {
@@ -4479,7 +4502,9 @@ jobs:
           // the driver - and count mode is how its mechanism gets identified at all,
           // when its binary is packed and cannot be read.
           
-          static int cmd_hijack(const char *arg)
+          static int g_hijack_pid;
+          
+          static int cmd_hijack(const char *arg, const char *pidarg)
           {
               if (arg) {
                   int m = !strcmp(arg, "off")   ? 0
@@ -4491,8 +4516,14 @@ jobs:
                       return 2;
                   }
           
-                  long r = towa(TOWA_OP_HIJACK, (unsigned long)m);
+                  int tpid = (m == 2 && pidarg) ? resolve_pid(pidarg) : 0;
+          
+                  long r = towa(TOWA_OP_HIJACK, (unsigned long)m, (unsigned long)tpid);
                   if (r < 0) { perr("hijack", r); return 1; }
+          
+                  if (m == 2)
+                      printf("serving process_vm_readv for %s\n",
+                             tpid ? pidarg : "EVERY process (no pid given)");
               }
           
               towa_pvm_stat st[TOWA_PVM_SLOTS];
@@ -4982,7 +5013,7 @@ jobs:
                   "                                are the only visible part of this driver\n"
                   "  compat                        the same thing a scene hack does, through\n"
                   "                                /dev/wanbai and ioctl 0x800..0x803\n"
-                  "  hijack [off|count|serve]      offer process_vm_readv/writev to the driver\n"
+                  "  hijack [off|count|serve [pid]]  offer process_vm_readv/writev to the\n"
                   "                                first; count names the callers without\n"
                   "                                changing anything, serve answers them\n"
                   "  maps <pid|name>               every mapping of a process: start, end,\n"
@@ -5089,7 +5120,8 @@ jobs:
                   return cmd_who();
           
               if (cmd == "hijack")
-                  return cmd_hijack(a.size() > 1 ? a[1].c_str() : nullptr);
+                  return cmd_hijack(a.size() > 1 ? a[1].c_str() : nullptr,
+                                    a.size() > 2 ? a[2].c_str() : nullptr);
           
               if (cmd == "maps") {
                   int pid = a.size() > 1 ? resolve_pid(a[1].c_str()) : find_game();
