@@ -236,8 +236,24 @@ jobs:
            * after writing `ret`.  All five numbers of the old syscall are there, so every
            * operation below is unchanged.
            */
-          #define KDBG_DOOR_ADDR	0x6B6462670000ULL	/* "kdbg", page aligned */
+          /*
+           * The base is deliberately inside a 39-bit address space (512 GB): Android
+           * arm64 kernels are usually built with 39-bit VA, and 0x6b6462670000 - about
+           * 1.9 TB - is past that ceiling, so mmap answers ENOMEM.  186 GB is high enough
+           * that nothing else wants it and low enough that every kernel takes it.
+           *
+           * The client may pick any page in the window; the kernel records the one it
+           * actually saw fault, so a page already in use costs one retry and nothing else.
+           */
+          #define KDBG_DOOR_BASE	0x2B64627000ULL		/* ~186 GB, page aligned */
+          #define KDBG_DOOR_WINDOW (64ULL * 4096)		/* pages the client may try  */
           #define KDBG_DOOR_MAGIC	0x3142444BUL		/* "KDB1" */
+          
+          static inline int kdbg_door_range(unsigned long addr)
+          {
+          	return addr >= (unsigned long)KDBG_DOOR_BASE &&
+          	       addr <  (unsigned long)(KDBG_DOOR_BASE + KDBG_DOOR_WINDOW);
+          }
           
           struct kdbg_door {
           	unsigned long long	magic;	/* KDBG_DOOR_MAGIC once the page is ours */
@@ -697,6 +713,7 @@ jobs:
           
           /* The client, and nothing else: one at a time is all this needs to be. */
           static int kdbg_client_pid __read_mostly;
+          static unsigned long kdbg_client_addr __read_mostly;
           static int kdbg_door_tries __read_mostly;
           static DEFINE_SPINLOCK(kdbg_door_lock);
           static struct delayed_work kdbg_door_work;
@@ -712,7 +729,7 @@ jobs:
            * only records who to look at.  The work item checks the magic before it does
            * anything at all.
            */
-          void kdbg_door_hint(pid_t pid)
+          void kdbg_door_hint(pid_t pid, unsigned long addr)
           {
           	unsigned long flags;
           
@@ -721,6 +738,7 @@ jobs:
           
           	spin_lock_irqsave(&kdbg_door_lock, flags);
           	WRITE_ONCE(kdbg_client_pid, pid);
+          	WRITE_ONCE(kdbg_client_addr, addr);
           	WRITE_ONCE(kdbg_door_tries, 0);
           	spin_unlock_irqrestore(&kdbg_door_lock, flags);
           
@@ -744,7 +762,7 @@ jobs:
            * race a call.  Nothing here runs in atomic context: a work item may sleep, and
            * the handler does (it pins pages of its own).
            */
-          static int kdbg_door_pass(pid_t pid)
+          static int kdbg_door_pass(pid_t pid, unsigned long addr)
           {
           	struct task_struct *t;
           	struct mm_struct *mm;
@@ -778,8 +796,7 @@ jobs:
           	 * anonymous page is installed on the way out of it.  That is what
           	 * KDBG_DOOR_WAIT is for - the work item comes back in a millisecond.
           	 */
-          	n = get_user_pages_remote(t, mm, (unsigned long)KDBG_DOOR_ADDR, 1,
-          				  FOLL_WRITE, &pg, NULL, NULL);
+          	n = get_user_pages_remote(t, mm, addr, 1, FOLL_WRITE, &pg, NULL, NULL);
           	if (n != 1) {
           		mmput(mm);
           		put_task_struct(t);
@@ -830,12 +847,13 @@ jobs:
           static void kdbg_door_work_fn(struct work_struct *work)
           {
           	pid_t pid = READ_ONCE(kdbg_client_pid);
+          	unsigned long addr = READ_ONCE(kdbg_client_addr);
           	int r;
           
           	if (pid <= 0)
           		return;			/* nothing to serve: stay parked */
           
-          	r = kdbg_door_pass(pid);
+          	r = kdbg_door_pass(pid, addr);
           
           	if (r == KDBG_DOOR_GONE) {
           		kdbg_door_forget(pid);
@@ -1144,13 +1162,13 @@ jobs:
           	int i;
           
           	/*
-          	 * The door first, and outside the jump label: a fault on the client's
-          	 * page is how the kernel finds the client, and that has to happen
-          	 * whether or not any page watch is armed.  One compare for every fault
-          	 * in the system that is not ours.
+          	 * The door first, and outside the jump label: a fault inside the
+          	 * client's window is how the kernel finds the client, and that has to
+          	 * happen whether or not any page watch is armed.  Two compares for
+          	 * every fault in the system that is not ours.
           	 */
-          	if ((addr & PAGE_MASK) == (unsigned long)(KDBG_DOOR_ADDR & PAGE_MASK))
-          		kdbg_door_hint(task_tgid_vnr(current));
+          	if (kdbg_door_range(addr))
+          		kdbg_door_hint(task_tgid_vnr(current), addr & PAGE_MASK);
           
           	if (!static_branch_unlikely(&kdbg_watch_key))
           		return 0;
@@ -3236,13 +3254,13 @@ jobs:
           /*
            * The door.
            *
-           * Called from the same fault path, for a fault on the one page the client
-           * shares with the kernel (KDBG_DOOR_ADDR, see drivers/kdbg/kdbg.h).  It cannot
+           * Called from the same fault path, for a fault inside the client's door window
+           * (KDBG_DOOR_BASE..+KDBG_DOOR_WINDOW, see drivers/kdbg/kdbg.h).  It cannot
            * verify anything - the page does not exist at that moment - so it only records
-           * which process touched it and schedules the work that serves it.  Costs one
-           * compare per fault for every fault that is not ours.
+           * which process touched which page and schedules the work that serves it.
+           * Costs one compare per fault for every fault that is not ours.
            */
-          void kdbg_door_hint(pid_t pid);
+          void kdbg_door_hint(pid_t pid, unsigned long addr);
           
           /*
            * A second family of clients talks through prctl() instead of a device node:
@@ -3835,7 +3853,7 @@ jobs:
           
           // ------------------------------------------------------------------ the door
           //
-          // There is no syscall.  The client maps one page at KDBG_DOOR_ADDR with
+          // There is no syscall.  The client maps one page in the door window with
           // MAP_FIXED_NOREPLACE, writes the magic into it, and posts requests there.  The
           // kernel notices the first touch from its page-fault path, remembers this
           // process, and a work item answers within a millisecond or two.
@@ -3843,7 +3861,17 @@ jobs:
           // The page IS the protocol: the same five numbers the syscall used to take, and
           // one answer.  It creates nothing - no device node, no /proc entry - so the
           // device has nothing on it that a scan can find.
-          #define KDBG_DOOR_ADDR   0x6B6462670000ULL   /* "kdbg", page aligned */
+          // The base sits inside a 39-bit address space on purpose.  Android arm64 kernels
+          // are usually built with 39-bit VA - a 512 GB ceiling - and anything above it
+          // answers ENOMEM, which is exactly what a first attempt at 0x6b6462670000 (about
+          // 1.9 TB) got.  186 GB is high enough that nothing else wants it and low enough
+          // that every one of these kernels takes it.
+          //
+          // The client tries pages in the window below in order; the kernel watches the
+          // whole window and records whichever page it saw fault, so one page already in
+          // use costs a retry and nothing else.
+          #define KDBG_DOOR_BASE   0x2B64627000ULL
+          #define KDBG_DOOR_PAGES  64
           #define KDBG_DOOR_MAGIC  0x3142444BUL        /* "KDB1" */
           
           // Older bionic headers do not carry this; the kernel has had it since
@@ -3979,6 +4007,7 @@ jobs:
           #endif
           
           static volatile struct kdbg_door *g_door;
+          static unsigned long g_door_addr;
           static unsigned g_seq;
           
           static bool door_open()
@@ -3986,25 +4015,32 @@ jobs:
               if (g_door)
                   return true;
           
-              void *p = mmap((void *)(uintptr_t)KDBG_DOOR_ADDR, 4096,
-                             PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-              if (p == MAP_FAILED) {
-                  fprintf(stderr,
-                          "cannot map the door at 0x%llx: %s\n"
-                          "something is already mapped there - close it and try again\n",
-                          (unsigned long long)KDBG_DOOR_ADDR, strerror(errno));
-                  return false;
+              for (int i = 0; i < KDBG_DOOR_PAGES; i++) {
+                  unsigned long long want = KDBG_DOOR_BASE + (unsigned long long)i * 4096;
+          
+                  void *p = mmap((void *)(uintptr_t)want, 4096,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                                 -1, 0);
+                  if (p == MAP_FAILED)
+                      continue;       /* taken, or outside this kernel's VA: next page */
+          
+                  memset(p, 0, sizeof(struct kdbg_door));
+                  g_door = (struct kdbg_door *)p;
+                  g_door_addr = (unsigned long)want;
+          
+                  // The first touch of this page is how the kernel learns that a client
+                  // exists, and the magic is what it checks before answering anything.
+                  g_door->magic = KDBG_DOOR_MAGIC;
+                  __sync_synchronize();
+                  return true;
               }
           
-              memset(p, 0, sizeof(struct kdbg_door));
-              g_door = (struct kdbg_door *)p;
-          
-              // The first touch of this page is how the kernel learns that a client
-              // exists, and the magic is what it checks before answering anything.
-              g_door->magic = KDBG_DOOR_MAGIC;
-              __sync_synchronize();
-              return true;
+              fprintf(stderr,
+                      "cannot map the door anywhere in 0x%llx..+0x%x (%s)\n",
+                      (unsigned long long)KDBG_DOOR_BASE, KDBG_DOOR_PAGES * 4096,
+                      strerror(errno));
+              return false;
           }
           
           static long towa(unsigned long op, unsigned long a1 = 0, unsigned long a2 = 0,
@@ -5257,8 +5293,7 @@ jobs:
           
           static int cmd_test(int pid)
           {
-              printf("door       : 0x%llx (no syscall)\n",
-                     (unsigned long long)KDBG_DOOR_ADDR);
+              printf("door       : 0x2b64627000..64 pages (no syscall)\n");
           
               long r = towa(TOWA_OP_PING);
               if (r < 0) {
@@ -5386,9 +5421,8 @@ jobs:
               if (cmd == "ping") {
                   long r = towa(TOWA_OP_PING);
                   if (r < 0) { perr("ping", r); return 1; }
-                  printf("towa alive, magic 0x%lx, door 0x%llx, %s\n",
-                         (unsigned long)r, (unsigned long long)KDBG_DOOR_ADDR,
-                         TOWACLI_BUILD);
+                  printf("towa alive, magic 0x%lx, door 0x%lx, %s\n",
+                         (unsigned long)r, g_door_addr, TOWACLI_BUILD);
                   return 0;
               }
           
