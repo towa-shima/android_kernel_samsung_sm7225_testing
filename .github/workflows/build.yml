@@ -1687,7 +1687,7 @@ jobs:
           	 * do not answer, and that is a line to add rather than a mystery.
           	 */
           	kdbg_note_cmd(cmd, arg);
-          	static const char *nm = (m && m->name) ? m->name : "?";
+          	const char *nm = (m && m->name) ? m->name : "?";
           
           	if (strncmp(kdbg_stat.last_node, nm, sizeof(kdbg_stat.last_node)))
           		strlcpy(kdbg_stat.last_node, nm, sizeof(kdbg_stat.last_node));
