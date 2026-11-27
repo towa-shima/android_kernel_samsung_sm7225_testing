@@ -2666,6 +2666,13 @@ jobs:
           [ -f "$DEF" ] || DEF=arch/arm64/configs/vendor/lito-perf_defconfig
           [ -f "$DEF" ] || { echo "no defconfig"; ls arch/arm64/configs/vendor | head -30; exit 1; }
           echo "defconfig: $DEF"
+          
+          # make takes the target relative to arch/arm64/configs and prepends that
+          # directory itself - the full path here becomes
+          # arch/arm64/configs/arch/arm64/configs/vendor/... and kbuild says it
+          # cannot find the default configuration.
+          TGT=${DEF#arch/arm64/configs/}
+          echo "make target: $TGT"
           sed -i -e '/^CONFIG_KDBG_CORE=/d' -e '/^# CONFIG_KDBG_CORE is not set$/d' "$DEF"
           printf 'CONFIG_KDBG_CORE=m\n' >> "$DEF"
           
@@ -2677,17 +2684,16 @@ jobs:
           	tristate "kdbg kernel-assisted memory access"
           	default n
           	help
-          	  The worker half of the kdbg syscall: memory read/write, module base,
-          	  hardware breakpoints and page watches.  As a module (=m) it can be
-          	  loaded and unloaded at will and the syscall is inert while it is out;
-          	  built in (=y) it arms itself at boot and nothing shows up in
-          	  /proc/modules at all.
+          	  The worker half of kdbg: memory read/write, module base, hardware
+          	  breakpoints and page watches.  As a module (=m) it can be loaded and
+          	  unloaded at will, and the door answers -ENOSYS while it is out; built
+          	  in (=y) it arms itself at boot and nothing shows up in /proc/modules.
           
-          	  The syscall itself and the page-fault hook are always built in,
-          	  because neither can live in a module.
+          	  The door itself and the page-fault hook are always built in, because
+          	  the fault path reaches them with no module loaded.
           TW_K
           grep -q 'drivers/kdbg/Kconfig' drivers/Kconfig || echo 'source "drivers/kdbg/Kconfig"' >> drivers/Kconfig
-          make O=out $P ARCH=arm64 "$DEF"
+          make O=out $P ARCH=arm64 "$TGT"
           make O=out $P ARCH=arm64 olddefconfig
           make O=out $P ARCH=arm64 modules_prepare
           echo "--- the switches that decide what the module can do ---"
