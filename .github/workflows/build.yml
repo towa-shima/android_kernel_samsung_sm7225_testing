@@ -1,34 +1,25 @@
-name: Build kdbg kernel
+name: Build kdbg.ko only
 
-# One run gives you two files:
-#   * a flashable AnyKernel3 zip: the kernel, carrying the driver's front end,
-#   * kdbg.ko - the module that holds the actual read/write logic.
+# The one-flash loop.
 #
-# Why split it that way:
-#   There is no syscall.  The front end is one page at a fixed address
-#   (KDBG_DOOR_BASE) that the client maps and posts requests in; the kernel
-#   learns about the client from the page-fault path, and a work item serves the
-#   requests.  That front end has to be in the kernel itself - the fault path
-#   reaches it with no module loaded - and it is the only thing that does.
+# kernel-build-towa.yml builds a whole kernel and a flashable zip; it has to,
+# because the door and the page-fault hook live in the kernel and are reached
+# with no module loaded.  That flash happens once.
 #
-#   Everything else, every read, write, module base, mapping list, batch,
-#   breakpoint and page watch, is in kdbg_core.ko.  So after this one flash,
-#   every future change is a module rebuild and an insmod: kernel-module-towa.yml
-#   does exactly that in a couple of minutes.  With no module loaded the door
-#   still answers - with -ENOSYS - so the driver is silent either way.
+# Everything else - every read, write, module base, mapping list, batch,
+# hardware breakpoint and page watch - is kdbg_core.ko, and this workflow builds
+# only that.  A few minutes instead of twenty, no flash, no reboot: insmod the
+# new one over the old.
 #
-# Defaults are the flash-once shape: builtin=n, so the Image does NOT contain
-# the driver's logic and kdbg.ko is loaded by hand.
-#
-# DEFAULTS ARE THE 325 BUILD (branch Boostkernel2-cip, clang-r563880). The
-# source below is version-agnostic - none of it cares which 4.19 it lands in -
-# so the 191 tree is the same run with branch=cheetkernel and
-# clang_dir=clang-r487747c.
+# It must agree with the flashed kernel about three things, and they are why the
+# first five steps are lifted verbatim from the kernel workflow: the source
+# branch, the clang revision, and the defconfig.  Change any of them and the
+# .ko's vermagic no longer matches the kernel it is loaded into.
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Source branch'
+        description: 'Source branch (must be the one the flashed kernel came from)'
         required: true
         default: 'Boostkernel2-cip'
       model:
@@ -36,18 +27,18 @@ on:
         required: true
         default: 'm23xq'
       clang_dir:
-        description: 'AOSP clang revision directory'
+        description: 'AOSP clang revision directory (same as the kernel build)'
         required: true
         default: 'clang-r563880'
-      builtin:
-        description: 'y = build kdbg into the kernel (nothing in /proc/modules, nothing to insmod), n = loadable kdbg.ko'
+      client:
+        description: 'y = also build towacli (about two minutes more), n = module only'
         required: true
-        default: 'n'
+        default: 'y'
 
 jobs:
-  build:
+  module:
     runs-on: ubuntu-22.04
-    timeout-minutes: 300
+    timeout-minutes: 120
     permissions:
       contents: write
 
@@ -206,7 +197,7 @@ jobs:
 
       # ------------------------------------------------------- the kdbg source
       # The four files are written here so this workflow stays a single upload.
-      - name: Write kdbg sources
+      - name: Write the module sources
         working-directory: ${{ github.workspace }}/kernel
         run: |
           set -e
@@ -566,776 +557,108 @@ jobs:
           
           #endif /* _KDBG_H */
           TW_H
-          cat > drivers/kdbg/kdbg_syscall.c <<'TW_S'
-          // SPDX-License-Identifier: GPL-2.0
+          cat > include/linux/kdbg.h <<'TW_I'
+          /* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _LINUX_KDBG_WATCH_H
+          #define _LINUX_KDBG_WATCH_H
+          
+          #include <linux/limits.h>
+          #include <linux/types.h>
+          
+          struct pt_regs;
+          
+          /*
+           * Call site is inside do_page_fault(), with mm->mmap_sem held for read and the
+           * faulting task being current.  Observes only: it never claims the fault, so
+           * the normal handling always goes ahead and the access always succeeds.
+           * Costs one perfectly-predicted branch while no watch is armed.
+           */
+          int kdbg_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr);
+          
           /*
            * The door.
            *
-           * There is no syscall any more.  A client maps one page at KDBG_DOOR_ADDR,
-           * writes KDBG_DOOR_MAGIC into it, and posts requests in it:
-           *
-           *     magic, state, seq, op, a1..a4, ret
-           *
-           * The kernel learns about the client from the page-fault path.  The first touch
-           * of that address calls kdbg_door_hint() (see kdbg_watch.c), which remembers
-           * the process; the work item below then reads the request out of the page,
-           * calls the registered handler, and writes the answer back.  While a client is
-           * connected the work item re-arms itself every millisecond, which is the door's
-           * latency; with no client it is not scheduled at all and costs nothing.
-           *
-           * A work item and not a kthread, on purpose: a kthread has a name and /proc
-           * lists it.  This runs on the system's own kworkers, so there is one less thing
-           * on the device that looks like itself.
-           *
-           * Nothing is created for any of this - no node, no file, no table entry - and
-           * the module it forwards to (kdbg_core.ko) can be absent: with no handler
-           * registered every request is answered -ENOSYS, exactly as an unimplemented
-           * syscall would be.
-           *
-           * This file is built into the kernel rather than into the module because the
-           * page-fault path calls into it whether or not the module is loaded.
+           * Called from the same fault path, for a fault inside the client's door window
+           * (KDBG_DOOR_BASE..+KDBG_DOOR_WINDOW, see drivers/kdbg/kdbg.h).  It cannot
+           * verify anything - the page does not exist at that moment - so it only records
+           * which process touched which page and schedules the work that serves it.
+           * Costs one compare per fault for every fault that is not ours.
            */
-          #include <linux/kernel.h>
-          #include <linux/sched.h>
-          #include <linux/sched/mm.h>
-          #include <linux/sched/task.h>
-          #include <linux/mm.h>
-          #include <linux/highmem.h>
-          #include <linux/mutex.h>
-          #include <linux/pid.h>
-          #include <linux/spinlock.h>
-          #include <linux/workqueue.h>
-          #include <linux/delay.h>
-          #include <linux/jiffies.h>
-          #include <linux/init.h>
-          
-          /* The client being served right now, so the module can copy to and from it
-           * without the door having to lend a kernel thread someone else's address
-           * space.  See kdbg_door_client()'s declaration for why that matters. */
-          static struct task_struct *kdbg_door_client_task __read_mostly;
-          
-          struct task_struct *kdbg_door_client(void)
-          {
-          	return READ_ONCE(kdbg_door_client_task);
-          }
-          EXPORT_SYMBOL_GPL(kdbg_door_client);
-          #include <asm/barrier.h>
-          #include <linux/export.h>
-          #include <linux/uio.h>
-          
-          #include <linux/kdbg.h>
-          
-          #include "kdbg.h"
-          
-          static kdbg_handler_t kdbg_handler __read_mostly;
-          static DEFINE_MUTEX(kdbg_mutex);
-          
-          void kdbg_set_handler(kdbg_handler_t fn)
-          {
-          	mutex_lock(&kdbg_mutex);
-          	kdbg_handler = fn;
-          	mutex_unlock(&kdbg_mutex);
-          }
-          EXPORT_SYMBOL_GPL(kdbg_set_handler);
-          
-          /* ---------------------------------------------------------------- prctl ---- */
-          
-          static kdbg_prctl_t kdbg_prctl_fn __read_mostly;
-          static void (*kdbg_prctl_note_fn)(int option) __read_mostly;
-          
-          void kdbg_set_prctl(kdbg_prctl_t fn)
-          {
-          	mutex_lock(&kdbg_mutex);
-          	kdbg_prctl_fn = fn;
-          	mutex_unlock(&kdbg_mutex);
-          }
-          EXPORT_SYMBOL_GPL(kdbg_set_prctl);
+          void kdbg_door_hint(pid_t pid, unsigned long addr);
           
           /*
-           * Called from SYSCALL_DEFINE5(prctl, ...) for every option.  Same shape as the
-           * rest of this file: nothing but "call the registered handler", so the prctl
-           * path costs a single predictable branch for every other caller.
+           * While a door request is being served, this is the client task - NULL the rest
+           * of the time.  The handler runs in a kernel thread, which has no address space
+           * of its own, so the module asks this before it decides how to copy: a kernel
+           * thread copies through access_process_vm() against the client, a caller in its
+           * own context (the prctl and process_vm forwards) uses the normal primitives.
            */
-          void kdbg_set_prctl_note(void (*fn)(int option))
-          {
-          	mutex_lock(&kdbg_mutex);
-          	kdbg_prctl_note_fn = fn;
-          	mutex_unlock(&kdbg_mutex);
-          }
-          EXPORT_SYMBOL_GPL(kdbg_set_prctl_note);
-          
-          long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3)
-          {
-          	kdbg_prctl_t fn;
-          	long ret;
-          
-          	/* watched first: a magic we do not own is still worth knowing about */
-          	if (kdbg_prctl_note_fn)
-          		kdbg_prctl_note_fn(option);
-          
-          	if (option != KDBG_PRCTL_MAGIC)
-          		return -EINVAL;
-          
-          	mutex_lock(&kdbg_mutex);
-          	fn = kdbg_prctl_fn;
-          	ret = fn ? fn(a2, (void __user *)a3) : -EINVAL;
-          	mutex_unlock(&kdbg_mutex);
-          
-          	return ret;
-          }
-          
-          /* ------------------------------------------------------- memory syscalls ---- */
-          
-          static kdbg_pvm_t kdbg_pvm_fn __read_mostly;
-          
-          void kdbg_set_pvm(kdbg_pvm_t fn)
-          {
-          	mutex_lock(&kdbg_mutex);
-          	kdbg_pvm_fn = fn;
-          	mutex_unlock(&kdbg_mutex);
-          }
-          EXPORT_SYMBOL_GPL(kdbg_set_pvm);
+          struct task_struct;
+          struct task_struct *kdbg_door_client(void);
           
           /*
-           * Called from mm/process_vm_access.c for every process_vm_readv() and
-           * process_vm_writev() in the system.
+           * A second family of clients talks through prctl() instead of a device node:
            *
-           * No lock: this is on the path of a syscall other software uses, and the
-           * pointer is either NULL or a function that lives as long as the module does -
-           * module_exit clears it under the mutex before anything is freed.  A call that
-           * races an unload is harmless either way, because whoever wins gets either
-           * KDBG_NOT_HANDLED or a working answer.
+           *	prctl(0x4E41, NA_CMD_READ_MEM, &cmd, 0, 0)
+           *
+           * so the driver needs nothing in /dev, nothing in /proc, and no node for anyone
+           * to scan for.  kernel/sys.c forwards that one option here and passes everything
+           * else straight through to the real prctl.
            */
+          #define KDBG_PRCTL_MAGIC	0x4E41
+          
+          long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3);
+          
+          /*
+           * Called for every prctl() the kernel handles once the driver is loaded,
+           * whatever the option - so the driver can notice a client probing a magic
+           * number it does not own yet, instead of wondering why nothing happens.  It
+           * observes only: no return value, no side effect, and libc's own options
+           * (all small numbers) are filtered out before they reach it.
+           */
+          void kdbg_set_prctl_note(void (*fn)(int option));
+          
+          /* ------------------------------------------------------------------------ */
+          /*
+           * The memory syscalls.
+           *
+           * The same trick as the prctl forward, one level up: mm/process_vm_access.c
+           * calls kdbg_pvm_try() at the top of process_vm_rw(), which is the single
+           * funnel both process_vm_readv and process_vm_writev go through.  A hack that
+           * opens no device and speaks no driver protocol reads memory with exactly that
+           * syscall - this is how it ends up using us without knowing.
+           *
+           * Three modes, set from userspace:
+           *     0  off     nothing at all happens
+           *     1  count   the call is recorded and the kernel does its normal work
+           *     2  serve   the copy happens through the driver and the normal work is
+           *                skipped
+           *
+           * Count mode exists so the question "does this hack use process_vm_readv?"
+           * can be answered from the kernel side, for a binary that is packed and cannot
+           * be read at all.  It changes no behaviour.
+           *
+           * The call site links against this file, which is always built in, and reaches
+           * the driver through a pointer; with no driver loaded the pointer is NULL and
+           * every caller gets KDBG_NOT_HANDLED and the kernel's own path.
+           */
+          struct iovec;
+          
+          #define KDBG_NOT_HANDLED	((ssize_t)LONG_MAX)
+          
+          typedef ssize_t (*kdbg_pvm_t)(pid_t pid, const struct iovec __user *lvec,
+          			      unsigned long liovcnt,
+          			      const struct iovec __user *rvec,
+          			      unsigned long riovcnt, int vm_write);
+          
+          void kdbg_set_pvm(kdbg_pvm_t fn);
+          
           ssize_t kdbg_pvm_try(pid_t pid, const struct iovec __user *lvec,
           		     unsigned long liovcnt, const struct iovec __user *rvec,
-          		     unsigned long riovcnt, int vm_write)
-          {
-          	kdbg_pvm_t fn = READ_ONCE(kdbg_pvm_fn);
+          		     unsigned long riovcnt, int vm_write);
           
-          	if (!fn)
-          		return KDBG_NOT_HANDLED;
-          
-          	return fn(pid, lvec, liovcnt, rvec, riovcnt, vm_write);
-          }
-          EXPORT_SYMBOL_GPL(kdbg_pvm_try);
-          
-          /* ------------------------------------------------------------- the door --- */
-          
-          /* The client, and nothing else: one at a time is all this needs to be. */
-          static int kdbg_client_pid __read_mostly;
-          static unsigned long kdbg_client_addr __read_mostly;
-          static int kdbg_door_tries __read_mostly;
-          static DEFINE_SPINLOCK(kdbg_door_lock);
-          static struct delayed_work kdbg_door_work;
-          
-          /* What one pass found. */
-          #define KDBG_DOOR_SERVED	1	/* the page is ours, we did our job */
-          #define KDBG_DOOR_WAIT		0	/* not mapped yet - try again shortly */
-          #define KDBG_DOOR_GONE		(-1)	/* the process is not there any more */
-          
-          /*
-           * From the page-fault path, for a fault on our page.  Nothing can be verified
-           * here - the page does not exist yet, that is why we are being called - so this
-           * only records who to look at.  The work item checks the magic before it does
-           * anything at all.
-           */
-          void kdbg_door_hint(pid_t pid, unsigned long addr)
-          {
-          	unsigned long flags;
-          
-          	if (pid <= 0)
-          		return;
-          
-          	spin_lock_irqsave(&kdbg_door_lock, flags);
-          	WRITE_ONCE(kdbg_client_pid, pid);
-          	WRITE_ONCE(kdbg_client_addr, addr);
-          	WRITE_ONCE(kdbg_door_tries, 0);
-          	spin_unlock_irqrestore(&kdbg_door_lock, flags);
-          
-          	schedule_delayed_work(&kdbg_door_work, 0);
-          }
-          
-          static void kdbg_door_forget(pid_t pid)
-          {
-          	unsigned long flags;
-          
-          	spin_lock_irqsave(&kdbg_door_lock, flags);
-          	if (READ_ONCE(kdbg_client_pid) == pid)
-          		WRITE_ONCE(kdbg_client_pid, 0);
-          	spin_unlock_irqrestore(&kdbg_door_lock, flags);
-          }
-          
-          /*
-           * One pass: find the process, pin its door page, and answer the request if one
-           * is posted.  The handler is called with the page mapped and the module mutex
-           * held - the same arrangement the syscall had, so a module unload still cannot
-           * race a call.  Nothing here runs in atomic context: a work item may sleep, and
-           * the handler does (it pins pages of its own).
-           */
-          static int kdbg_door_pass(pid_t pid, unsigned long addr)
-          {
-          	struct task_struct *t;
-          	struct mm_struct *mm;
-          	struct page *pg = NULL;
-          	struct kdbg_door *d;
-          	struct pid *p;
-          	long n;
-          
-          	p = find_vpid(pid);
-          	if (!p)
-          		return KDBG_DOOR_GONE;
-          
-          	rcu_read_lock();
-          	t = pid_task(p, PIDTYPE_PID);
-          	if (!t) {
-          		rcu_read_unlock();
-          		return KDBG_DOOR_GONE;
-          	}
-          	get_task_struct(t);
-          	rcu_read_unlock();
-          
-          	mm = get_task_mm(t);
-          	if (!mm) {
-          		put_task_struct(t);
-          		return KDBG_DOOR_GONE;
-          	}
-          
-          	/*
-          	 * Pin the page.  It may not be there yet on the very first pass: the
-          	 * fault that told us about this process is still being handled, and the
-          	 * anonymous page is installed on the way out of it.  That is what
-          	 * KDBG_DOOR_WAIT is for - the work item comes back in a millisecond.
-          	 */
-          	n = get_user_pages_remote(t, mm, addr, 1, FOLL_WRITE, &pg, NULL, NULL);
-          	if (n != 1) {
-          		mmput(mm);
-          		put_task_struct(t);
-          		return KDBG_DOOR_WAIT;
-          	}
-          
-          	d = kmap(pg);
-          
-          	if (READ_ONCE(d->magic) != KDBG_DOOR_MAGIC) {
-          		/*
-          		 * Not ours - or not ours yet.  The second reading matters: the
-          		 * fault that told us about this process is the client's own
-          		 * first write to the page, so we can arrive while it is still
-          		 * zeroing it, before it has written the magic.  Treating that
-          		 * as "go away" loses the client for good, because once the page
-          		 * is mapped nothing faults again and there is no second knock.
-          		 * So: come back shortly, and let the retry limit decide.
-          		 */
-          		kunmap(pg);
-          		put_page(pg);
-          		mmput(mm);
-          		put_task_struct(t);
-          		return KDBG_DOOR_WAIT;
-          	}
-          
-          	if (READ_ONCE(d->state) == 1) {
-          		unsigned long long op = d->op;
-          		unsigned long long a1 = d->a1, a2 = d->a2;
-          		unsigned long long a3 = d->a3, a4 = d->a4;
-          		kdbg_handler_t fn;
-          		long ret;
-          
-          		mutex_lock(&kdbg_mutex);
-          		fn = kdbg_handler;
-          
-          		/*
-          		 * The handler was written for a syscall, where it ran in the
-          		 * caller's context and its copies reached the caller's buffers
-          		 * for free.  A work item has no address space at all, so the
-          		 * module is told who the client is and copies through
-          		 * access_process_vm() instead - which is what a kernel thread is
-          		 * supposed to do.  An earlier version borrowed the client's
-          		 * address space with use_mm() here, and the first op that
-          		 * carried a pointer took the phone down.
-          		 */
-          		if (fn) {
-          			WRITE_ONCE(kdbg_door_client_task, t);
-          			ret = fn(op, a1, a2, a3, a4);
-          			WRITE_ONCE(kdbg_door_client_task, NULL);
-          		} else {
-          			ret = -ENOSYS;
-          		}
-          		mutex_unlock(&kdbg_mutex);
-          
-          		/*
-          		 * The answer must be visible before the state that announces
-          		 * it: the client spins on `state` and reads `ret` the moment it
-          		 * turns 2.
-          		 */
-          		d->ret = ret;
-          		smp_wmb();
-          		WRITE_ONCE(d->state, 2);
-          	}
-          
-          	kunmap(pg);
-          	put_page(pg);
-          	mmput(mm);
-          	put_task_struct(t);
-          
-          	return KDBG_DOOR_SERVED;
-          }
-          
-          static void kdbg_door_work_fn(struct work_struct *work)
-          {
-          	pid_t pid = READ_ONCE(kdbg_client_pid);
-          	unsigned long addr = READ_ONCE(kdbg_client_addr);
-          	int r;
-          
-          	if (pid <= 0)
-          		return;			/* nothing to serve: stay parked */
-          
-          	r = kdbg_door_pass(pid, addr);
-          
-          	if (r == KDBG_DOOR_GONE) {
-          		kdbg_door_forget(pid);
-          		return;
-          	}
-          
-          	/*
-          	 * A connected client is polled, and one that is not mapped yet is
-          	 * retried.  The retry cannot go on for ever: a process that faults on
-          	 * this address once and never maps anything must not keep a kworker
-          	 * waking up for the rest of the uptime.
-          	 */
-          	if (r == KDBG_DOOR_WAIT && ++kdbg_door_tries > 2000) {
-          		kdbg_door_forget(pid);
-          		return;
-          	}
-          
-          	schedule_delayed_work(&kdbg_door_work, msecs_to_jiffies(1));
-          }
-          
-          static int __init kdbg_door_init(void)
-          {
-          	INIT_DELAYED_WORK(&kdbg_door_work, kdbg_door_work_fn);
-          	return 0;
-          }
-          late_initcall(kdbg_door_init);
-          TW_S
-          cat > drivers/kdbg/kdbg_watch.c <<'TW_W'
-          // SPDX-License-Identifier: GPL-2.0
-          /*
-           * Page watches - the fault-path half of a PTE hook.
-           *
-           * This file is built into the kernel, not into the module, because it needs two
-           * things a module cannot have: a call site inside do_page_fault() and the core
-           * mm helpers that manipulate another process's page tables.
-           *
-           * How it works, and why it is the safe end of "PTE hook":
-           *
-           *   1. Arming takes access to one page away from one process.  For a write
-           *      watch that means clearing the write bit in the PTE; for an access watch
-           *      it means clearing the PTE so the next touch faults.  Either way only the
-           *      page TABLE is touched.  The page's contents are untouched, so a scanner
-           *      that reads the memory finds exactly the original bytes - there is no
-           *      shadow page and no patched instruction anywhere.
-           *
-           *   2. The next time that process touches the page it faults, do_page_fault()
-           *      calls us before the normal handling, and we record the pc it faulted
-           *      from, which task it was, and whether it was a write.
-           *
-           *   3. We then put the PTE back the way it was and return "not handled", so the
-           *      normal fault path resolves it and the access simply succeeds.  Nothing
-           *      is emulated and no instruction is decoded - which is the whole trick.
-           *      A watch is single shot: one arm, one event.  Arm it again for another.
-           *
-           * What this deliberately does NOT do yet: substitute a different value for the
-           * game to read.  That needs either a shadow page (the page then belongs to the
-           * file's page cache, which is a real hazard) or decoding the faulting
-           * instruction.  Both are separate steps that want this watcher proven first.
-           */
-          #include <linux/kernel.h>
-          #include <linux/module.h>
-          #include <linux/mm.h>
-          #include <linux/sched.h>
-          #include <linux/sched/mm.h>
-          #include <linux/pid.h>
-          #include <linux/export.h>
-          #include <linux/string.h>
-          #include <linux/spinlock.h>
-          #include <linux/jump_label.h>
-          #include <linux/rmap.h>
-          #include <linux/pagemap.h>
-          #include <linux/mmap_lock.h>
-          #include <asm/pgtable.h>
-          #include <asm/tlbflush.h>
-          #include <asm/ptrace.h>
-          #include <asm/esr.h>
-          
-          #include <linux/kdbg.h>	/* so our definition is checked against the
-          				 * prototype fault.c calls us through */
-          
-          #include "kdbg.h"
-          
-          /*
-           * Off unless something is armed.  A static branch compiles to a no-op that the
-           * CPU predicts perfectly, so do_page_fault() pays nothing for the call below
-           * while no watch exists.
-           */
-          DEFINE_STATIC_KEY_FALSE(kdbg_watch_key);
-          
-          struct kdbg_watch_slot {
-          	struct mm_struct	*mm;		/* NULL = free */
-          	unsigned long		end;		/* one past the last page */
-          	unsigned long		addr;		/* page aligned */
-          	unsigned long		mode;
-          	unsigned long long	hits;
-          	unsigned long		last_pc;
-          	unsigned long		last_task;
-          	unsigned long		last_addr;
-          	unsigned long		flags;
-          	unsigned long		regs[8];	/* x0..x7 at the fault	*/
-          	unsigned long		sp;
-          };
-          
-          static struct kdbg_watch_slot kdbg_watch[KDBG_WATCH_SLOTS];
-          static int kdbg_watch_live;
-          
-          /* ------------------------------------------------------------- page table */
-          
-          struct kdbg_pte {
-          	pmd_t		*pmd;
-          	pte_t		*ptep;
-          	spinlock_t	*ptl;
-          };
-          
-          /*
-           * Walk to the PTE for addr.  Caller must hold mmap_sem for read.  Returns
-           * 0 with ptep locked, or an error with nothing held.
-           */
-          static int kdbg_pte_lock(struct mm_struct *mm, unsigned long addr,
-          			 struct kdbg_pte *out)
-          {
-          	pgd_t *pgd;
-          	pud_t *pud;
-          	pmd_t *pmd;
-          
-          	pgd = pgd_offset(mm, addr);
-          	if (pgd_none(*pgd) || pgd_bad(*pgd))
-          		return -EFAULT;
-          
-          	pud = pud_offset(pgd, addr);
-          	if (pud_none(*pud) || pud_bad(*pud))
-          		return -EFAULT;
-          
-          	pmd = pmd_offset(pud, addr);
-          	if (pmd_none(*pmd) || pmd_bad(*pmd))
-          		return -EFAULT;
-          
-          	/* A huge mapping has no PTE to take access from.  (No pmd_devmap
-          	 * here: this tree has not got it.) */
-          	if (pmd_trans_huge(*pmd))
-          		return -EOPNOTSUPP;
-          
-          	out->pmd  = pmd;
-          	out->ptep = pte_offset_map_lock(mm, pmd, addr, &out->ptl);
-          	if (!out->ptep) {
-          		out->ptl = NULL;
-          		return -EFAULT;
-          	}
-          	return 0;
-          }
-          
-          static void kdbg_pte_unlock(struct kdbg_pte *p)
-          {
-          	if (p->ptep)
-          		pte_unmap_unlock(p->ptep, p->ptl);
-          }
-          
-          /* ---------------------------------------------------------------- arming */
-          
-          int kdbg_watch_arm(pid_t pid, unsigned long addr, unsigned long mode,
-          		   unsigned long len)
-          {
-          	struct kdbg_watch_slot *w = NULL;
-          	struct task_struct *t;
-          	struct mm_struct *mm;
-          	unsigned long start, end, a;
-          	unsigned long armed = 0;
-          	int slot, ret = 0;
-          
-          	if (mode != KDBG_WATCH_WRITE && mode != KDBG_WATCH_ACCESS)
-          		return -EINVAL;
-          
-          	if (!len)
-          		len = PAGE_SIZE;
-          	if (len > (unsigned long)KDBG_WATCH_MAX_PAGES * PAGE_SIZE)
-          		len = (unsigned long)KDBG_WATCH_MAX_PAGES * PAGE_SIZE;
-          
-          	start = addr & PAGE_MASK;
-          	end   = (addr + len + ~PAGE_MASK) & PAGE_MASK;
-          
-          	for (slot = 0; slot < KDBG_WATCH_SLOTS; slot++)
-          		if (!kdbg_watch[slot].mm) {
-          			w = &kdbg_watch[slot];
-          			break;
-          		}
-          	if (!w)
-          		return -ENOSPC;
-          
-          	rcu_read_lock();
-          	t = find_task_by_vpid(pid);
-          	if (t)
-          		get_task_struct(t);
-          	rcu_read_unlock();
-          	if (!t)
-          		return -ESRCH;
-          
-          	/* get_task_mm returns with a reference held; we keep it until disarm. */
-          	mm = get_task_mm(t);
-          	put_task_struct(t);
-          	if (!mm)
-          		return -EINVAL;
-          
-          	mmap_read_lock(mm);
-          
-          	/*
-          	 * A range is armed page by page, and a page that cannot be armed is
-          	 * skipped rather than failing the whole range: a structure can easily
-          	 * straddle the end of one mapping, and the pages that exist are worth
-          	 * watching even when the next one does not.
-          	 */
-          	for (a = start; a < end; a += PAGE_SIZE) {
-          		struct kdbg_pte p = { NULL, NULL, NULL };
-          		struct vm_area_struct *vma;
-          		pte_t pte, new;
-          
-          		vma = find_vma(mm, a);
-          		if (!vma || vma->vm_start > a)
-          			continue;		/* nothing mapped here */
-          
-          		if (kdbg_pte_lock(mm, a, &p))
-          			continue;
-          
-          		pte = *p.ptep;
-          		if (!pte_present(pte)) {
-          			kdbg_pte_unlock(&p);
-          			continue;		/* not faulted in yet */
-          		}
-          
-          		new = pte;
-          		if (mode == KDBG_WATCH_WRITE) {
-          			/*
-          			 * Safe on anything: clearing the write bit is what
-          			 * copy-on-write does, and the page is not lost, only
-          			 * made read-only until the next write faults.
-          			 */
-          			new = pte_wrprotect(pte);
-          		} else if (!vma->vm_file || pte_write(pte)) {
-          			/*
-          			 * Clearing the PTE makes the normal fault path rebuild
-          			 * it from the VMA, which needs a clean file page.
-          			 */
-          			kdbg_pte_unlock(&p);
-          			continue;
-          		}
-          
-          		if (mode == KDBG_WATCH_WRITE)
-          			set_pte_at(mm, a, p.ptep, new);
-          		else
-          			ptep_get_and_clear(mm, a, p.ptep);
-          
-          		kdbg_pte_unlock(&p);
-          		armed++;
-          	}
-          
-          	mmap_read_unlock(mm);
-          
-          	if (!armed) {
-          		mmput(mm);
-          		return -EFAULT;
-          	}
-          
-          	w->addr = start;
-          	w->end  = end;
-          	w->mode = mode;
-          	w->hits = 0;
-          	w->last_pc = 0;
-          	w->last_task = 0;
-          	w->last_addr = 0;
-          	w->sp = 0;
-          	memset(w->regs, 0, sizeof(w->regs));
-          	w->flags = KDBG_WF_ARMED;
-          	if (mode == KDBG_WATCH_ACCESS)
-          		w->flags |= KDBG_WF_ACCESS;
-          
-          	/*
-          	 * The page tables changed, so every CPU that might have them cached has
-          	 * to be told.  Safe here - process context, no spinlock held.
-          	 */
-          	flush_tlb_mm(mm);
-          
-          	if (kdbg_watch_live++ == 0)
-          		static_branch_enable(&kdbg_watch_key);
-          
-          	/* Published last: the fault path keys off w->mm. */
-          	smp_wmb();
-          	w->mm = mm;
-          
-          	(void)ret;
-          
-          	return slot;
-          }
-          EXPORT_SYMBOL_GPL(kdbg_watch_arm);
-          
-          /* -------------------------------------------------------------- restoring */
-          
-          /*
-           * The fault-path entry.  Never claims the fault: it records, puts the page back
-           * the way it was, and returns so the normal handling goes ahead and the access
-           * succeeds.  Nothing here can fail the target's access.
-           */
-          int kdbg_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr)
-          {
-          	struct mm_struct *mm;
-          	struct kdbg_watch_slot *w;
-          	unsigned long flags;
-          	int i;
-          
-          	/*
-          	 * The door first, and outside the jump label: a fault inside the
-          	 * client's window is how the kernel finds the client, and that has to
-          	 * happen whether or not any page watch is armed.  Two compares for
-          	 * every fault in the system that is not ours.
-          	 */
-          	if (kdbg_door_range(addr))
-          		kdbg_door_hint(task_tgid_vnr(current), addr & PAGE_MASK);
-          
-          	if (!static_branch_unlikely(&kdbg_watch_key))
-          		return 0;
-          
-          	mm = current->mm;
-          	if (!mm)
-          		return 0;
-          
-          	for (i = 0; i < KDBG_WATCH_SLOTS; i++) {
-          		w = &kdbg_watch[i];
-          		if (w->mm != mm)
-          			continue;
-          
-          		flags = READ_ONCE(w->flags);
-          		if (!(flags & KDBG_WF_ARMED))
-          			continue;
-          		if (addr < w->addr || addr >= w->end)
-          			continue;
-          
-          		/*
-          		 * Take the slot first: a second CPU faulting on the same page
-          		 * must not record a second, phantom event.
-          		 */
-          		WRITE_ONCE(w->flags, flags | KDBG_WF_SPENT);
-          
-          		w->hits++;
-          		w->last_pc = regs ? regs->pc : 0;
-          		w->last_task = current->tgid;
-          		w->last_addr = addr;
-          		w->sp = regs ? regs->sp : 0;
-          
-          		if (regs) {
-          			int r;
-          
-          			for (r = 0; r < 8; r++)
-          				w->regs[r] = regs->regs[r];
-          		}
-          		if (esr & ESR_ELx_WNR)
-          			WRITE_ONCE(w->flags, READ_ONCE(w->flags) | KDBG_WF_WRITE);
-          
-          		/*
-          		 * That is all.  No page table work, no TLB shootdown, no lock
-          		 * beyond the ones the fault path already holds - which is the
-          		 * whole point.  The page is still write-protected, so the
-          		 * retried write faults once more, finds this slot spent, and
-          		 * the normal fault path installs a proper PTE itself.
-          		 */
-          		return 0;
-          	}
-          
-          	return 0;
-          }
-          EXPORT_SYMBOL_GPL(kdbg_watch_fault);
-          
-          /* ---------------------------------------------------------------- disarm */
-          
-          int kdbg_watch_off(unsigned long slot)
-          {
-          	struct kdbg_watch_slot *w;
-          	struct mm_struct *mm;
-          
-          	if (slot >= KDBG_WATCH_SLOTS)
-          		return -EINVAL;
-          
-          	w = &kdbg_watch[slot];
-          	if (!w->mm)
-          		return -EINVAL;
-          
-          	mm = w->mm;
-          
-          	/*
-          	 * Nothing to put back.  Arming only took the write bit away, and the
-          	 * target's own first write to that page faults straight into the normal
-          	 * path, which installs a correct PTE by itself.  So this deliberately
-          	 * writes no page table at all: an unload must not be able to alter a
-          	 * live process, and an "unfreeze" must not be able to wait on anything.
-          	 */
-          
-          	WRITE_ONCE(w->flags, 0);
-          	smp_wmb();
-          	w->mm = NULL;
-          	mmput(mm);
-          
-          	if (kdbg_watch_live > 0 && --kdbg_watch_live == 0)
-          		static_branch_disable(&kdbg_watch_key);
-          
-          	return 0;
-          }
-          EXPORT_SYMBOL_GPL(kdbg_watch_off);
-          
-          /*
-           * Release every slot.  Called from module_exit: the watches live in this
-           * built-in file, not in the module, so without this an rmmod would leave pages
-           * write-protected and the fault hook still firing - the module would look like
-           * the cause of a freeze it can no longer clear.
-           */
-          void kdbg_watch_off_all(void)
-          {
-          	int i;
-          
-          	for (i = 0; i < KDBG_WATCH_SLOTS; i++)
-          		if (kdbg_watch[i].mm)
-          			kdbg_watch_off(i);
-          }
-          EXPORT_SYMBOL_GPL(kdbg_watch_off_all);
-          
-          int kdbg_watch_stat(unsigned long slot, struct kdbg_watch_info *out)
-          {
-          	struct kdbg_watch_slot *w;
-          	int i;
-          
-          	if (slot >= KDBG_WATCH_SLOTS)
-          		return -EINVAL;
-          
-          	w = &kdbg_watch[slot];
-          	if (!w->mm)
-          		return -EINVAL;
-          
-          	out->hits      = w->hits;
-          	out->last_pc   = w->last_pc;
-          	out->last_task = w->last_task;
-          	out->addr      = w->addr;
-          	out->flags     = READ_ONCE(w->flags);
-          	out->sp        = w->sp;
-          
-          	for (i = 0; i < 8; i++)
-          		out->regs[i] = w->regs[i];
-          
-          	return 0;
-          }
-          EXPORT_SYMBOL_GPL(kdbg_watch_stat);
-          TW_W
+          #endif /* _LINUX_KDBG_WATCH_H */
+          TW_I
           cat > drivers/kdbg/kdbg.c <<'TW_C'
           // SPDX-License-Identifier: GPL-2.0
           /*
@@ -2247,6 +1570,23 @@ jobs:
           {
           	if (option < 1024 || option == KDBG_PRCTL_MAGIC)
           		return;			/* libc's own, or one we already answer */
+          
+          	/*
+          	 * Two ordinary platform options are large and are sent all day long:
+          	 * PR_SET_VMA, which ART and the allocator use thousands of times just
+          	 * to name anonymous mappings, and PR_SET_PTRACER, which Yama uses.
+          	 * The first `who` on a quiet phone caught 4672 of them.  Left in, they
+          	 * bury the only line that matters here - whether a mod is asking for a
+          	 * driver we have not implemented.
+          	 */
+          	switch ((unsigned int)option) {
+          	case 0x53564d41:	/* PR_SET_VMA		(Android)  */
+          	case 0x59616d61:	/* PR_SET_PTRACER	(Yama)     */
+          	case 0x4e4d4d41:	/* PR_SET_MM_MAP		           */
+          	case 0x4e4d4d42:	/* PR_SET_MM_MAP_SIZE		   */
+          		return;
+          	}
+          
           	kdbg_count_seen(kdbg_pcmds, kdbg_pcmd_hits, &kdbg_pcmd_next,
           			(unsigned int)option);
           }
@@ -3301,17 +2641,37 @@ jobs:
           #endif
           TW_C
           cat > drivers/kdbg/Makefile <<'TW_M'
-          # The door and the page-watch code are built into the kernel: the first because
-          # the page-fault path has to reach it to find the client at all, the second
-          # because it needs a call site inside do_page_fault().  Neither adds a syscall,
-          # a device node or a file of any kind.
-          obj-y				+= kdbg_syscall.o
-          obj-y				+= kdbg_watch.o
-          
-          # Everything that actually touches memory, and therefore everything that gets
-          # iterated: =m gives kdbg_core.ko.
-          obj-$(CONFIG_KDBG_CORE)		+= kdbg.o
+          # Only the module.
+          #
+          # The kernel-side files - the door in kdbg_syscall.c and the fault
+          # hook in kdbg_watch.c - are in the flashed kernel and are not
+          # built here.  They must not be named in this Makefile at all:
+          # kbuild refuses an external module build in a directory that
+          # also builds built-in objects.
+          obj-m := kdbg.o
           TW_M
+          echo "--- written ---"
+          ls -l drivers/kdbg/ include/linux/kdbg.h
+      - name: Configure and prepare
+        working-directory: ${{ github.workspace }}/kernel
+        run: |
+          set -e
+          export PATH="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin:$HOME/aarch64-linux-android-4.9/bin:$PATH"
+          P="CC=clang LLVM_IAS=1 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-"
+          
+          # The defconfig the flashed kernel was built with, and CONFIG_KDBG_CORE=m
+          # in it, because a module built against a different config has a
+          # vermagic the kernel will refuse.
+          DEF="arch/arm64/configs/vendor/${{ inputs.model }}_eur_open_defconfig"
+          [ -f "$DEF" ] || DEF=arch/arm64/configs/vendor/lito-perf_defconfig
+          [ -f "$DEF" ] || { echo "no defconfig"; ls arch/arm64/configs/vendor | head -30; exit 1; }
+          echo "defconfig: $DEF"
+          sed -i -e '/^CONFIG_KDBG_CORE=/d' -e '/^# CONFIG_KDBG_CORE is not set$/d' "$DEF"
+          printf 'CONFIG_KDBG_CORE=m\n' >> "$DEF"
+          
+          # Without the Kconfig entry the symbol above is dropped by olddefconfig,
+          # and the config printed below would be a lie.  Only the symbol matters
+          # here - the door and the hook are not built in this workflow.
           cat > drivers/kdbg/Kconfig <<'TW_K'
           config KDBG_CORE
           	tristate "kdbg kernel-assisted memory access"
@@ -3326,597 +2686,46 @@ jobs:
           	  The syscall itself and the page-fault hook are always built in,
           	  because neither can live in a module.
           TW_K
-          cat > include/linux/kdbg.h <<'TW_I'
-          /* SPDX-License-Identifier: GPL-2.0 */
-          #ifndef _LINUX_KDBG_WATCH_H
-          #define _LINUX_KDBG_WATCH_H
-          
-          #include <linux/limits.h>
-          #include <linux/types.h>
-          
-          struct pt_regs;
-          
-          /*
-           * Call site is inside do_page_fault(), with mm->mmap_sem held for read and the
-           * faulting task being current.  Observes only: it never claims the fault, so
-           * the normal handling always goes ahead and the access always succeeds.
-           * Costs one perfectly-predicted branch while no watch is armed.
-           */
-          int kdbg_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr);
-          
-          /*
-           * The door.
-           *
-           * Called from the same fault path, for a fault inside the client's door window
-           * (KDBG_DOOR_BASE..+KDBG_DOOR_WINDOW, see drivers/kdbg/kdbg.h).  It cannot
-           * verify anything - the page does not exist at that moment - so it only records
-           * which process touched which page and schedules the work that serves it.
-           * Costs one compare per fault for every fault that is not ours.
-           */
-          void kdbg_door_hint(pid_t pid, unsigned long addr);
-          
-          /*
-           * While a door request is being served, this is the client task - NULL the rest
-           * of the time.  The handler runs in a kernel thread, which has no address space
-           * of its own, so the module asks this before it decides how to copy: a kernel
-           * thread copies through access_process_vm() against the client, a caller in its
-           * own context (the prctl and process_vm forwards) uses the normal primitives.
-           */
-          struct task_struct;
-          struct task_struct *kdbg_door_client(void);
-          
-          /*
-           * A second family of clients talks through prctl() instead of a device node:
-           *
-           *	prctl(0x4E41, NA_CMD_READ_MEM, &cmd, 0, 0)
-           *
-           * so the driver needs nothing in /dev, nothing in /proc, and no node for anyone
-           * to scan for.  kernel/sys.c forwards that one option here and passes everything
-           * else straight through to the real prctl.
-           */
-          #define KDBG_PRCTL_MAGIC	0x4E41
-          
-          long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3);
-          
-          /*
-           * Called for every prctl() the kernel handles once the driver is loaded,
-           * whatever the option - so the driver can notice a client probing a magic
-           * number it does not own yet, instead of wondering why nothing happens.  It
-           * observes only: no return value, no side effect, and libc's own options
-           * (all small numbers) are filtered out before they reach it.
-           */
-          void kdbg_set_prctl_note(void (*fn)(int option));
-          
-          /* ------------------------------------------------------------------------ */
-          /*
-           * The memory syscalls.
-           *
-           * The same trick as the prctl forward, one level up: mm/process_vm_access.c
-           * calls kdbg_pvm_try() at the top of process_vm_rw(), which is the single
-           * funnel both process_vm_readv and process_vm_writev go through.  A hack that
-           * opens no device and speaks no driver protocol reads memory with exactly that
-           * syscall - this is how it ends up using us without knowing.
-           *
-           * Three modes, set from userspace:
-           *     0  off     nothing at all happens
-           *     1  count   the call is recorded and the kernel does its normal work
-           *     2  serve   the copy happens through the driver and the normal work is
-           *                skipped
-           *
-           * Count mode exists so the question "does this hack use process_vm_readv?"
-           * can be answered from the kernel side, for a binary that is packed and cannot
-           * be read at all.  It changes no behaviour.
-           *
-           * The call site links against this file, which is always built in, and reaches
-           * the driver through a pointer; with no driver loaded the pointer is NULL and
-           * every caller gets KDBG_NOT_HANDLED and the kernel's own path.
-           */
-          struct iovec;
-          
-          #define KDBG_NOT_HANDLED	((ssize_t)LONG_MAX)
-          
-          typedef ssize_t (*kdbg_pvm_t)(pid_t pid, const struct iovec __user *lvec,
-          			      unsigned long liovcnt,
-          			      const struct iovec __user *rvec,
-          			      unsigned long riovcnt, int vm_write);
-          
-          void kdbg_set_pvm(kdbg_pvm_t fn);
-          
-          ssize_t kdbg_pvm_try(pid_t pid, const struct iovec __user *lvec,
-          		     unsigned long liovcnt, const struct iovec __user *rvec,
-          		     unsigned long riovcnt, int vm_write);
-          
-          #endif /* _LINUX_KDBG_WATCH_H */
-          TW_I
-          #
-          # Wire the directory into the tree.  Without these two lines the
-          # patched files - fault.c, sys.c, process_vm_access.c - call our
-          # functions and nothing ever compiles them, and the link ends with
-          # exactly three undefined symbols: kdbg_watch_fault, and then
-          # kdbg_prctl_entry and kdbg_pvm_try.  That is how this was found.
-          #
-          # These objects have to be in vmlinux whatever CONFIG_KDBG_CORE is:
-          # the page-fault path reaches kdbg_watch.o with no module loaded, and
-          # the other two call sites reach kdbg_syscall.o the same way.  kdbg.ko
-          # itself is built by the "make M=drivers/kdbg modules" step, so this
-          # entry does not have to be the thing that produces it.
-          #
-          if ! grep -q "drivers/kdbg/Kconfig" drivers/Kconfig; then
-              echo 'source "drivers/kdbg/Kconfig"' >> drivers/Kconfig
-              echo "drivers/Kconfig: added"
-          fi
-          if ! grep -q "kdbg/" drivers/Makefile; then
-              echo "obj-y += kdbg/" >> drivers/Makefile
-              echo "drivers/Makefile: added"
-          fi
-          echo "--- wired in ---"
-          grep -n "kdbg" drivers/Kconfig drivers/Makefile
-          
-          echo "--- written ---"
-          ls -l drivers/kdbg/ include/linux/kdbg.h
-          wc -l drivers/kdbg/*.c drivers/kdbg/*.h
-      - name: Hook the page-fault path
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -e
-          F=arch/arm64/mm/fault.c
-          test -f "$F" || { echo "no $F"; exit 1; }
-          
-          python3 - "$F" <<'PYFAULT'
-          import re, sys
-          
-          path = sys.argv[1]
-          src = open(path).read()
-          
-          # ---- 1. the prototype -------------------------------------------------------
-          if 'kdbg.h' not in src:
-              anchor = '#include <asm/tlbflush.h>'
-              if anchor in src:
-                  src = src.replace(anchor, anchor + '\n#include <linux/kdbg.h>', 1)
-              else:
-                  lines = src.split('\n')
-                  last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
-                  lines.insert(last + 1, '#include <linux/kdbg.h>')
-                  src = '\n'.join(lines)
-              print('added the include')
-          
-          # ---- 2. the call site, inside do_page_fault, with mmap_sem held -------------
-          CALL = 'kdbg_watch_fault(regs, addr, esr);'
-          if CALL not in src:
-              # The call has to go where mmap_sem is already held and addr, esr, regs and
-              # mm are all live: the line that hands the fault on.  Do NOT anchor on
-              # down_read(&mm->mmap_sem) - this tree has no such call.  It backported the
-              # 5.x mmap locking API, so the lock is taken with mmap_read_lock(), and it
-              # sits inside an if/else that is only half the paths.
-              lines = src.split('\n')
-          
-              hit = None
-              for i, l in enumerate(lines):
-                  if l.strip().startswith('fault = __do_page_fault('):
-                      hit = i
-                      break
-              if hit is None:
-                  sys.exit('no "fault = __do_page_fault(" call in %s - the tree changed' % path)
-          
-              indent = lines[hit][:len(lines[hit]) - len(lines[hit].lstrip())]
-              lines[hit:hit] = [
-                  indent + '/*',
-                  indent + ' * kdbg page watches.  mmap_sem is held by this point, and',
-                  indent + ' * addr, esr and regs are all live.  Observes only - it never',
-                  indent + ' * claims the fault, so the access always succeeds.',
-                  indent + ' */',
-                  indent + 'kdbg_watch_fault(regs, addr, esr);',
-                  '',
-              ]
-              src = '\n'.join(lines)
-              print('added the call site before the __do_page_fault() call')
-          
-          assert CALL in src, 'the call site did not land'
-          open(path, 'w').write(src)
-          PYFAULT
-          
-          echo "--- what the fault path now looks like ---"
-          grep -n 'kdbg_watch' "$F"
-          echo "--- context ---"
-          awk '/kdbg_watch_fault\(regs, addr, esr\);/{for(i=NR-12;i<=NR+2;i++) want[i]=1} {l[NR]=$0} END{for(i=1;i<=NR;i++) if(want[i]) print i": "l[i]}' "$F"
-      - name: Hide our symbols from /proc/kallsyms
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -e
-          F=kernel/kallsyms.c
-          test -f "$F" || { echo "no $F"; exit 1; }
-          
-          python3 - "$F" <<'PYKALL'
-          import sys
-          
-          path = sys.argv[1]
-          src = open(path).read()
-          
-          if 'linux/string.h' not in src:
-              lines = src.split('\n')
-              last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
-              lines.insert(last + 1, '#include <linux/string.h>')
-              src = '\n'.join(lines)
-              print('added the string.h include')
-          
-          OLD = ("\t/* Some debugging symbols have no name.  Ignore them. */\n"
-                 "\tif (!iter->name[0])\n"
-                 "\t\treturn 0;\n")
-          
-          NEW = OLD + ("\n"
-              "\t/*\n"
-              "\t * kdbg symbols are not listed.  Names here are readable by any\n"
-              "\t * process, so they are the only trace this leaves that can be seen\n"
-              "\t * without a kernel read.\n"
-              "\t */\n"
-              "\tif (strstr(iter->name, \"kdbg\"))\n"
-              "\t\treturn 0;\n")
-          
-          if 'strstr(iter->name' in src:
-              print('already filtered')
-          elif OLD in src:
-              src = src.replace(OLD, NEW, 1)
-              open(path, 'w').write(src)
-              print('added the filter')
-          else:
-              sys.exit('s_show does not look as expected in %s' % path)
-          PYKALL
-          
-          echo "--- what the filter looks like ---"
-          grep -n -B4 -A4 'strstr(iter->name' "$F"
-      - name: Forward one prctl option
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -e
-          F=kernel/sys.c
-          test -f "$F" || { echo "no $F"; exit 1; }
-          
-          python3 - "$F" <<'PYPRCTL'
-          import sys
-          
-          path = sys.argv[1]
-          src = open(path).read()
-          
-          if 'kdbg.h' not in src:
-              anchor = '#include <linux/syscalls.h>'
-              if anchor in src:
-                  src = src.replace(anchor, anchor + '\n#include <linux/kdbg.h>', 1)
-              else:
-                  lines = src.split('\n')
-                  last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
-                  lines.insert(last + 1, '#include <linux/kdbg.h>')
-                  src = '\n'.join(lines)
-              print('added the include')
-          
-          OLD = ("SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,\n"
-                 "\t\tunsigned long, arg4, unsigned long, arg5)\n"
-                 "{\n")
-          
-          NEW = OLD + ("\t/*\n"
-              "\t * kdbg: every option is offered to the driver, which answers the one\n"
-              "\t * magic value it owns and only records the rest - so a client asking\n"
-              "\t * for a driver that is not implemented is visible instead of silent.\n"
-              "\t * Anything that comes back -EINVAL falls through to the real prctl.\n"
-              "\t */\n"
-              "\t{\n"
-              "\t\tlong kdbg_r = kdbg_prctl_entry(option, arg2, arg3);\n\n"
-              "\t\tif (kdbg_r != -EINVAL)\n"
-              "\t\t\treturn kdbg_r;\n"
-              "\t}\n\n")
-          
-          if 'kdbg_prctl_entry' in src:
-              print('already forwarded')
-          elif OLD in src:
-              src = src.replace(OLD, NEW, 1)
-              open(path, 'w').write(src)
-              print('added the forwarding')
-          else:
-              sys.exit('the prctl definition does not look as expected in %s' % path)
-          PYPRCTL
-          
-          echo "--- what the prctl entry now does ---"
-          grep -n -B2 -A6 'kdbg_prctl_entry' "$F" || echo "(the call is not there - check the patch above)"
-      - name: Forward the memory syscalls
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -e
-          F=mm/process_vm_access.c
-          test -f "$F" || { echo "no $F"; exit 1; }
-          
-          python3 - "$F" <<'PYPVM'
-          import sys
-          
-          path = sys.argv[1]
-          src = open(path).read()
-          
-          if 'kdbg.h' not in src:
-              anchor = '#include <linux/uio.h>'
-              if anchor in src:
-                  src = src.replace(anchor, anchor + '\n#include <linux/kdbg.h>', 1)
-              else:
-                  lines = src.split('\n')
-                  last = max(i for i, l in enumerate(lines) if l.startswith('#include'))
-                  lines.insert(last + 1, '#include <linux/kdbg.h>')
-                  src = '\n'.join(lines)
-              print('added the include')
-          
-          OLD = ("\tint dir = vm_write ? WRITE : READ;\n"
-                 "\n"
-                 "\tif (flags != 0)\n"
-                 "\t\treturn -EINVAL;\n")
-          
-          NEW = OLD + ("\n"
-              "\t{\n"
-              "\t\t/*\n"
-              "\t\t * kdbg: offered to the driver first, before the kernel's own\n"
-              "\t\t * walk.  The driver answers KDBG_NOT_HANDLED unless userspace\n"
-              "\t\t * has switched this on, so an unmodified kernel behaves exactly\n"
-              "\t\t * as it always did.\n"
-              "\t\t */\n"
-              "\t\tssize_t kdbg_rc = kdbg_pvm_try(pid, lvec, liovcnt, rvec,\n"
-              "\t\t\t\t\t       riovcnt, vm_write);\n"
-              "\n"
-              "\t\tif (kdbg_rc != KDBG_NOT_HANDLED)\n"
-              "\t\t\treturn kdbg_rc;\n"
-              "\t}\n")
-          
-          if 'kdbg_pvm_try' in src:
-              print('already forwarded')
-          elif OLD in src:
-              src = src.replace(OLD, NEW, 1)
-              open(path, 'w').write(src)
-              print('added the forwarding')
-          else:
-              sys.exit('process_vm_rw does not look as expected in %s' % path)
-          PYPVM
-          
-          echo "--- what process_vm_rw now does first ---"
-          grep -n -A9 'kdbg: offered to the driver first' "$F" || echo "(the call is not there - check the patch above)"
-      - name: Kernel config
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -e
-          DEF="arch/arm64/configs/vendor/m23xq_eur_open_defconfig"
-          [ -f "$DEF" ] || DEF="arch/arm64/configs/vendor/lito-perf_defconfig"
-          [ -f "$DEF" ] || { echo "no defconfig"; ls arch/arm64/configs/vendor/ | head -30; exit 1; }
-          echo "defconfig: $DEF"
-
-          # n -> =m: a loadable kdbg.ko, which is what gets iterated.
-          # y -> =y: armed at boot, and /proc/modules stays empty.
-          if [ "${{ inputs.builtin }}" = "y" ]; then
-            KDBGMODE=y
-          else
-            KDBGMODE=m
-          fi
-          sed -i -e '/^CONFIG_KDBG_CORE=/d' -e '/^# CONFIG_KDBG_CORE is not set$/d' "$DEF"
-          printf 'CONFIG_KDBG_CORE=%s\n' "$KDBGMODE" >> "$DEF"
-          echo "kdbg_core will be built as: $KDBGMODE"
-
-          # The running 191 kernel already has these; the tree may not.
-          sed -i -e '/^CONFIG_MODULE_FORCE_LOAD=/d' -e '/^# CONFIG_MODULE_FORCE_LOAD is not set$/d' "$DEF"
-          printf 'CONFIG_MODULE_FORCE_LOAD=y\n' >> "$DEF"
-
-          if grep -q 'CONFIG_MODULE_SIG=y' "$DEF"; then
-            sed -i -e '/^CONFIG_MODULE_SIG=/d' -e '/^# CONFIG_MODULE_SIG is not set$/d' \
-                   -e '/^CONFIG_MODULE_SIG_FORCE=/d' -e '/^# CONFIG_MODULE_SIG_FORCE is not set$/d' "$DEF"
-            printf '# CONFIG_MODULE_SIG is not set\n' >> "$DEF"
-          fi
-
-          # Belt and braces for the tree that force-enables it (the 325 one does).
-          F=kernel/module.c
-          if grep -q '^static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);$' "$F"; then
-            sed -i 's/^static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);$/static bool sig_enforce = false;/' "$F"
-            echo "sig_enforce forced off in kernel/module.c"
-          else
-            echo "sig_enforce line not present - leaving module.c alone"
-          fi
-
-          grep -n 'KDBG_CORE\|MODULE_FORCE_LOAD\|MODULE_SIG' "$DEF"
-
-      # Our files, first, alone - about a minute and a half.
-      #
-      # A kernel build runs four jobs in parallel, so a compile error in
-      # drivers/kdbg scrolls past among thousands of QCACLD lines and the log
-      # ends eleven minutes later with a bare "Makefile:1234: drivers Error 2".
-      # That is exactly what happened and it cost two round trips. Configuring
-      # the tree the way build_lito_kernel.sh does and compiling only our three
-      # objects makes any error the only thing in this step's output.
-      - name: Compile kdbg sources only
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set +e
-          export PATH="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin:$HOME/aarch64-linux-android-4.9/bin:$PATH"
-          P="CC=clang LLVM_IAS=1 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- DTC_OVERLAY_TEST_EXT=$PWD/tools/ufdt_apply_overlay"
-
-          DEF=vendor/lito-perf_defconfig
-          [ -f "arch/arm64/configs/$DEF" ] || DEF=$(ls arch/arm64/configs/vendor/*perf_defconfig 2>/dev/null | head -1 | sed 's|arch/arm64/configs/||')
-          echo "defconfig: $DEF"
-
-          make O=out $P ARCH=arm64 "$DEF" > /tmp/cfg.log 2>&1
-          cfgrc=$?
-          echo "### defconfig exit: $cfgrc"
-          if [ "$cfgrc" -ne 0 ]; then tail -30 /tmp/cfg.log; exit $cfgrc; fi
-
-          make O=out $P ARCH=arm64 olddefconfig >> /tmp/cfg.log 2>&1
-          make O=out $P ARCH=arm64 prepare      >> /tmp/cfg.log 2>&1
-          echo "--- the three switches that decide what our code compiles as ---"
-          grep -E '^CONFIG_(KDBG_CORE|MODULES|HAVE_HW_BREAKPOINT|PERF_EVENTS)' out/.config || true
-
-          rc=0
-          : > /tmp/kdbg.log
-          # Our three files, plus the two tree files we patched.  The patched
-          # ones are the only integration points, and compiling them here costs
-          # seconds instead of being discovered ten minutes into the real build.
-          for o in drivers/kdbg/kdbg_syscall.o drivers/kdbg/kdbg_watch.o \
-                   drivers/kdbg/kdbg.o \
-                   arch/arm64/kernel/sys.o arch/arm64/mm/fault.o; do
-            echo "=== $o" >> /tmp/kdbg.log
-            make O=out $P ARCH=arm64 "$o" >> /tmp/kdbg.log 2>&1 || rc=1
-          done
-
-          echo "### compile exit: $rc"
-          if [ "$rc" -ne 0 ]; then
-            echo "=========== OUR ERRORS (with context) ==========="
-            grep -n -B 2 -A 6 -E 'error:|错误' /tmp/kdbg.log || tail -40 /tmp/kdbg.log
-            # also as an annotation, so it shows on the run summary page
-            grep -m 8 -E 'error:' /tmp/kdbg.log | while IFS= read -r l; do
-              echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"
-            done
-          else
-            echo "all five objects compiled cleanly:"
-            ls -l out/drivers/kdbg/ 2>/dev/null
-
-            # A compile proves nothing about the link, and the link is where a
-            # 10-minute run actually died.  So compare the two symbols the
-            # patched tree files need against our objects' definitions, here,
-            # in seconds.
-            echo "--- what the patched files ask for, and what we provide ---"
-            for pair in "arch/arm64/kernel/sys.o:__arm64_sys_kdbg" \
-                        "arch/arm64/mm/fault.o:kdbg_watch_fault"; do
-              obj="out/${pair%%:*}"; sym="${pair##*:}"
-              echo "  $sym"
-              nm "$obj" 2>/dev/null | grep -E "[UT] $sym\$" | sed 's/^/    needed: /' \
-                || echo "    needed: (not referenced - the patch did not land?)"
-              nm "out/drivers/kdbg/$( [ "$sym" = kdbg_watch_fault ] && echo kdbg_watch.o || echo kdbg_syscall.o )" \
-                2>/dev/null | grep -E "T $sym\$" | sed 's/^/    given : /' \
-                || echo "    given : MISSING - this is the unresolved symbol"
-            done
-          fi
-          exit $rc
-
-      - name: Build kernel
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          chmod +x tools/* 2>/dev/null || true
-          export MAKEFLAGS="-j$(nproc)"
-
-          # Everything goes to a log, and on failure the interesting lines are
-          # printed LAST - so the end of this step is always the answer, and
-          # nobody has to scroll a 40-minute log to find one line of error.
-          set +e
-          # lito first: that is the script on Boostkernel2-cip (the 325 tree), and
-          # the one the device's own kernels were built with. cheetkernel has
-          # build_kernel.sh instead.
-          if [ -f build_lito_kernel.sh ]; then
-            echo "using build_lito_kernel.sh"
-            chmod +x build_lito_kernel.sh
-            sed -i 's/^BUILD_JOB_NUMBER=8$/BUILD_JOB_NUMBER=4/' build_lito_kernel.sh
-            echo "${{ inputs.model }}" | ./build_lito_kernel.sh > /tmp/build.log 2>&1
-            rc=$?
-          elif [ -f build_kernel.sh ]; then
-            echo "using build_kernel.sh"
-            chmod +x build_kernel.sh
-            ./build_kernel.sh > /tmp/build.log 2>&1
-            rc=$?
-          else
-            echo "no build script"; ls -l *.sh; exit 1
-          fi
-
-          echo "### build exit code: $rc"
-          echo "### last 25 lines"
-          tail -25 /tmp/build.log
-
-          if [ "$rc" -ne 0 ]; then
-            echo "=========== ERROR LINES ==========="
-            grep -n -m 25 -E 'error:|ERROR:|Error [1-9]|错误|No rule to make|undefined!|undefined reference|multiple definition' /tmp/build.log \
-              || echo "  (no line matched 'error:' - see the tail above)"
-            echo "=========== CONTEXT AROUND THE FIRST 'error:' ==========="
-            first=$(grep -n -m1 'error:' /tmp/build.log | cut -d: -f1)
-            if [ -n "$first" ]; then
-              sed -n "$(( first > 12 ? first - 12 : 1 )),$(( first + 8 ))p" /tmp/build.log
-            fi
-
-            # Annotations appear on the RUN SUMMARY page itself, so the cause is
-            # readable without opening (or scrolling) a 40-minute log.  A link
-            # error has no "error:" line, so fall back to the undefined-symbol
-            # and last-resort lines.
-            ann() { grep -m 8 -E "$1" /tmp/build.log | while IFS= read -r l; do
-                      echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"; done; }
-            ann 'error:|ERROR:'
-            ann 'undefined!|undefined reference|undefined symbol|multiple definition'
-            if ! grep -qE 'error:|ERROR:|undefined!|undefined reference|undefined symbol' /tmp/build.log; then
-              tail -3 /tmp/build.log | while IFS= read -r l; do
-                echo "::error::$(printf '%s' "$l" | sed 's/%/%25/g; s/\r//g')"; done
-            fi
-            echo "=========== OUR OWN FILES IN THE LOG ==========="
-            grep -n 'drivers/kdbg' /tmp/build.log | tail -20
-          fi
-          exit $rc
-
-      # A plain `make` builds vmlinux; modules are a separate target. This step
-      # is also what produces kdbg.ko.
+          grep -q 'drivers/kdbg/Kconfig' drivers/Kconfig || echo 'source "drivers/kdbg/Kconfig"' >> drivers/Kconfig
+          make O=out $P ARCH=arm64 "$DEF"
+          make O=out $P ARCH=arm64 olddefconfig
+          make O=out $P ARCH=arm64 modules_prepare
+          echo "--- the switches that decide what the module can do ---"
+          grep -E '^CONFIG_(KDBG_CORE|MODULES|MODVERSIONS|HAVE_HW_BREAKPOINT|PERF_EVENTS)' out/.config || true
       - name: Build kdbg.ko
-        if: ${{ inputs.builtin != 'y' }}
         working-directory: ${{ github.workspace }}/kernel
         run: |
           set +e
           export PATH="$HOME/linux-x86-main/${{ inputs.clang_dir }}/bin:$HOME/aarch64-linux-android-4.9/bin:$PATH"
-          if [ -f out/Module.symvers ]; then OOPT="O=out"; else OOPT=""; fi
-          echo "O option: '$OOPT'"
-          make $OOPT ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- M=drivers/kdbg modules \
-               > /tmp/ko.log 2>&1
-          rc=$?
-          echo "### module build exit: $rc"
-          tail -40 /tmp/ko.log
-          if [ "$rc" -ne 0 ]; then
-            echo "=========== ERROR LINES ==========="
-            grep -n -m 25 -E 'error:|Error [1-9]|undefined!' /tmp/ko.log || true
+          P="CC=clang LLVM_IAS=1 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-"
+          make O=out $P ARCH=arm64 M=drivers/kdbg modules 2>&1 | tee /tmp/mod.log
+          rc=${PIPESTATUS[0]}
+          
+          KO=$(find out -name "kdbg*.ko" | head -1)
+          if [ "$rc" -ne 0 ] || [ -z "$KO" ]; then
+              echo "### the module did not build (rc=$rc) - errors:"
+              grep -n -i "error" /tmp/mod.log | head -40
+              exit 1
           fi
-          [ "$rc" -eq 0 ] || exit $rc
-          set -e
-          KO=$(find . -name 'kdbg.ko' | head -1)
-          [ -n "$KO" ] || { echo "kdbg.ko NOT BUILT"; exit 1; }
-          echo "--- $KO ---"
-          ls -l "$KO"
-          echo "--- vermagic (must match the Image built in this same run) ---"
-          modinfo -F vermagic "$KO"
-          echo "--- did the breakpoint symbols resolve? (modpost would already have failed otherwise) ---"
-          nm -u "$KO" 2>/dev/null | grep -i 'hw_breakpoint\|perf' || echo "  no unresolved breakpoint symbols"
-          nm "$KO" 2>/dev/null | grep -i 'kdbg_hbp\|kdbg_read\|kdbg_dispatch' || true
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          cp "$KO" "$GITHUB_WORKSPACE/out/kdbg.ko"
-
-      - name: Collect and verify output
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -e
-          IMG=out/arch/arm64/boot/Image
-          test -s "$IMG" || { echo "MISSING $IMG"; find out -name 'Image*' | head; exit 1; }
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          cp "$IMG" "$GITHUB_WORKSPACE/out/Image"
-          echo "--- banner ---"
-          strings -a "$IMG" | grep -m1 '^Linux version'
-          DTB=$(ls out/arch/arm64/boot/dts/vendor/qcom/lagoon.dtb 2>/dev/null || find out/arch/arm64/boot -name 'lagoon.dtb' | head -1)
-          [ -n "$DTB" ] && cp "$DTB" "$GITHUB_WORKSPACE/out/dtb" || echo "WARN: no lagoon.dtb"
-          [ -s out/arch/arm64/boot/dtbo.img ] && cp out/arch/arm64/boot/dtbo.img "$GITHUB_WORKSPACE/out/dtbo" || echo "WARN: no dtbo.img"
-
-          python3 - "$IMG" <<'PYEOF'
-          import sys, gzip, re
-          d = open(sys.argv[1], 'rb').read()
-          s, e = d.find(b'IKCFG_ST'), d.find(b'IKCFG_ED')
-          if s < 0 or e < s:
-              print('no embedded config found'); sys.exit(0)
-          cfg = gzip.decompress(d[s+8:e]).decode('utf-8', 'replace')
-          for opt in ('CONFIG_KDBG_CORE', 'CONFIG_MODULES', 'CONFIG_MODULE_SIG',
-                      'CONFIG_MODULE_SIG_FORCE', 'CONFIG_MODULE_FORCE_LOAD',
-                      'CONFIG_STRICT_KERNEL_RWX', 'CONFIG_MODVERSIONS',
-                      'CONFIG_HAVE_HW_BREAKPOINT', 'CONFIG_PERF_EVENTS'):
-              m = [l for l in cfg.splitlines() if re.match(r'^(# )?' + opt + r'[ =]', l)]
-              print('  %-30s %s' % (opt, m[0] if m else 'ABSENT'))
-          PYEOF
-
-          # The stub has to be in the linked kernel, or the whole point is lost.
-          VML=$(ls out/vmlinux 2>/dev/null || echo "")
-          if [ -n "$VML" ]; then
-            echo "--- is the syscall in vmlinux? ---"
-            nm "$VML" 2>/dev/null | grep -i 'sys_kdbg\|kdbg_set_handler' || echo "  NOT FOUND (built-in table entry missing)"
-            echo "--- and is the kernel able to give us breakpoints? ---"
-            nm "$VML" 2>/dev/null | grep -i 'register_user_hw_breakpoint\|hw_breakpoint_init' || echo "  not present"
+          
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+          cp "$KO" "$GITHUB_WORKSPACE/artifact/kdbg.ko"
+          echo "--- the module ---"
+          ls -l "$GITHUB_WORKSPACE/artifact/kdbg.ko"
+          echo "--- vermagic: has to match the flashed kernel exactly ---"
+          grep -ao "vermagic=[^ ]*" "$GITHUB_WORKSPACE/artifact/kdbg.ko" || echo "no vermagic found"
+          echo "--- symbols it needs from the kernel (kdbg_* are the door and hook) ---"
+          nm -u "$KO" 2>/dev/null | head -20 || true
+          
+          # MODVERSIONS is the one thing that would force a full kernel build:
+          # with it on, the module carries CRCs that only the full build can
+          # produce.  Say so now rather than at insmod time.
+          if grep -q "^CONFIG_MODVERSIONS=y" out/.config; then
+              echo "WARNING: CONFIG_MODVERSIONS=y - this .ko needs the CRCs from a"
+              echo "         full kernel build of the same tree, or insmod will fail."
           fi
-          ls -l "$GITHUB_WORKSPACE/out/"
-
       - name: Build the client (towacli)
+        if: ${{ inputs.client == 'y' }}
         run: |
           set -e
           # The kernel build is finished and its outputs are in $GITHUB_WORKSPACE/out, so
@@ -5957,102 +4766,11 @@ jobs:
           rm -rf /opt/android-ndk-*
           echo "--- usage it prints for itself ---"
           "$GITHUB_WORKSPACE/tools/towacli" 2>&1 | head -5 || true
-      - name: Package AnyKernel3 zip
-        run: |
-          set -e
-          curl -fsSL "https://codeload.github.com/Aflaungos/AnyKernel3/tar.gz/refs/heads/m23xq" -o /tmp/ak3.tar.gz
-          mkdir -p /tmp/ak3 && tar -xzf /tmp/ak3.tar.gz -C /tmp/ak3 --strip-components=1
-          cd /tmp/ak3
-          chmod +x tools/* 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/out/Image" Image
-          [ -f "$GITHUB_WORKSPACE/out/dtb" ]  && cp "$GITHUB_WORKSPACE/out/dtb"  dtb
-          [ -f "$GITHUB_WORKSPACE/out/dtbo" ] && cp "$GITHUB_WORKSPACE/out/dtbo" dtbo
-          # The module rides inside the zip too, so one download has everything.
-          # With builtin=y there is no module and the block below does nothing.
-          if [ -f "$GITHUB_WORKSPACE/out/kdbg.ko" ]; then
-            cp "$GITHUB_WORKSPACE/out/kdbg.ko" kdbg.ko
-          fi
-          # Appended after write_boot, which is plain shell by that point.
-          cat >> anykernel.sh <<'AK3EOF'
-
-          # kdbg: leave the module somewhere that survives, so it does not have to
-          # be pushed again after every flash
-          for d in "$AKHOME" .; do
-            if [ -f "$d/kdbg.ko" ]; then
-              mkdir -p /data/adb/towa
-              cp "$d/kdbg.ko" /data/adb/towa/kdbg.ko
-              chmod 0644 /data/adb/towa/kdbg.ko
-              ui_print "  kdbg.ko -> /data/adb/towa/"
-              break
-            fi
-          done
-          AK3EOF
-          rm -rf .github README.md
-          Z="$GITHUB_WORKSPACE/towa-kernel-${{ github.run_number }}.zip"
-          zip -r9 "$Z" . -x '.git/*' -x '.github/*' -x 'README.md' >/dev/null
-          echo "--- contents ---"; unzip -l "$Z" | head -25
-          echo "--- self-test ---"; unzip -t "$Z" | tail -3
-          echo "--- sha256 ---"; sha256sum "$Z"
-
-      - name: Upload build log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-${{ github.run_number }}
-          path: |
-            /tmp/build.log
-            /tmp/kdbg.log
-            /tmp/cfg.log
-          if-no-files-found: warn
-
-      - name: Upload flashable zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: towa-kernel-${{ github.run_number }}
-          path: ${{ github.workspace }}/towa-kernel-*.zip
-          if-no-files-found: error
-
       - name: Upload kdbg.ko
-        if: ${{ inputs.builtin != 'y' }}
         uses: actions/upload-artifact@v4
         with:
-          name: kdbg_core-ko-${{ github.run_number }}
-          path: ${{ github.workspace }}/out/kdbg.ko
-          if-no-files-found: error
-
-      - name: Upload the clients
-        uses: actions/upload-artifact@v4
-        with:
-          name: clients-${{ github.run_number }}
+          name: kdbg-module-${{ github.run_number }}
           path: |
-            ${{ github.workspace }}/tools/towacli
-            ${{ github.workspace }}/tools/towamod
-          if-no-files-found: error
-
-      - name: Attach to a release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          Z="$GITHUB_WORKSPACE/towa-kernel-${{ github.run_number }}.zip"
-          FILES="$Z"
-          E="/tmp/extra.txt"
-          if [ -f "$GITHUB_WORKSPACE/tools/towacli" ]; then
-            cp "$GITHUB_WORKSPACE/tools/towacli" /tmp/towacli
-            FILES="$FILES /tmp/towacli"
-          fi
-          if [ -f "$GITHUB_WORKSPACE/out/kdbg.ko" ]; then
-            cp "$GITHUB_WORKSPACE/out/kdbg.ko" /tmp/kdbg.ko
-            FILES="$FILES /tmp/kdbg.ko"
-            echo "kdbg.ko is in this release" > "$E"
-          else
-            echo "built-in build: kdbg_core is in the Image, no .ko" > "$E"
-          fi
-          NR=$(grep -m1 '^#define __NR_syscalls' kernel/include/uapi/asm-generic/unistd.h | awk '{print $3}')
-          gh release create "kdbg-${{ github.run_number }}" $FILES \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "kdbg kernel build ${{ github.run_number }}" \
-            --notes "TOWA_NR=$((NR-1))  cookie=0x9E3779B97F4A7C15  branch=${{ inputs.branch }}  builtin=${{ inputs.builtin }}
-          $(cat "$E")
-          sha256=$(sha256sum "$Z" | cut -d' ' -f1)" \
-          || gh release upload "kdbg-${{ github.run_number }}" $FILES \
-            --repo "$GITHUB_REPOSITORY" --clobber
+            artifact/kdbg.ko
+            tools/towacli
+          if-no-files-found: warn
