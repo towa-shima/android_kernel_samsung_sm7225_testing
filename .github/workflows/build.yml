@@ -592,6 +592,8 @@ jobs:
           #include <linux/workqueue.h>
           #include <linux/delay.h>
           #include <linux/jiffies.h>
+          #include <linux/init.h>
+          #include <asm/barrier.h>
           #include <linux/export.h>
           #include <linux/uio.h>
           
@@ -3305,6 +3307,30 @@ jobs:
           
           #endif /* _LINUX_KDBG_WATCH_H */
           TW_I
+          #
+          # Wire the directory into the tree.  Without these two lines the
+          # patched files - fault.c, sys.c, process_vm_access.c - call our
+          # functions and nothing ever compiles them, and the link ends with
+          # exactly three undefined symbols: kdbg_watch_fault, and then
+          # kdbg_prctl_entry and kdbg_pvm_try.  That is how this was found.
+          #
+          # These objects have to be in vmlinux whatever CONFIG_KDBG_CORE is:
+          # the page-fault path reaches kdbg_watch.o with no module loaded, and
+          # the other two call sites reach kdbg_syscall.o the same way.  kdbg.ko
+          # itself is built by the "make M=drivers/kdbg modules" step, so this
+          # entry does not have to be the thing that produces it.
+          #
+          if ! grep -q "drivers/kdbg/Kconfig" drivers/Kconfig; then
+              echo 'source "drivers/kdbg/Kconfig"' >> drivers/Kconfig
+              echo "drivers/Kconfig: added"
+          fi
+          if ! grep -q "kdbg/" drivers/Makefile; then
+              echo "obj-y += kdbg/" >> drivers/Makefile
+              echo "drivers/Makefile: added"
+          fi
+          echo "--- wired in ---"
+          grep -n "kdbg" drivers/Kconfig drivers/Makefile
+          
           echo "--- written ---"
           ls -l drivers/kdbg/ include/linux/kdbg.h
           wc -l drivers/kdbg/*.c drivers/kdbg/*.h
@@ -3819,6 +3845,12 @@ jobs:
           // device has nothing on it that a scan can find.
           #define KDBG_DOOR_ADDR   0x6B6462670000ULL   /* "kdbg", page aligned */
           #define KDBG_DOOR_MAGIC  0x3142444BUL        /* "KDB1" */
+          
+          // Older bionic headers do not carry this; the kernel has had it since
+          // 4.17, which is what matters here.
+          #ifndef MAP_FIXED_NOREPLACE
+          #define MAP_FIXED_NOREPLACE 0x100000
+          #endif
           
           struct kdbg_door {
               unsigned long long magic;
