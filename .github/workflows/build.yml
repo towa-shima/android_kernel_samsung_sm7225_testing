@@ -609,6 +609,7 @@ jobs:
           #include <linux/delay.h>
           #include <linux/jiffies.h>
           #include <linux/init.h>
+          #include <linux/kthread.h>	/* use_mm / unuse_mm */
           #include <asm/barrier.h>
           #include <linux/export.h>
           #include <linux/uio.h>
@@ -831,7 +832,27 @@ jobs:
           
           		mutex_lock(&kdbg_mutex);
           		fn = kdbg_handler;
-          		ret = fn ? fn(op, a1, a2, a3, a4) : -ENOSYS;
+          
+          		/*
+          		 * The handler was written for a syscall, where it ran in the
+          		 * caller's context and copy_to_user()/copy_from_user() worked on
+          		 * the caller's buffers.  A work item runs with current->mm ==
+          		 * NULL, so every op that passes a pointer would fail with
+          		 * -EFAULT - which is exactly what `who` did the first time it
+          		 * was run.  Installing the client's address space for the call
+          		 * puts those pointers back in reach.
+          		 *
+          		 * Only around the call, and only when there is something to
+          		 * serve: switching address spaces flushes, and this loop runs at
+          		 * a kilohertz when a client is connected.
+          		 */
+          		if (fn) {
+          			use_mm(mm);
+          			ret = fn(op, a1, a2, a3, a4);
+          			unuse_mm(mm);
+          		} else {
+          			ret = -ENOSYS;
+          		}
           		mutex_unlock(&kdbg_mutex);
           
           		/*
