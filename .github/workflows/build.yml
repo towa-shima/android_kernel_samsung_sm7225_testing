@@ -609,16 +609,16 @@ jobs:
           #include <linux/jiffies.h>
           #include <linux/init.h>
           
-          /*
-           * Some trees declare these in <linux/mmu_context.h>, some in <linux/kthread.h>,
-           * and this one in neither place the include set above reaches - the build says
-           * "implicit declaration of function 'use_mm'", which is the compiler being
-           * precise about it.  The symbols themselves are in kernel/kthread.c on every
-           * kernel that has them, and this file is built in, so a prototype is all that
-           * is missing.
-           */
-          void use_mm(struct mm_struct *mm);
-          void unuse_mm(struct mm_struct *mm);
+          /* The client being served right now, so the module can copy to and from it
+           * without the door having to lend a kernel thread someone else's address
+           * space.  See kdbg_door_client()'s declaration for why that matters. */
+          static struct task_struct *kdbg_door_client_task __read_mostly;
+          
+          struct task_struct *kdbg_door_client(void)
+          {
+          	return READ_ONCE(kdbg_door_client_task);
+          }
+          EXPORT_SYMBOL_GPL(kdbg_door_client);
           #include <asm/barrier.h>
           #include <linux/export.h>
           #include <linux/uio.h>
@@ -844,21 +844,18 @@ jobs:
           
           		/*
           		 * The handler was written for a syscall, where it ran in the
-          		 * caller's context and copy_to_user()/copy_from_user() worked on
-          		 * the caller's buffers.  A work item runs with current->mm ==
-          		 * NULL, so every op that passes a pointer would fail with
-          		 * -EFAULT - which is exactly what `who` did the first time it
-          		 * was run.  Installing the client's address space for the call
-          		 * puts those pointers back in reach.
-          		 *
-          		 * Only around the call, and only when there is something to
-          		 * serve: switching address spaces flushes, and this loop runs at
-          		 * a kilohertz when a client is connected.
+          		 * caller's context and its copies reached the caller's buffers
+          		 * for free.  A work item has no address space at all, so the
+          		 * module is told who the client is and copies through
+          		 * access_process_vm() instead - which is what a kernel thread is
+          		 * supposed to do.  An earlier version borrowed the client's
+          		 * address space with use_mm() here, and the first op that
+          		 * carried a pointer took the phone down.
           		 */
           		if (fn) {
-          			use_mm(mm);
+          			WRITE_ONCE(kdbg_door_client_task, t);
           			ret = fn(op, a1, a2, a3, a4);
-          			unuse_mm(mm);
+          			WRITE_ONCE(kdbg_door_client_task, NULL);
           		} else {
           			ret = -ENOSYS;
           		}
@@ -1381,6 +1378,64 @@ jobs:
           #include <linux/kdbg.h>	/* KDBG_PRCTL_MAGIC, and the fault-path hook */
           
           #include "kdbg.h"
+          
+          /* ------------------------------------------------------------------ copies */
+          /*
+           * The driver is reached two ways, and they need different copies.
+           *
+           *   - Through the door, the handler runs in a kernel thread: current->mm is
+           *     NULL, so copy_to_user()/copy_from_user() have no address space to work
+           *     against.  Those copies go through access_process_vm() against the client
+           *     instead, which is exactly the primitive for a kernel thread reaching into
+           *     someone else's memory.
+           *   - Through the prctl and process_vm forwards, the handler runs in the
+           *     caller's own context, where the normal primitives are right and cheap.
+           *
+           * So everything below keeps saying copy_to_user()/copy_from_user()/put_user()
+           * and gets the correct one for where it is running.  Nothing else in this file
+           * has to know which door a request came through.
+           *
+           * access_process_vm()'s last argument is FOLL_WRITE on this tree and was a
+           * plain 0/1 write flag on older ones, which is the same value - so one call is
+           * right for either.
+           */
+          static inline int kdbg_u2k(void *to, const void __user *from, unsigned long n)
+          {
+          	struct task_struct *t;
+          
+          	if (current->mm != NULL)
+          		return copy_from_user(to, from, n);
+          
+          	t = kdbg_door_client();
+          	if (!t)
+          		return -EFAULT;
+          
+          	return access_process_vm(t, (unsigned long)from, to, (int)n, 0) == (int)n
+          	       ? 0 : -EFAULT;
+          }
+          
+          static inline int kdbg_k2u(void __user *to, const void *from, unsigned long n)
+          {
+          	struct task_struct *t;
+          
+          	if (current->mm != NULL)
+          		return copy_to_user(to, from, n);
+          
+          	t = kdbg_door_client();
+          	if (!t)
+          		return -EFAULT;
+          
+          	return access_process_vm(t, (unsigned long)to, (void *)from, (int)n,
+          				 FOLL_WRITE) == (int)n ? 0 : -EFAULT;
+          }
+          
+          #define copy_from_user(to, from, n)	kdbg_u2k((to), (from), (n))
+          #define copy_to_user(to, from, n)	kdbg_k2u((to), (from), (n))
+          #define put_user(x, p)							\
+          	({								\
+          		__typeof__(*(p)) __v = (x);				\
+          		kdbg_k2u((void __user *)(p), &__v, sizeof(__v));	\
+          	})
           
           /*
            * 1 = also answer as a device node the wanbai.h family of clients can find
@@ -3299,6 +3354,16 @@ jobs:
            * Costs one compare per fault for every fault that is not ours.
            */
           void kdbg_door_hint(pid_t pid, unsigned long addr);
+          
+          /*
+           * While a door request is being served, this is the client task - NULL the rest
+           * of the time.  The handler runs in a kernel thread, which has no address space
+           * of its own, so the module asks this before it decides how to copy: a kernel
+           * thread copies through access_process_vm() against the client, a caller in its
+           * own context (the prctl and process_vm forwards) uses the normal primitives.
+           */
+          struct task_struct;
+          struct task_struct *kdbg_door_client(void);
           
           /*
            * A second family of clients talks through prctl() instead of a device node:
