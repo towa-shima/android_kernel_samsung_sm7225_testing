@@ -220,11 +220,36 @@ jobs:
           /*
            * Shared between the kernel side and the userspace client.
            *
-           * KDBG_COOKIE is the first argument of every call. Without it the syscall
-           * answers -ENOSYS, so a blind probe of the number sees the same thing it would
-           * see from an unused table slot.
+           * There is no syscall.  The door is one page at a fixed address: the client
+           * maps it with MAP_FIXED_NOREPLACE, writes KDBG_DOOR_MAGIC into it, and posts
+           * requests in it.  The page-fault path notices the first touch of that address,
+           * remembers the process, and a work item serves every request after that.
+           *
+           * Nothing is created anywhere for this: no device node, no procfs file, no
+           * sysfs attribute, no syscall table entry.  A scan of /dev, /sys or /proc finds
+           * nothing, because there is nothing to find.  A process that never maps this
+           * page cannot reach the driver at all, and one that maps it by accident is
+           * recognised by the magic and ignored.
+           *
+           * The request struct is the whole protocol.  `state` is the handshake: the
+           * client sets it to 1 after filling the request in, the kernel sets it to 2
+           * after writing `ret`.  All five numbers of the old syscall are there, so every
+           * operation below is unchanged.
            */
-          #define KDBG_COOKIE	0x9E3779B97F4A7C15ULL
+          #define KDBG_DOOR_ADDR	0x6B6462670000ULL	/* "kdbg", page aligned */
+          #define KDBG_DOOR_MAGIC	0x3142444BUL		/* "KDB1" */
+          
+          struct kdbg_door {
+          	unsigned long long	magic;	/* KDBG_DOOR_MAGIC once the page is ours */
+          	unsigned int		state;	/* 0 idle, 1 posted, 2 answered         */
+          	unsigned int		seq;	/* the client's counter, copied back    */
+          	unsigned long long	op;
+          	unsigned long long	a1;
+          	unsigned long long	a2;
+          	unsigned long long	a3;
+          	unsigned long long	a4;
+          	long long		ret;
+          };
           
           /* KDBG_OP_PING returns this. */
           #define KDBG_MAGIC	0x5032300AUL
@@ -529,19 +554,44 @@ jobs:
           cat > drivers/kdbg/kdbg_syscall.c <<'TW_S'
           // SPDX-License-Identifier: GPL-2.0
           /*
-           * The syscall front end.
+           * The door.
            *
-           * Its entire body is "call the registered handler". The table entry is emitted
-           * by the compiler at build time, so nothing here ever writes to sys_call_table
-           * - no set_memory_rw, no text poking, no rwxp page, and nothing for another
-           * hook to collide with.
+           * There is no syscall any more.  A client maps one page at KDBG_DOOR_ADDR,
+           * writes KDBG_DOOR_MAGIC into it, and posts requests in it:
            *
-           * If no handler is installed (kdbg_core.ko not loaded) this returns -ENOSYS,
-           * which is what an unimplemented table slot returns anyway.
+           *     magic, state, seq, op, a1..a4, ret
+           *
+           * The kernel learns about the client from the page-fault path.  The first touch
+           * of that address calls kdbg_door_hint() (see kdbg_watch.c), which remembers
+           * the process; the work item below then reads the request out of the page,
+           * calls the registered handler, and writes the answer back.  While a client is
+           * connected the work item re-arms itself every millisecond, which is the door's
+           * latency; with no client it is not scheduled at all and costs nothing.
+           *
+           * A work item and not a kthread, on purpose: a kthread has a name and /proc
+           * lists it.  This runs on the system's own kworkers, so there is one less thing
+           * on the device that looks like itself.
+           *
+           * Nothing is created for any of this - no node, no file, no table entry - and
+           * the module it forwards to (kdbg_core.ko) can be absent: with no handler
+           * registered every request is answered -ENOSYS, exactly as an unimplemented
+           * syscall would be.
+           *
+           * This file is built into the kernel rather than into the module because the
+           * page-fault path calls into it whether or not the module is loaded.
            */
           #include <linux/kernel.h>
-          #include <linux/syscalls.h>
+          #include <linux/sched.h>
+          #include <linux/sched/mm.h>
+          #include <linux/sched/task.h>
+          #include <linux/mm.h>
+          #include <linux/highmem.h>
           #include <linux/mutex.h>
+          #include <linux/pid.h>
+          #include <linux/spinlock.h>
+          #include <linux/workqueue.h>
+          #include <linux/delay.h>
+          #include <linux/jiffies.h>
           #include <linux/export.h>
           #include <linux/uio.h>
           
@@ -560,30 +610,6 @@ jobs:
           }
           EXPORT_SYMBOL_GPL(kdbg_set_handler);
           
-          SYSCALL_DEFINE6(kdbg, unsigned long, cookie, unsigned long, op,
-          		unsigned long, a1, unsigned long, a2,
-          		unsigned long, a3, unsigned long, a4)
-          {
-          	kdbg_handler_t fn;
-          	long ret;
-          
-          	if (cookie != KDBG_COOKIE)
-          		return -ENOSYS;
-          
-          	/*
-          	 * The mutex is held across the call on purpose: it serialises two
-          	 * concurrent callers, and it also means rmmod cannot free the module
-          	 * while a call is still inside it (module_exit takes the same lock to
-          	 * clear the handler).
-          	 */
-          	mutex_lock(&kdbg_mutex);
-          	fn = kdbg_handler;
-          	ret = fn ? fn(op, a1, a2, a3, a4) : -ENOSYS;
-          	mutex_unlock(&kdbg_mutex);
-          
-          	return ret;
-          }
-          
           /* ---------------------------------------------------------------- prctl ---- */
           
           static kdbg_prctl_t kdbg_prctl_fn __read_mostly;
@@ -598,9 +624,9 @@ jobs:
           EXPORT_SYMBOL_GPL(kdbg_set_prctl);
           
           /*
-           * Called from SYSCALL_DEFINE5(prctl, ...) for the one magic option.  Same shape
-           * as the syscall front end: nothing but "call the registered handler", so the
-           * prctl path costs a single predictable branch for every other caller.
+           * Called from SYSCALL_DEFINE5(prctl, ...) for every option.  Same shape as the
+           * rest of this file: nothing but "call the registered handler", so the prctl
+           * path costs a single predictable branch for every other caller.
            */
           void kdbg_set_prctl_note(void (*fn)(int option))
           {
@@ -609,6 +635,26 @@ jobs:
           	mutex_unlock(&kdbg_mutex);
           }
           EXPORT_SYMBOL_GPL(kdbg_set_prctl_note);
+          
+          long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3)
+          {
+          	kdbg_prctl_t fn;
+          	long ret;
+          
+          	/* watched first: a magic we do not own is still worth knowing about */
+          	if (kdbg_prctl_note_fn)
+          		kdbg_prctl_note_fn(option);
+          
+          	if (option != KDBG_PRCTL_MAGIC)
+          		return -EINVAL;
+          
+          	mutex_lock(&kdbg_mutex);
+          	fn = kdbg_prctl_fn;
+          	ret = fn ? fn(a2, (void __user *)a3) : -EINVAL;
+          	mutex_unlock(&kdbg_mutex);
+          
+          	return ret;
+          }
           
           /* ------------------------------------------------------- memory syscalls ---- */
           
@@ -645,25 +691,175 @@ jobs:
           }
           EXPORT_SYMBOL_GPL(kdbg_pvm_try);
           
-          long kdbg_prctl_entry(int option, unsigned long a2, unsigned long a3)
+          /* ------------------------------------------------------------- the door --- */
+          
+          /* The client, and nothing else: one at a time is all this needs to be. */
+          static int kdbg_client_pid __read_mostly;
+          static int kdbg_door_tries __read_mostly;
+          static DEFINE_SPINLOCK(kdbg_door_lock);
+          static struct delayed_work kdbg_door_work;
+          
+          /* What one pass found. */
+          #define KDBG_DOOR_SERVED	1	/* the page is ours, we did our job */
+          #define KDBG_DOOR_WAIT		0	/* not mapped yet - try again shortly */
+          #define KDBG_DOOR_GONE		(-1)	/* the process is not there any more */
+          
+          /*
+           * From the page-fault path, for a fault on our page.  Nothing can be verified
+           * here - the page does not exist yet, that is why we are being called - so this
+           * only records who to look at.  The work item checks the magic before it does
+           * anything at all.
+           */
+          void kdbg_door_hint(pid_t pid)
           {
-          	kdbg_prctl_t fn;
-          	long ret;
+          	unsigned long flags;
           
-          	/* watched first: a magic we do not own is still worth knowing about */
-          	if (kdbg_prctl_note_fn)
-          		kdbg_prctl_note_fn(option);
+          	if (pid <= 0)
+          		return;
           
-          	if (option != KDBG_PRCTL_MAGIC)
-          		return -EINVAL;
+          	spin_lock_irqsave(&kdbg_door_lock, flags);
+          	WRITE_ONCE(kdbg_client_pid, pid);
+          	WRITE_ONCE(kdbg_door_tries, 0);
+          	spin_unlock_irqrestore(&kdbg_door_lock, flags);
           
-          	mutex_lock(&kdbg_mutex);
-          	fn = kdbg_prctl_fn;
-          	ret = fn ? fn(a2, (void __user *)a3) : -EINVAL;
-          	mutex_unlock(&kdbg_mutex);
-          
-          	return ret;
+          	schedule_delayed_work(&kdbg_door_work, 0);
           }
+          
+          static void kdbg_door_forget(pid_t pid)
+          {
+          	unsigned long flags;
+          
+          	spin_lock_irqsave(&kdbg_door_lock, flags);
+          	if (READ_ONCE(kdbg_client_pid) == pid)
+          		WRITE_ONCE(kdbg_client_pid, 0);
+          	spin_unlock_irqrestore(&kdbg_door_lock, flags);
+          }
+          
+          /*
+           * One pass: find the process, pin its door page, and answer the request if one
+           * is posted.  The handler is called with the page mapped and the module mutex
+           * held - the same arrangement the syscall had, so a module unload still cannot
+           * race a call.  Nothing here runs in atomic context: a work item may sleep, and
+           * the handler does (it pins pages of its own).
+           */
+          static int kdbg_door_pass(pid_t pid)
+          {
+          	struct task_struct *t;
+          	struct mm_struct *mm;
+          	struct page *pg = NULL;
+          	struct kdbg_door *d;
+          	struct pid *p;
+          	long n;
+          
+          	p = find_vpid(pid);
+          	if (!p)
+          		return KDBG_DOOR_GONE;
+          
+          	rcu_read_lock();
+          	t = pid_task(p, PIDTYPE_PID);
+          	if (!t) {
+          		rcu_read_unlock();
+          		return KDBG_DOOR_GONE;
+          	}
+          	get_task_struct(t);
+          	rcu_read_unlock();
+          
+          	mm = get_task_mm(t);
+          	if (!mm) {
+          		put_task_struct(t);
+          		return KDBG_DOOR_GONE;
+          	}
+          
+          	/*
+          	 * Pin the page.  It may not be there yet on the very first pass: the
+          	 * fault that told us about this process is still being handled, and the
+          	 * anonymous page is installed on the way out of it.  That is what
+          	 * KDBG_DOOR_WAIT is for - the work item comes back in a millisecond.
+          	 */
+          	n = get_user_pages_remote(t, mm, (unsigned long)KDBG_DOOR_ADDR, 1,
+          				  FOLL_WRITE, &pg, NULL, NULL);
+          	if (n != 1) {
+          		mmput(mm);
+          		put_task_struct(t);
+          		return KDBG_DOOR_WAIT;
+          	}
+          
+          	d = kmap(pg);
+          
+          	if (READ_ONCE(d->magic) != KDBG_DOOR_MAGIC) {
+          		/* not our page, whoever this is */
+          		kunmap(pg);
+          		put_page(pg);
+          		mmput(mm);
+          		put_task_struct(t);
+          		return KDBG_DOOR_GONE;
+          	}
+          
+          	if (READ_ONCE(d->state) == 1) {
+          		unsigned long long op = d->op;
+          		unsigned long long a1 = d->a1, a2 = d->a2;
+          		unsigned long long a3 = d->a3, a4 = d->a4;
+          		kdbg_handler_t fn;
+          		long ret;
+          
+          		mutex_lock(&kdbg_mutex);
+          		fn = kdbg_handler;
+          		ret = fn ? fn(op, a1, a2, a3, a4) : -ENOSYS;
+          		mutex_unlock(&kdbg_mutex);
+          
+          		/*
+          		 * The answer must be visible before the state that announces
+          		 * it: the client spins on `state` and reads `ret` the moment it
+          		 * turns 2.
+          		 */
+          		d->ret = ret;
+          		smp_wmb();
+          		WRITE_ONCE(d->state, 2);
+          	}
+          
+          	kunmap(pg);
+          	put_page(pg);
+          	mmput(mm);
+          	put_task_struct(t);
+          
+          	return KDBG_DOOR_SERVED;
+          }
+          
+          static void kdbg_door_work_fn(struct work_struct *work)
+          {
+          	pid_t pid = READ_ONCE(kdbg_client_pid);
+          	int r;
+          
+          	if (pid <= 0)
+          		return;			/* nothing to serve: stay parked */
+          
+          	r = kdbg_door_pass(pid);
+          
+          	if (r == KDBG_DOOR_GONE) {
+          		kdbg_door_forget(pid);
+          		return;
+          	}
+          
+          	/*
+          	 * A connected client is polled, and one that is not mapped yet is
+          	 * retried.  The retry cannot go on for ever: a process that faults on
+          	 * this address once and never maps anything must not keep a kworker
+          	 * waking up for the rest of the uptime.
+          	 */
+          	if (r == KDBG_DOOR_WAIT && ++kdbg_door_tries > 2000) {
+          		kdbg_door_forget(pid);
+          		return;
+          	}
+          
+          	schedule_delayed_work(&kdbg_door_work, msecs_to_jiffies(1));
+          }
+          
+          static int __init kdbg_door_init(void)
+          {
+          	INIT_DELAYED_WORK(&kdbg_door_work, kdbg_door_work_fn);
+          	return 0;
+          }
+          late_initcall(kdbg_door_init);
           TW_S
           cat > drivers/kdbg/kdbg_watch.c <<'TW_W'
           // SPDX-License-Identifier: GPL-2.0
@@ -944,6 +1140,15 @@ jobs:
           	struct kdbg_watch_slot *w;
           	unsigned long flags;
           	int i;
+          
+          	/*
+          	 * The door first, and outside the jump label: a fault on the client's
+          	 * page is how the kernel finds the client, and that has to happen
+          	 * whether or not any page watch is armed.  One compare for every fault
+          	 * in the system that is not ours.
+          	 */
+          	if ((addr & PAGE_MASK) == (unsigned long)(KDBG_DOOR_ADDR & PAGE_MASK))
+          		kdbg_door_hint(task_tgid_vnr(current));
           
           	if (!static_branch_unlikely(&kdbg_watch_key))
           		return 0;
@@ -2983,9 +3188,10 @@ jobs:
           #endif
           TW_C
           cat > drivers/kdbg/Makefile <<'TW_M'
-          # The syscall stub and the page-watch code are built into the kernel: the first
-          # because a syscall table entry can only be emitted at build time, the second
-          # because it needs a call site inside do_page_fault() and the core mm helpers.
+          # The door and the page-watch code are built into the kernel: the first because
+          # the page-fault path has to reach it to find the client at all, the second
+          # because it needs a call site inside do_page_fault().  Neither adds a syscall,
+          # a device node or a file of any kind.
           obj-y				+= kdbg_syscall.o
           obj-y				+= kdbg_watch.o
           
@@ -3024,6 +3230,17 @@ jobs:
            * Costs one perfectly-predicted branch while no watch is armed.
            */
           int kdbg_watch_fault(struct pt_regs *regs, unsigned long addr, unsigned int esr);
+          
+          /*
+           * The door.
+           *
+           * Called from the same fault path, for a fault on the one page the client
+           * shares with the kernel (KDBG_DOOR_ADDR, see drivers/kdbg/kdbg.h).  It cannot
+           * verify anything - the page does not exist at that moment - so it only records
+           * which process touched it and schedules the work that serves it.  Costs one
+           * compare per fault for every fault that is not ours.
+           */
+          void kdbg_door_hint(pid_t pid);
           
           /*
            * A second family of clients talks through prctl() instead of a device node:
@@ -3308,46 +3525,6 @@ jobs:
           
           echo "--- what process_vm_rw now does first ---"
           grep -n -A9 'kdbg: offered to the driver first' "$F" || echo "(the call is not there - check the patch above)"
-      - name: Add the kdbg syscall number
-        working-directory: ${{ github.workspace }}/kernel
-        run: |
-          set -e
-          U=include/uapi/asm-generic/unistd.h
-          NR=$(grep -m1 '^#define __NR_syscalls' "$U" | awk '{print $3}')
-          echo "highest existing syscall number = $NR  -> kdbg will be $NR"
-
-          python3 - "$U" "$NR" <<'PYEOF'
-          import sys
-          path, nr = sys.argv[1], int(sys.argv[2])
-          lines = open(path).read().split('\n')
-
-          # Insert immediately before the LAST "#undef __NR_syscalls", i.e. at the
-          # end of the syscall list, and bump the table size to match.
-          last = max(i for i, l in enumerate(lines) if l.startswith('#undef __NR_syscalls'))
-          lines[last:last] = [
-              '#define __NR_kdbg %d' % nr,
-              '#ifndef __SYSCALL_COMPAT',
-              '__SYSCALL(__NR_kdbg, sys_kdbg)',
-              '#endif',
-          ]
-          for i in range(len(lines) - 1, -1, -1):
-              if lines[i].startswith('#define __NR_syscalls'):
-                  lines[i] = '#define __NR_syscalls %d' % (nr + 1)
-                  break
-          open(path, 'w').write('\n'.join(lines))
-          PYEOF
-
-          echo "--- tail of $U ---"
-          tail -14 "$U"
-          echo "--- who else builds a table from this header ---"
-          grep -rn '__SYSCALL_COMPAT' arch/arm64/kernel/ arch/arm64/include/asm/unistd.h 2>/dev/null || echo "  none in arch/arm64"
-
-          # drivers/Makefile + drivers/Kconfig
-          grep -q 'kdbg/' drivers/Makefile || printf 'obj-y\t\t\t\t+= kdbg/\n' >> drivers/Makefile
-          grep -q 'drivers/kdbg/Kconfig' drivers/Kconfig || printf 'source "drivers/kdbg/Kconfig"\n' >> drivers/Kconfig
-          grep -n 'kdbg' drivers/Makefile drivers/Kconfig
-
-      # ------------------------------------------------------------ config tweaks
       - name: Kernel config
         working-directory: ${{ github.workspace }}/kernel
         run: |
@@ -3592,7 +3769,7 @@ jobs:
           fi
           ls -l "$GITHUB_WORKSPACE/out/"
 
-      - name: Build the clients (towacli + towamod)
+      - name: Build the client (towacli)
         run: |
           set -e
           # The kernel build is finished and its outputs are in $GITHUB_WORKSPACE/out, so
@@ -3602,16 +3779,16 @@ jobs:
           
           mkdir -p "$GITHUB_WORKSPACE/tools"
           cat > "$GITHUB_WORKSPACE/tools/towacli.cpp" <<'TW_CLI'
-          // towacli.cpp - talk to the towa kernel syscall.
+          // towacli.cpp - talk to the towa kernel driver.
           //
           // Build this in AIDE Pro as a plain C++ native executable. It needs no root,
           // no su, no zygisk and no injection: the kernel does the cross-process memory
-          // access, and the syscall itself has no permission check, so SELinux, ptrace
+          // access, and the driver has no permission check on its door, so SELinux, ptrace
           // scope, /proc/<pid>/mem's EACCES and the target's own VMA permissions are all
           // irrelevant.
           //
-          // If the build log printed a syscall number other than 294, either change
-          // NR_TOWA below or pass -n <number> as the first argument.
+          // There is no syscall.  The door is one page at a fixed address - see the
+          // "the door" block below for what that means and where it came from.
           
           #include <cstdio>
           #include <cstdlib>
@@ -3630,7 +3807,30 @@ jobs:
           #include <sys/stat.h>
           #include <sys/sysmacros.h>
           
-          #define TOWA_COOKIE 0x9E3779B97F4A7C15ULL
+          // ------------------------------------------------------------------ the door
+          //
+          // There is no syscall.  The client maps one page at KDBG_DOOR_ADDR with
+          // MAP_FIXED_NOREPLACE, writes the magic into it, and posts requests there.  The
+          // kernel notices the first touch from its page-fault path, remembers this
+          // process, and a work item answers within a millisecond or two.
+          //
+          // The page IS the protocol: the same five numbers the syscall used to take, and
+          // one answer.  It creates nothing - no device node, no /proc entry - so the
+          // device has nothing on it that a scan can find.
+          #define KDBG_DOOR_ADDR   0x6B6462670000ULL   /* "kdbg", page aligned */
+          #define KDBG_DOOR_MAGIC  0x3142444BUL        /* "KDB1" */
+          
+          struct kdbg_door {
+              unsigned long long magic;
+              unsigned int       state;   /* 0 idle, 1 posted, 2 answered */
+              unsigned int       seq;
+              unsigned long long op;
+              unsigned long long a1;
+              unsigned long long a2;
+              unsigned long long a3;
+              unsigned long long a4;
+              long long          ret;
+          };
           #define TOWA_MAGIC  0x5032300AUL
           
           static const unsigned long kElfMagic = 0x464C457FUL;   // "\x7fELF" little-endian
@@ -3740,37 +3940,85 @@ jobs:
               unsigned long long sp;
           };
           
-          // The syscall number is NOT fixed: it is whatever was free in the tree the
-          // kernel was built from (this one's table already runs to 442).  The CI compiles
-          // this file with -DNR_TOWA=<the number it just installed>.  Built without it,
-          // there is no safe guess - calling a random number with six arguments would hit
-          // somebody else's syscall - so the default is 0 and main() refuses to run.
-          #ifndef NR_TOWA
-          #define NR_TOWA 0
-          #endif
-          
           // Filled in by the build with the date and time, so there is never any doubt
           // about which binary is being run.
           #ifndef TOWACLI_BUILD
           #define TOWACLI_BUILD "unstamped"
           #endif
           
-          static unsigned long g_nr = NR_TOWA;
+          static volatile struct kdbg_door *g_door;
+          static unsigned g_seq;
+          
+          static bool door_open()
+          {
+              if (g_door)
+                  return true;
+          
+              void *p = mmap((void *)(uintptr_t)KDBG_DOOR_ADDR, 4096,
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+              if (p == MAP_FAILED) {
+                  fprintf(stderr,
+                          "cannot map the door at 0x%llx: %s\n"
+                          "something is already mapped there - close it and try again\n",
+                          (unsigned long long)KDBG_DOOR_ADDR, strerror(errno));
+                  return false;
+              }
+          
+              memset(p, 0, sizeof(struct kdbg_door));
+              g_door = (struct kdbg_door *)p;
+          
+              // The first touch of this page is how the kernel learns that a client
+              // exists, and the magic is what it checks before answering anything.
+              g_door->magic = KDBG_DOOR_MAGIC;
+              __sync_synchronize();
+              return true;
+          }
           
           static long towa(unsigned long op, unsigned long a1 = 0, unsigned long a2 = 0,
                            unsigned long a3 = 0, unsigned long a4 = 0)
           {
-              return syscall((long)g_nr, (unsigned long)TOWA_COOKIE, op, a1, a2, a3, a4);
+              if (!door_open())
+                  return -ENODEV;
+          
+              g_door->seq = ++g_seq;
+              g_door->op  = op;
+              g_door->a1  = a1;
+              g_door->a2  = a2;
+              g_door->a3  = a3;
+              g_door->a4  = a4;
+              g_door->ret = 0;
+              __sync_synchronize();
+          
+              g_door->state = 1;              // posted
+              __sync_synchronize();
+          
+              // Two seconds is enormously generous - a pass takes a millisecond - but a
+              // driver that is not loaded never answers, and this tool must not hang on
+              // that: it says so instead.
+              for (int i = 0; i < 20000; i++) {
+                  if (g_door->state == 2)
+                      break;
+                  usleep(100);
+              }
+          
+              if (g_door->state != 2) {
+                  g_door->state = 0;
+                  return -ETIMEDOUT;
+              }
+          
+              __sync_synchronize();
+              long r = (long)g_door->ret;
+              g_door->state = 0;
+              return r;
           }
           
           static void perr(const char *what, long r)
           {
               /*
-               * syscall() does NOT hand back the negated errno: it returns -1 and puts
-               * the real code in errno, exactly like every other libc call.  Reading -r
-               * here printed strerror(1) - "Operation not permitted" - for every possible
-               * failure, which is worse than printing nothing.  Read errno first, before
-               * strerror() or fprintf() get a chance to touch it.
+               * The door hands back the driver's return value, which is a negative errno
+               * on failure - not -1 plus errno, the way a libc call does it.  Both shapes
+               * are accepted here because a few of the helpers still come from libc.
                */
               int e = (r == -1) ? errno : (int)-r;
           
@@ -4516,7 +4764,20 @@ jobs:
                       return 2;
                   }
           
-                  int tpid = (m == 2 && pidarg) ? resolve_pid(pidarg) : 0;
+                  /*
+                   * A pid that resolves to nothing is refused here rather than passed
+                   * on.  Passing it on made "serve <a word that is not a process>" look
+                   * like it worked: the kernel stored the -1 as its filter, which
+                   * matches no caller at all, so everything was silently unserved.
+                   */
+                  int tpid = 0;
+                  if (m == 2 && pidarg) {
+                      tpid = resolve_pid(pidarg);
+                      if (tpid <= 0) {
+                          printf("no process matches '%s' - nothing served\n", pidarg);
+                          return 1;
+                      }
+                  }
           
                   long r = towa(TOWA_OP_HIJACK, (unsigned long)m, (unsigned long)tpid);
                   if (r < 0) { perr("hijack", r); return 1; }
@@ -4964,14 +5225,14 @@ jobs:
           
           static int cmd_test(int pid)
           {
-              printf("syscall    : %lu\n", g_nr);
+              printf("door       : 0x%llx (no syscall)\n",
+                     (unsigned long long)KDBG_DOOR_ADDR);
           
               long r = towa(TOWA_OP_PING);
               if (r < 0) {
                   perr("ping", r);
                   if (-r == ENOSYS)
-                      printf("           ENOSYS means either the number is wrong or "
-                             "towa_core.ko is not loaded\n");
+                      printf("           ENOSYS means kdbg_core.ko is not loaded\n");
                   return 1;
               }
               if ((unsigned long)r != TOWA_MAGIC) {
@@ -5080,7 +5341,7 @@ jobs:
               std::vector<std::string> a;
               for (int i = 1; i < argc; i++) {
                   if (!strcmp(argv[i], "-n") && i + 1 < argc) {
-                      g_nr = strtoul(argv[++i], NULL, 0);
+                      ++i;                    // accepted and ignored: there is no number
                       continue;
                   }
                   a.push_back(argv[i]);
@@ -5088,22 +5349,14 @@ jobs:
           
               if (a.empty()) { usage(argv[0]); return 2; }
           
-              if (!g_nr) {
-                  fprintf(stderr,
-                          "towacli was built without -DNR_TOWA=<number>, so it does not\n"
-                          "know the syscall.  Either use the binary the build produces, or\n"
-                          "pass -n <number>.  Do not guess: the wrong number is another\n"
-                          "syscall, with six arguments you did not mean.\n");
-                  return 2;
-              }
-          
               const std::string &cmd = a[0];
           
               if (cmd == "ping") {
                   long r = towa(TOWA_OP_PING);
                   if (r < 0) { perr("ping", r); return 1; }
-                  printf("towa alive, magic 0x%lx, syscall %lu, %s\n",
-                         (unsigned long)r, g_nr, TOWACLI_BUILD);
+                  printf("towa alive, magic 0x%lx, door 0x%llx, %s\n",
+                         (unsigned long)r, (unsigned long long)KDBG_DOOR_ADDR,
+                         TOWACLI_BUILD);
                   return 0;
               }
           
@@ -5502,295 +5755,15 @@ jobs:
           CXX="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++"
           test -x "$CXX" || { echo "no ndk clang++ at $CXX"; ls -d /opt/android-ndk-* 2>/dev/null; exit 1; }
           
-          # The syscall number comes from the tree we just built, because it is NOT 294:
-          # this kernel's table already runs to 442, so 294 is somebody else's syscall and
-          # calling it with six arguments would be worse than useless.
-          NR=$(grep -m1 '^#define __NR_syscalls' \
-                 "$GITHUB_WORKSPACE/kernel/include/uapi/asm-generic/unistd.h" | awk '{print $3}')
-          NR=$((NR-1))
-          echo "building against TOWA_NR=$NR"
-          test "$NR" -gt 0 || { echo "could not read the syscall number"; exit 1; }
-          
-          # -static-libstdc++ so the binary does not need libc++_shared.so pushed next to
-          # it; libc, libm and libdl are on the device already.
+          # The syscall number used to come from the tree we just built.  There is no
+          # syscall any more: the client's door is one page at a fixed address that the
+          # kernel finds in the page-fault path, so nothing here depends on the table.
           STAMP=$(date -u +%Y%m%d.%H%M)
           echo "towacli build stamp: $STAMP"
           
-          "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -DNR_TOWA=$NR \
+          "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall \
                  -DTOWACLI_BUILD="\"$STAMP\"" \
                  -o "$GITHUB_WORKSPACE/tools/towacli" "$GITHUB_WORKSPACE/tools/towacli.cpp"
-          
-          cat > "$GITHUB_WORKSPACE/tools/towamod.cpp" <<'TW_MOD'
-          // towamod.cpp - our own mod, on our own driver.
-          //
-          // Built in AIDE Pro as a plain C++ native executable, the same way towacli is.
-          // It talks to kdbg through its syscall, which means:
-          //
-          //   - no device node, so nothing appears in /dev while this runs
-          //   - `compat` never has to be switched on
-          //   - no root needed for reads and writes (only the ioctl path checks
-          //     CAP_SYS_PTRACE; the syscall path does not)
-          //   - nothing injected into the game, no zygisk, no library of anyone else's
-          //
-          // The shell wrapper (towamod.sh) does the root check, unpacking and menu; this
-          // binary is the thing that actually does the work.
-          //
-          // Layout of the work, so the file stays readable:
-          //     driver        the syscall, and the three operations that matter
-          //     target        finding the game, its module, its module base
-          //     games         per-game knowledge (Free Fire first)
-          //     menu          what to turn on
-          //     main          the loop
-          
-          #include <cstdio>
-          #include <cstdlib>
-          #include <cstring>
-          #include <cstdint>
-          #include <cerrno>
-          #include <string>
-          #include <vector>
-          #include <dirent.h>
-          #include <fcntl.h>
-          #include <unistd.h>
-          #include <sys/syscall.h>
-          
-          #ifndef NR_TOWA
-          #define NR_TOWA 0        /* the build passes -DNR_TOWA=<number from the log> */
-          #endif
-          
-          #define TOWA_COOKIE 0x9E3779B97F4A7C15ULL
-          #define TOWA_MAGIC  0x5032300AUL
-          
-          enum {
-              OP_PING       = 0,
-              OP_READ       = 1,
-              OP_WRITE      = 2,
-              OP_BASE       = 3,
-          };
-          
-          static unsigned long g_nr = NR_TOWA;
-          
-          static long drv(unsigned long op, unsigned long a1 = 0, unsigned long a2 = 0,
-                          unsigned long a3 = 0, unsigned long a4 = 0)
-          {
-              return syscall((long)g_nr, (unsigned long)TOWA_COOKIE, op, a1, a2, a3, a4);
-          }
-          
-          static bool drv_read(int pid, unsigned long addr, void *buf, unsigned long len)
-          {
-              return drv(OP_READ, (unsigned long)pid, addr, (unsigned long)buf, len) == (long)len;
-          }
-          
-          static bool drv_write(int pid, unsigned long addr, const void *buf, unsigned long len)
-          {
-              return drv(OP_WRITE, (unsigned long)pid, addr,
-                         (unsigned long)buf, len) == (long)len;
-          }
-          
-          static unsigned long drv_base(int pid, const char *module)
-          {
-              unsigned long base = 0;
-          
-              if (drv(OP_BASE, (unsigned long)pid, (unsigned long)module,
-                      (unsigned long)&base) < 0)
-                  return 0;
-          
-              return base;
-          }
-          
-          /* ------------------------------------------------------------------ target */
-          
-          // A pid or a process name - the same convenience towacli has, because the game
-          // is found by its command line, not by `pidof` (which matches the 15-character
-          // kernel name and therefore never matches a package name).
-          static int find_pid(const char *name)
-          {
-              DIR *d = opendir("/proc");
-              if (!d)
-                  return -1;
-          
-              int loose = -1;
-              size_t nlen = strlen(name);
-              struct dirent *e;
-          
-              while ((e = readdir(d)) != NULL) {
-                  if (e->d_name[0] < '0' || e->d_name[0] > '9')
-                      continue;
-          
-                  char path[64], cmd[256] = {0};
-                  snprintf(path, sizeof(path), "/proc/%s/cmdline", e->d_name);
-          
-                  int fd = open(path, O_RDONLY);
-                  if (fd < 0)
-                      continue;
-                  ssize_t n = read(fd, cmd, sizeof(cmd) - 1);
-                  close(fd);
-                  if (n <= 0)
-                      continue;
-          
-                  if (!strcmp(cmd, name)) {          /* exact */
-                      int pid = atoi(e->d_name);
-                      closedir(d);
-                      return pid;
-                  }
-                  if (loose < 0 && strlen(cmd) >= nlen && !strncmp(cmd, name, nlen))
-                      loose = atoi(e->d_name);       /* same prefix */
-              }
-          
-              closedir(d);
-              return loose;
-          }
-          
-          /* ------------------------------------------------------------------- games */
-          
-          struct game {
-              const char *label;
-              const char *package;
-              const char *module;        /* the module every offset is relative to */
-          };
-          
-          static const struct game g_games[] = {
-              { "Free Fire",       "com.dts.freefireth",  "libil2cpp.so" },
-              { "Free Fire MAX",   "com.dts.freefiremax", "libil2cpp.so" },
-              { "PUBG Mobile",     "com.tencent.ig",      "libUE4.so"    },
-          };
-          
-          #define GAME_COUNT (int)(sizeof(g_games) / sizeof(g_games[0]))
-          
-          struct target {
-              int pid = -1;
-              const struct game *g = nullptr;
-              unsigned long base = 0;
-          };
-          
-          // Probes one game into its own local target and commits nothing, so a later
-          // game that is not running cannot overwrite a target that was found.
-          static bool target_acquire(target &t, const struct game &g)
-          {
-              int pid = find_pid(g.package);
-              if (pid <= 0) {
-                  printf("  %-16s not running\n", g.label);
-                  return false;
-              }
-          
-              unsigned long base = drv_base(pid, g.module);
-              if (!base) {
-                  printf("  %-16s pid %d, but no %s - is it loaded yet?\n",
-                         g.label, pid, g.module);
-                  return false;
-              }
-          
-              t.pid  = pid;
-              t.base = base;
-              t.g    = &g;
-              printf("  %-16s pid %d, %s at 0x%lx\n", g.label, pid, g.module, base);
-              return true;
-          }
-          
-          /* -------------------------------------------------------------------- menu */
-          
-          struct opts {
-              bool esp   = false;
-              bool aim   = false;
-              int  aim_fov = 120;      /* degrees; 120 is generous on purpose */
-              int  aim_key = 0;        /* 0 = always, otherwise a volume step */
-          };
-          
-          static void menu(const target &t, opts &o)
-          {
-              printf("\n  target: %s   pid %d   base 0x%lx\n\n",
-                     t.g->label, t.pid, t.base);
-              printf("  [1] ESP            %s\n", o.esp ? "ON" : "off");
-              printf("  [2] Aim            %s\n", o.aim ? "ON" : "off");
-              printf("  [3] Aim FOV        %d\n", o.aim_fov);
-              printf("  [4] Toggle aim key %s\n", o.aim_key ? "volume step" : "always on");
-              printf("  [9] Start\n");
-              printf("  [0] Quit\n");
-              printf("\n  > ");
-              fflush(stdout);
-          }
-          
-          /* -------------------------------------------------------------------- main */
-          
-          static void banner(void)
-          {
-              printf("\n  towamod - our own, on our own driver\n");
-              printf("  driver: syscall %lu\n", g_nr);
-              printf("  nothing injected, no /dev entries, no root needed for reads\n\n");
-          }
-          
-          int main(int argc, char **argv)
-          {
-              /*
-               * The syscall number, in order of preference: -n on the command line, then
-               * TOWA_NR from the environment, then whatever the build passed in.  It is
-               * not guessed and never probed - calling an unknown syscall number with six
-               * arguments is somebody else's syscall, with consequences nobody asked for.
-               * The number is printed as TOWA_NR by the kernel build log.
-               */
-              if (argc > 1 && !strcmp(argv[1], "-n") && argc > 2)
-                  g_nr = strtoul(argv[2], nullptr, 0);
-              else if (getenv("TOWA_NR"))
-                  g_nr = strtoul(getenv("TOWA_NR"), nullptr, 0);
-          
-              banner();
-          
-              if (!g_nr) {
-                  fprintf(stderr, "built without -DNR_TOWA=<number>: pass -n <number>\n");
-                  return 2;
-              }
-          
-              long r = drv(OP_PING);
-              if (r < 0 || (unsigned long)r != TOWA_MAGIC) {
-                  fprintf(stderr, "driver did not answer (0x%lx) - is the kernel flashed?\n", r);
-                  return 1;
-              }
-              printf("  driver: alive (0x%lx)\n\n", r);
-          
-              printf("  looking for a game...\n");
-              target t;
-              bool found = false;
-              for (int i = 0; i < GAME_COUNT; i++) {
-                  target probe;
-                  if (target_acquire(probe, g_games[i]) && !found) {
-                      t = probe;          /* the first game found wins */
-                      found = true;
-                  }
-              }
-          
-              if (!found) {
-                  fprintf(stderr, "\n  none of the supported games is running (or no module yet)\n");
-                  return 1;
-              }
-          
-              opts o;
-          
-              for (;;) {
-                  menu(t, o);
-                  char line[32];
-                  if (!fgets(line, sizeof(line), stdin))
-                      break;
-          
-                  switch (atoi(line)) {
-                  case 1: o.esp = !o.esp; break;
-                  case 2: o.aim = !o.aim; break;
-                  case 3: o.aim_fov = o.aim_fov >= 180 ? 20 : o.aim_fov + 20; break;
-                  case 4: o.aim_key = !o.aim_key; break;
-                  case 9:
-                      printf("\n  the read/link stage is what this build proves.\n"
-                             "  ESP drawing and the aim come next, on top of it.\n");
-                      return 0;
-                  case 0:
-                  default:
-                      return 0;
-                  }
-              }
-          
-              return 0;
-          }
-          TW_MOD
-          
-          "$CXX" -O2 -fPIE -pie -static-libstdc++ -Wall -DNR_TOWA=$NR        -o "$GITHUB_WORKSPACE/tools/towamod" "$GITHUB_WORKSPACE/tools/towamod.cpp"
           
           echo "--- what we built ---"
           ls -l "$GITHUB_WORKSPACE/tools/towacli"
