@@ -915,27 +915,6 @@ jobs:
            * which is not an error here: what to do about it is the caller's decision,
            * and for a read it is "skip it and carry on".
            */
-          /*
-           * The page the last read came from, per CPU.
-           *
-           * A hack reads many fields out of one page - a player record, a weapon, the
-           * view matrix - and each read is its own ioctl.  Walking four levels of the
-           * game's page tables for every one of them is the single most expensive thing
-           * in this path: those tables are cold in our CPU's cache, so it is several
-           * misses per read.  One entry per CPU turns a repeat into one compare.
-           *
-           * A stale entry is safe by construction.  Only reads use it, and the only way
-           * it can be wrong is that the mapping changed after it was cached, which
-           * yields an old value rather than a fault - the same trade the lockless walk
-           * already makes.  Writes never come near it.
-           */
-          struct kdbg_pcache {
-          	struct mm_struct *mm;
-          	unsigned long	 va_page;
-          	unsigned long	 kpage;		/* the page's kernel address */
-          };
-          
-          static DEFINE_PER_CPU(struct kdbg_pcache, kdbg_pcache);
           
           static int kdbg_copy_page(struct task_struct *t, struct mm_struct *mm,
           			  unsigned long va, void __user *ubuf, size_t n,
@@ -966,38 +945,8 @@ jobs:
           	 * rare enough (38 thousand against 196 million reads) to pay for it.
           	 */
           	if (!write) {
-          		unsigned long va_page = va & PAGE_MASK;
-          		struct kdbg_pcache *c;
-          		int cpu;
-          
-          		cpu = get_cpu();
-          		c = &per_cpu(kdbg_pcache, cpu);
-          		if (c->mm == mm && c->va_page == va_page) {
-          			void *p = (void *)(c->kpage + (va & ~PAGE_MASK));
-          
-          			put_cpu();
-          			return copy_to_user(ubuf, p, n) ? -EFAULT : 0;
-          		}
-          		put_cpu();
-          
-          		if (!kdbg_va_to_kaddr(mm, va, &kva, &pfn)) {
-          			/* not present: drop the entry and let the pin try */
-          			cpu = get_cpu();
-          			c = &per_cpu(kdbg_pcache, cpu);
-          			if (c->mm == mm && c->va_page == va_page) {
-          				c->mm = NULL;
-          				c->va_page = 0;
-          			}
-          			put_cpu();
-          		} else {
-          			cpu = get_cpu();
-          			c = &per_cpu(kdbg_pcache, cpu);
-          			c->mm = mm;
-          			c->va_page = va_page;
-          			c->kpage = (unsigned long)kva & PAGE_MASK;
-          			put_cpu();
+          		if (!kdbg_va_to_kaddr(mm, va, &kva, &pfn))
           			return copy_to_user(ubuf, kva, n) ? -EFAULT : 0;
-          		}
           	}
           
           	/* Pin the page: correct copy-on-write for a write, and it faults a read in. */
