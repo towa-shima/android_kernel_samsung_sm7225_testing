@@ -806,12 +806,20 @@ jobs:
           	d = kmap(pg);
           
           	if (READ_ONCE(d->magic) != KDBG_DOOR_MAGIC) {
-          		/* not our page, whoever this is */
+          		/*
+          		 * Not ours - or not ours yet.  The second reading matters: the
+          		 * fault that told us about this process is the client's own
+          		 * first write to the page, so we can arrive while it is still
+          		 * zeroing it, before it has written the magic.  Treating that
+          		 * as "go away" loses the client for good, because once the page
+          		 * is mapped nothing faults again and there is no second knock.
+          		 * So: come back shortly, and let the retry limit decide.
+          		 */
           		kunmap(pg);
           		put_page(pg);
           		mmput(mm);
           		put_task_struct(t);
-          		return KDBG_DOOR_GONE;
+          		return KDBG_DOOR_WAIT;
           	}
           
           	if (READ_ONCE(d->state) == 1) {
@@ -4049,36 +4057,49 @@ jobs:
               if (!door_open())
                   return -ENODEV;
           
-              g_door->seq = ++g_seq;
-              g_door->op  = op;
-              g_door->a1  = a1;
-              g_door->a2  = a2;
-              g_door->a3  = a3;
-              g_door->a4  = a4;
-              g_door->ret = 0;
-              __sync_synchronize();
+              // Twice: the first pass can be lost if the kernel looked at the page while
+              // it was still being set up.  The second attempt drops the page and lets it
+              // fault again, which is the only way the kernel can be told about a client
+              // it has forgotten - a mapped page never faults a second time.
+              for (int attempt = 0; attempt < 2; attempt++) {
+                  if (attempt) {
+                      madvise((void *)g_door_addr, 4096, MADV_DONTNEED);
+                      memset((void *)g_door_addr, 0, sizeof(struct kdbg_door));
+                      g_door->magic = KDBG_DOOR_MAGIC;   // this write faults, and is seen
+                      __sync_synchronize();
+                  }
           
-              g_door->state = 1;              // posted
-              __sync_synchronize();
+                  g_door->seq = ++g_seq;
+                  g_door->op  = op;
+                  g_door->a1  = a1;
+                  g_door->a2  = a2;
+                  g_door->a3  = a3;
+                  g_door->a4  = a4;
+                  g_door->ret = 0;
+                  __sync_synchronize();
           
-              // Two seconds is enormously generous - a pass takes a millisecond - but a
-              // driver that is not loaded never answers, and this tool must not hang on
-              // that: it says so instead.
-              for (int i = 0; i < 20000; i++) {
-                  if (g_door->state == 2)
-                      break;
-                  usleep(100);
+                  g_door->state = 1;              // posted
+                  __sync_synchronize();
+          
+                  // Two seconds is enormously generous - a pass takes a millisecond - but
+                  // a driver that is not loaded never answers, and this tool must not hang
+                  // on that.
+                  for (int i = 0; i < 20000; i++) {
+                      if (g_door->state == 2)
+                          break;
+                      usleep(100);
+                  }
+          
+                  if (g_door->state == 2) {
+                      __sync_synchronize();
+                      long r = (long)g_door->ret;
+                      g_door->state = 0;
+                      return r;
+                  }
               }
           
-              if (g_door->state != 2) {
-                  g_door->state = 0;
-                  return -ETIMEDOUT;
-              }
-          
-              __sync_synchronize();
-              long r = (long)g_door->ret;
               g_door->state = 0;
-              return r;
+              return -ETIMEDOUT;
           }
           
           static void perr(const char *what, long r)
