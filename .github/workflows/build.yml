@@ -926,34 +926,25 @@ jobs:
           	*hole = false;
           
           	/*
-          	 * A WRITE never takes the direct map shortcut.
+          	 * A READ takes the walk without mmap_sem, on purpose.
           	 *
-          	 * FOLL_FORCE|FOLL_WRITE is what breaks copy-on-write: it hands back the
-          	 * process's OWN page, which is the page its next read will see.  Writing
-          	 * through the direct map instead writes whichever page the PTE points at
-          	 * at that instant - and for a clean copy-on-write page that is the shared
-          	 * original, which the process then copies for itself on its own first
-          	 * write, so the value we wrote is never the one it reads back.  A read
-          	 * has no such problem, so the walk is kept for reads.
+          	 * That lock belongs to the game, and a hack reads in a tight loop - 780
+          	 * thousand reads a second in the session that prompted this - so taking
+          	 * it per read makes the game's own page faults queue behind us on one
+          	 * cache line.  The cores stay idle and the game still stutters, which is
+          	 * exactly what contention looks like from outside.
           	 *
-          	 * A write is also rare - 285 against 17.6 million reads in the session
-          	 * that prompted this - so nothing is lost by paying for the pin.
-          	 *
-          	 * The lock covers the walk AND the copy after it, for the same reason
-          	 * get_user_pages takes one: between reading a PTE and reading the page it
-          	 * points at, the mapping could be zapped.  It cannot cover the pin below,
-          	 * because get_user_pages_remote() takes mmap_sem itself and a recursive
-          	 * read lock on a rwsem deadlocks against a writer that is already waiting.
+          	 * The walk is five loads.  The race it leaves is a mapping zapped between
+          	 * the walk and the copy, and that is a stale read rather than a crash:
+          	 * the direct map never unmaps a page, so the alias stays readable, and a
+          	 * vanished mapping means the PTE is not present, which this already
+          	 * reports as a hole.  Writes never take this path - they need
+          	 * FOLL_FORCE|FOLL_WRITE for copy-on-write correctness, and a write is
+          	 * rare enough (38 thousand against 196 million reads) to pay for it.
           	 */
           	if (!write) {
-          		mmap_read_lock(mm);
-          		if (!kdbg_va_to_kaddr(mm, va, &kva, &pfn)) {
-          			int err = copy_to_user(ubuf, kva, n) ? -EFAULT : 0;
-          
-          			mmap_read_unlock(mm);
-          			return err;
-          		}
-          		mmap_read_unlock(mm);
+          		if (!kdbg_va_to_kaddr(mm, va, &kva, &pfn))
+          			return copy_to_user(ubuf, kva, n) ? -EFAULT : 0;
           	}
           
           	/* Pin the page: correct copy-on-write for a write, and it faults a read in. */
