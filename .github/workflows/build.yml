@@ -1,25 +1,24 @@
 name: Build kdbg kernel
 
 # One run gives you two files:
-#   * a flashable AnyKernel3 zip whose kernel carries a NEW syscall, and
+#   * a flashable AnyKernel3 zip: the kernel, carrying the driver's front end,
 #   * kdbg.ko - the module that holds the actual read/write logic.
 #
 # Why split it that way:
-#   RT and CShell get their syscall by writing sys_call_table[] at runtime. On
-#   this kernel that table is read-only (.rodata + STRICT_KERNEL_RWX), which is
-#   the most likely reason RT loads and then never hooks anything, and it is
-#   certainly why it would collide with KernelSU's manual hook, which wants the
-#   very same table. We don't write it at all - the compiler emits the entry,
-#   once, at build time. Nothing at runtime touches sys_call_table.
+#   There is no syscall.  The front end is one page at a fixed address
+#   (KDBG_DOOR_BASE) that the client maps and posts requests in; the kernel
+#   learns about the client from the page-fault path, and a work item serves the
+#   requests.  That front end has to be in the kernel itself - the fault path
+#   reaches it with no module loaded - and it is the only thing that does.
 #
-#   The stub that lives in the flashed kernel is ~40 lines and does nothing but
-#   tail-call a registered function pointer. All the real code sits in the
-#   module, so after this one flash every future change is insmod / rmmod with
-#   no reflash. With the module unloaded the syscall returns -ENOSYS, i.e. it
-#   looks exactly like the hole in the table it sits in.
+#   Everything else, every read, write, module base, mapping list, batch,
+#   breakpoint and page watch, is in kdbg_core.ko.  So after this one flash,
+#   every future change is a module rebuild and an insmod: kernel-module-towa.yml
+#   does exactly that in a couple of minutes.  With no module loaded the door
+#   still answers - with -ENOSYS - so the driver is silent either way.
 #
-# The build log prints TOWA_NR=<n>. That is the syscall number - normally 294,
-# but the run reads it out of the tree rather than assuming it.
+# Defaults are the flash-once shape: builtin=n, so the Image does NOT contain
+# the driver's logic and kdbg.ko is loaded by hand.
 #
 # DEFAULTS ARE THE 325 BUILD (branch Boostkernel2-cip, clang-r563880). The
 # source below is version-agnostic - none of it cares which 4.19 it lands in -
@@ -43,7 +42,7 @@ on:
       builtin:
         description: 'y = build kdbg into the kernel (nothing in /proc/modules, nothing to insmod), n = loadable kdbg.ko'
         required: true
-        default: 'y'
+        default: 'n'
 
 jobs:
   build:
@@ -609,7 +608,17 @@ jobs:
           #include <linux/delay.h>
           #include <linux/jiffies.h>
           #include <linux/init.h>
-          #include <linux/kthread.h>	/* use_mm / unuse_mm */
+          
+          /*
+           * Some trees declare these in <linux/mmu_context.h>, some in <linux/kthread.h>,
+           * and this one in neither place the include set above reaches - the build says
+           * "implicit declaration of function 'use_mm'", which is the compiler being
+           * precise about it.  The symbols themselves are in kernel/kthread.c on every
+           * kernel that has them, and this file is built in, so a prototype is all that
+           * is missing.
+           */
+          void use_mm(struct mm_struct *mm);
+          void unuse_mm(struct mm_struct *mm);
           #include <asm/barrier.h>
           #include <linux/export.h>
           #include <linux/uio.h>
